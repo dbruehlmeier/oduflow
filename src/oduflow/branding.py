@@ -20,6 +20,7 @@ brand is the only thing the license controls. Hidden infrastructure names
 
 from __future__ import annotations
 
+import html
 import logging
 import math
 import os
@@ -30,6 +31,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Callable
 from urllib.parse import urlsplit
+
+from oduflow import feedback
 
 if TYPE_CHECKING:
     from oduflow.settings import Settings
@@ -286,3 +289,30 @@ def _team_hostnames() -> list[str]:
         return [team.hostname for team in _get_settings().teams.values()]
     except Exception:  # noqa: BLE001
         return []
+
+
+def render_page(page: str) -> str:
+    """Render the brand into a page template (see oduflow.branding).
+
+    ``<!--IF-STOCK-->`` blocks hold vendor surfaces (license, updates, docs,
+    feedback) and are removed from the HTML under white label, so nothing of
+    them reaches the browser; ``<!--IF-WHITE-LABEL-->`` blocks are the
+    opposite.
+    """
+    brand = current()
+    keep, drop = (
+        ("WHITE-LABEL", "STOCK") if brand.white_label else ("STOCK", "WHITE-LABEL")
+    )
+    page = re.sub(rf"<!--IF-{drop}-->.*?<!--/IF-{drop}-->", "", page, flags=re.S)
+    page = page.replace(f"<!--IF-{keep}-->", "").replace(f"<!--/IF-{keep}-->", "")
+    asset_paths = [p for p in (brand.logo_path, brand.icon_path) if p]
+    try:
+        asset_version = str(int(max(os.stat(p).st_mtime for p in asset_paths)))
+    except (OSError, ValueError):
+        asset_version = feedback.oduflow_version()
+    return (
+        page.replace("__BRAND_NAME__", html.escape(brand.name, quote=True))
+        .replace("__WHITE_LABEL__", "1" if brand.white_label else "")
+        .replace("__LOGO_CLASS__", "custom-logo" if brand.logo_path else "")
+        .replace("__ASSET_VERSION__", html.escape(asset_version, quote=True))
+    )

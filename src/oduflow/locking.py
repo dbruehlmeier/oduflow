@@ -119,6 +119,11 @@ def image_publish_lock_key(team_id: str, name: str) -> str:
     return f"imgpublish:{team_id}:{name}"
 
 
+def image_cleanup_lock_key() -> str:
+    """Removal of unused Docker images — server-wide, so not team-scoped."""
+    return "images:cleanup"
+
+
 def env_wake_key(team_id: str, env_name: str) -> str:
     """Auto-start of one environment (see :func:`keyed_mutex`)."""
     return f"wake:{team_id}:{env_name}"
@@ -438,3 +443,22 @@ class LockManager:
     def release_system(self) -> None:
         with self._map_lock:
             self._system_holder = None
+
+    def active_operations(self) -> list[str]:
+        """Human-readable list of operations holding a lock right now.
+
+        A restart of the server would kill them half-way, so the Server
+        settings console refuses to restart while this is non-empty.
+        """
+        with self._map_lock:
+            busy = [
+                f"environment '{name}'{holder.describe()}"
+                for name, holder in sorted(self._env_holders.items())
+            ]
+            busy += [
+                f"team '{team_id}'{holder.describe()}"
+                for team_id, holder in sorted(self._team_holders.items())
+            ]
+            if self._system_holder is not None:
+                busy.append(f"system{self._system_holder.describe()}")
+        return busy

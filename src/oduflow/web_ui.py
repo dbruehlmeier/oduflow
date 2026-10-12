@@ -37,6 +37,7 @@ from starlette.websockets import WebSocket
 
 from oduflow import (
     activity,
+    admin_ui,
     agent_config,
     agent_uploads,
     artifact_tokens,
@@ -53,8 +54,10 @@ from oduflow import (
     ui_totp,
     updates,
 )
+from oduflow.config_store import ConfigRuntime
 from oduflow.docker_ops import (
     env_ops,
+    image_cleanup,
     odoo_ops,
     production_ops,
     service_database_ops,
@@ -88,6 +91,7 @@ from oduflow.licensing import (
 from oduflow.locking import (
     LockManager,
     credentials_lock_key,
+    image_cleanup_lock_key,
     prod_backups_lock_key,
     prod_lock_key,
     service_database_lock_key,
@@ -105,7 +109,7 @@ from oduflow.naming import (
     validate_env_name,
     validate_template_name,
 )
-from oduflow.settings import Settings, TeamSettings
+from oduflow.settings import OpenCodeProviderSettings, Settings, TeamSettings
 
 logger = logging.getLogger("oduflow")
 
@@ -359,7 +363,11 @@ class UIAuthMiddleware:
 
         path = scope.get("path", "")
         if scope["type"] == "http" and (
-            path in _PUBLIC_PATHS or path.startswith(_PUBLIC_PREFIXES)
+            path in _PUBLIC_PATHS
+            or path.startswith(_PUBLIC_PREFIXES)
+            # The Server settings console is not a team surface: its routes
+            # authenticate the console credential themselves (admin_ui).
+            or admin_ui.is_admin_path(path)
         ):
             await self._app(scope, receive, send)
             return
@@ -459,31 +467,7 @@ def _is_secure_request(request: Request) -> bool:
 _TEMPLATE_DIR = pathlib.Path(__file__).resolve().parent / "templates"
 
 
-def _apply_branding(page: str) -> str:
-    """Render the brand into a page template (see oduflow.branding).
-
-    ``<!--IF-STOCK-->`` blocks hold vendor surfaces (license, updates, docs,
-    feedback) and are removed from the HTML under white label, so nothing of
-    them reaches the browser; ``<!--IF-WHITE-LABEL-->`` blocks are the
-    opposite.
-    """
-    brand = branding.current()
-    keep, drop = (
-        ("WHITE-LABEL", "STOCK") if brand.white_label else ("STOCK", "WHITE-LABEL")
-    )
-    page = re.sub(rf"<!--IF-{drop}-->.*?<!--/IF-{drop}-->", "", page, flags=re.S)
-    page = page.replace(f"<!--IF-{keep}-->", "").replace(f"<!--/IF-{keep}-->", "")
-    asset_paths = [p for p in (brand.logo_path, brand.icon_path) if p]
-    try:
-        asset_version = str(int(max(os.stat(p).st_mtime for p in asset_paths)))
-    except (OSError, ValueError):
-        asset_version = feedback.oduflow_version()
-    return (
-        page.replace("__BRAND_NAME__", html.escape(brand.name, quote=True))
-        .replace("__WHITE_LABEL__", "1" if brand.white_label else "")
-        .replace("__LOGO_CLASS__", "custom-logo" if brand.logo_path else "")
-        .replace("__ASSET_VERSION__", html.escape(asset_version, quote=True))
-    )
+_apply_branding = branding.render_page
 
 
 def _render_login(error: str = "") -> str:
@@ -517,6 +501,11 @@ async def _read_login_credentials(request: Request) -> tuple[str, str]:
 
 
 _EXTERNAL_COMMAND_UI_ERROR = "Operation failed. Check server logs for details."
+
+# Result groups of system_ops.cleanup_orphans that Confirm may name.
+_CLEANUP_ORPHAN_KEYS = frozenset(
+    {"orphan_databases", "orphan_workspaces", "orphan_ports", "orphan_roles"}
+)
 
 
 def _flow_error_status(e: FlowError) -> int:
@@ -793,18 +782,40 @@ def _opencode_config(
     include_browser: bool = True,
     include_oduflow: bool = False,
     model: str = "",
+    provider: OpenCodeProviderSettings | None = None,
 ) -> str:
     """Return session-local OpenCode config with no embedded credential.
 
     ``OPENCODE_CONFIG_CONTENT`` has high precedence, so Oduflow's approval-free
     trust model and scoped MCP wiring cannot be silently shadowed by a checkout
     config. The bearer remains an environment placeholder resolved only inside
-    this docker-exec process.
+    this docker-exec process. A configured custom provider is declared the
+    same way: its base URL and key are ``{env:...}`` placeholders resolved
+    from the agent container's environment.
     """
     config: dict[str, Any] = {
         "autoupdate": False,
         "permission": "allow",
     }
+    if provider is not None:
+        # @ai-sdk/openai-compatible is bundled with OpenCode and talks Chat
+        # Completions (POST <baseURL>/chat/completions). OpenCode merges a
+        # provider whose id is in its models.dev catalog with the built-in
+        # entry; the empty env list and the whitelist keep only the declared
+        # models and variables.
+        config["provider"] = {
+            provider.id: {
+                "npm": "@ai-sdk/openai-compatible",
+                "name": provider.display_name,
+                "env": [],
+                "whitelist": list(provider.models),
+                "options": {
+                    "baseURL": f"{{env:{provider.base_url_env}}}",
+                    "apiKey": f"{{env:{provider.api_key_env}}}",
+                },
+                "models": {m: {"name": m} for m in provider.models},
+            },
+        }
     if include_browser:
         config["mcp"] = {
             "agent_browser": {
@@ -829,6 +840,53 @@ def _opencode_config(
             },
         }
     return json.dumps(config, separators=(",", ":"))
+
+
+def _opencode_provider_env_warning(settings: Settings, team: TeamSettings) -> str:
+    """Explain a custom OpenCode provider whose variables the team lacks.
+
+    OpenCode substitutes an unset ``{env:...}`` with an empty string, which
+    surfaces only as an opaque connection or 401 error from the gateway.
+    Only a provider that ``opencode_model`` selects is checked: a team that
+    does not use it must not be told its requests will fail. Returns an empty
+    string when there is nothing to warn about.
+    """
+    provider = settings.agent_opencode_provider
+    if provider is None or not settings.agent_opencode_model.startswith(
+        f"{provider.id}/"
+    ):
+        return ""
+    env = env_ops._agent_env_vars(settings, team)
+    missing = [
+        name
+        for name in (provider.base_url_env, provider.api_key_env)
+        if not env.get(name, "").strip()
+    ]
+    if not missing:
+        return ""
+    return (
+        f"the OpenCode model {settings.agent_opencode_model} reads "
+        f"{', '.join(missing)}, which this team's agent environment does not "
+        "set, so its requests will fail. Set the variables in "
+        f"[team.{team.team_id}.agent_env] and restart Oduflow; the server "
+        "environment is forwarded only for the known provider keys of a "
+        "single-team server."
+    )
+
+
+def _confirm_before_start(cmd: list[str], warning: str) -> list[str]:
+    """Wrap a TUI command so a warning stays on screen until Enter is pressed.
+
+    Full-screen TUIs switch to the alternate screen at once and would wipe a
+    warning written just before them. The warning is passed as an argument,
+    never interpolated into the script.
+    """
+    script = (
+        'printf "\\033[33mWarning: %s\\033[0m\\r\\n\\r\\n'
+        'Press Enter to start anyway, or close the console. " "$1"; '
+        'read -r _; shift; exec "$@"'
+    )
+    return ["sh", "-c", script, "sh", warning, *cmd]
 
 
 def _wire_client_acp_mcp(
@@ -967,7 +1025,10 @@ def _build_routes(
         )
 
     def _render_dashboard(
-        settings: Settings, scoped_env: str = "", team: TeamSettings | None = None
+        settings: Settings,
+        scoped_env: str = "",
+        team: TeamSettings | None = None,
+        admin: bool = False,
     ) -> str:
         """Render the dashboard page. With ``scoped_env`` set it renders in
         shared single-environment mode (see oduflow.ui_scope): the client-side
@@ -998,12 +1059,19 @@ def _build_routes(
                 "__TEAM_BASE_DOMAIN__",
                 html.escape(team.base_domain if team else "", quote=True),
             )
+            # Only a browser already signed in to the Server settings console
+            # gets the link; team members never learn the console exists.
+            .replace(
+                "__ADMIN_LINK_HIDDEN__", "" if admin and not scoped_env else "hidden"
+            )
         )
 
     def dashboard(request: Request) -> HTMLResponse:
         settings = get_settings()
         team = getattr(request.state, "team", None)
-        page = _render_dashboard(settings, team=team)
+        page = _render_dashboard(
+            settings, team=team, admin=admin_ui.has_admin_session(request, settings)
+        )
         return HTMLResponse(page)
 
     def _team_for_share(
@@ -1732,7 +1800,9 @@ def _build_routes(
             secret_store.resolve_env_secrets(team, env_vars)
             # Same for a stopped database server or a template without its
             # database: create_environment would refuse only after the delete.
-            env_ops._ensure_system_ready(client, settings, team, template_name)
+            env_ops._ensure_system_ready(
+                client, settings, team, template_name, odoo_image
+            )
 
             env_ops.delete_environment(settings, team, branch, preserve_share=True)
             result = env_ops.create_environment(
@@ -1901,6 +1971,9 @@ def _build_routes(
         auto_install_raw = (body.get("auto_install_modules") or "").strip()
         hostname = (body.get("hostname") or "").strip()
         from_production = (body.get("from_production") or "").strip()
+        # Where the branch starts when origin does not have it yet; it is then
+        # created and pushed. Empty keeps the old rule: the branch must exist.
+        base_branch = (body.get("base_branch") or "").strip()
         env_vars = _env_vars_from_body(body.get("env_vars"))
         if from_production and template_name_raw:
             return JSONResponse(
@@ -1925,6 +1998,13 @@ def _build_routes(
             # and starts no work that has to be unwound.
             if hostname:
                 hostname = validate_env_hostname(hostname)
+            if base_branch:
+                from oduflow.extra_addons import validate_branch_name
+
+                # Both names reach git (checkout -b, push), so both must be
+                # names git accepts as branches.
+                validate_branch_name(base_branch)
+                validate_branch_name(branch)
         except ValueError as e:
             return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
 
@@ -2035,6 +2115,7 @@ def _build_routes(
                 env_vars={**template_env_vars, **env_vars} or None,
                 local_path=local_path_from_meta,
                 hostname=hostname,
+                base_branch=base_branch,
             )
             payload: dict[str, Any] = {"ok": True, "result": result}
             if from_production:
@@ -2089,6 +2170,83 @@ def _build_routes(
             logger.exception("Unexpected error in api_logs")
             return JSONResponse(
                 {"ok": False, "error": "Internal server error."}, status_code=500
+            )
+
+    async def api_cleanup(request: Request) -> JSONResponse:
+        try:
+            body = await request.json()
+        except ValueError:
+            return JSONResponse(
+                {"ok": False, "error": "Invalid JSON body."}, status_code=400
+            )
+        if not isinstance(body, dict) or type(body.get("force", False)) is not bool:
+            return JSONResponse(
+                {"ok": False, "error": "force must be a boolean."}, status_code=400
+            )
+        force = body.get("force", False)
+        image_ids = body.get("image_ids", [])
+        if not isinstance(image_ids, list) or any(
+            not isinstance(image_id, str)
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id)
+            for image_id in image_ids
+        ):
+            return JSONResponse(
+                {"ok": False, "error": "image_ids must contain full image IDs."},
+                status_code=400,
+            )
+        # Confirm removes only the orphans the user reviewed in the preview.
+        orphans = body.get("orphans", {})
+        if not isinstance(orphans, dict) or any(
+            key not in _CLEANUP_ORPHAN_KEYS
+            or not isinstance(names, list)
+            or not all(isinstance(name, str) for name in names)
+            for key, names in orphans.items()
+        ):
+            return JSONResponse(
+                {"ok": False, "error": "orphans must list reviewed names by group."},
+                status_code=400,
+            )
+
+        def run() -> dict[str, Any]:
+            settings = get_settings()
+            team = _get_ui_team(request)
+            if not force:
+                # Read-only, like the CLI dry run: no lock, so a scan neither
+                # fails on nor blocks the team's environment operations.
+                result = system_ops.cleanup_orphans(settings, team, dry_run=True)
+                result["images"] = image_cleanup.list_unused_images()
+                return result
+            # Hold locks in the worker so disconnects cannot unlock live work,
+            # and take them all before deleting anything.
+            with contextlib.ExitStack() as stack:
+                if image_ids:
+                    # One image cleanup at a time across all dashboard teams.
+                    stack.enter_context(
+                        locks.env_lock(image_cleanup_lock_key(), operation="cleanup")
+                    )
+                with locks.team_lock(team.team_id, operation="cleanup"):
+                    result = system_ops.cleanup_orphans(
+                        settings, team, dry_run=False, only=orphans
+                    )
+                result["images"] = (
+                    image_cleanup.remove_unused_images(image_ids)
+                    if image_ids
+                    else {"removed": [], "skipped": [], "errors": []}
+                )
+            return result
+
+        try:
+            return JSONResponse({"ok": True, "result": await _offload(run)})
+        except FlowError as e:
+            return _error_response(e)
+        except Exception:
+            logger.exception("Unexpected error in api_cleanup")
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "error": "Cleanup failed. Check server logs and scan again to see remaining resources.",
+                },
+                status_code=500,
             )
 
     def api_stats(request: Request) -> JSONResponse:
@@ -5459,8 +5617,12 @@ def _build_routes(
                     mcp_url,
                     include_oduflow=bool(mcp_token),
                     model=settings.agent_opencode_model,
+                    provider=settings.agent_opencode_provider,
                 )
                 cmd = _opencode_cli_cmd(settings.agent_opencode_model)
+                provider_warning = _opencode_provider_env_warning(settings, team)
+                if provider_warning:
+                    cmd = _confirm_before_start(cmd, provider_warning)
             else:
                 # Approval-free like Codex: Docker + the unprivileged `agent`
                 # user are the security boundary, so the console skips per-tool
@@ -5735,7 +5897,11 @@ def _build_routes(
                 exec_env["OPENCODE_CONFIG_CONTENT"] = _opencode_config(
                     include_browser=False,
                     model=settings.agent_opencode_model,
+                    provider=settings.agent_opencode_provider,
                 )
+                provider_warning = _opencode_provider_env_warning(settings, team)
+                if provider_warning:
+                    await _notice(provider_warning)
 
             exec_id = client.api.exec_create(
                 container.id,
@@ -5945,7 +6111,15 @@ def _build_routes(
                 auto_update=bool(data.get("auto_update")),
                 template_name=str(data.get("template_name", "")).strip() or None,
                 from_environment=from_environment or None,
+                env_vars=(
+                    _env_vars_from_body(data["env_vars"])
+                    if "env_vars" in data
+                    else None
+                ),
                 env_lock=env_lock,
+                server_mode=production_ops.resolve_server_mode(
+                    data.get("server_mode"), production_ops.DEFAULT_SERVER_MODE
+                ),
             )
             return JSONResponse({"ok": True, **result})
         except FlowError as e:
@@ -6191,14 +6365,22 @@ def _build_routes(
             # Present-but-empty means "clear" (the dashboard always submits
             # the field); only an absent key means "leave unchanged".
             git_user=(str(data["git_user"]).strip() if "git_user" in data else None),
+            env_vars=(
+                _env_vars_from_body(data["env_vars"]) if "env_vars" in data else None
+            ),
             extra_addons=(
                 _normalize_extra_addons(raw_extra) if raw_extra is not None else None
             ),
+            server_mode=production_ops.resolve_server_mode(
+                data.get("server_mode"), None
+            ),
+            force_recreate=data.get("recreate") is True,
         )
 
     async def api_production_reconfigure(request: Request) -> JSONResponse:
-        """Change infra settings (domain/image/branch/repo/extra addons) and
-        recreate the production container to match; DB/filestore preserved."""
+        """Change infra settings (domain/image/branch/repo/extra addons/server
+        mode) and recreate the production container to match; DB/filestore
+        preserved."""
         return await _production_body_action(request, _reconfigure_action)
 
     def _odoo_conf_action(
@@ -6727,6 +6909,7 @@ def _build_routes(
         *production_routes,
         Route("/healthz", healthz, methods=["GET"]),
         Route("/api/stats", api_stats, methods=["GET"]),
+        Route("/api/cleanup", api_cleanup, methods=["POST"]),
         Route("/api/usage", api_usage, methods=["GET"]),
         Route("/api/usage/refresh", api_usage_refresh, methods=["POST"]),
         Route(
@@ -6951,11 +7134,13 @@ def mount_web_ui(
     app: Starlette,
     get_settings: Callable[[], Settings],
     locks: LockManager,
+    config_runtime: ConfigRuntime | None = None,
 ) -> None:
     from starlette.routing import Router
 
     branding.configure(get_settings)
-    routes = _build_routes(get_settings, locks)
+    routes = admin_ui.build_admin_routes(get_settings, config_runtime)
+    routes += _build_routes(get_settings, locks)
     sub_app: ASGIApp = Router(routes=routes)
 
     settings = get_settings()

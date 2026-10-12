@@ -95,7 +95,10 @@ precursors).
 | [0072](0072-polyform-commercial-licensing.md) | 2026-09-23 | PolyForm public source license, internal evaluation and alternative commercial agreements |
 | [0073](0073-on-demand-extra-addons-branches.md) | 2026-09-29 | Extra-addons repos registered without download; branches fetched on first use |
 | [0074](0074-postgresql16-cluster-replacement.md) | 2026-09-29 | PostgreSQL 16 replacement of prepared clusters, manual configuration and template restoration |
-| [0075](0075-custom-white-label-license.md) | 2026-10-07 | Custom license: operator brand instead of Oduflow in the dashboard and MCP, domain-bound key, 30-day grace |
+| [0075](0075-production-server-mode-routing.md) | 2026-10-03 | Production server mode (workers/gevent) with bus routing to the gevent port |
+| [0076](0076-postgresql-upgrade-on-demand.md) | 2026-10-09 | PostgreSQL major upgrade on operator request, carrying service and production databases |
+| [0077](0077-server-settings-console.md) | 2026-10-08 | Server settings console: oduflow.toml edited, validated and applied from the browser at /admin |
+| [0078](0078-custom-white-label-license.md) | 2026-10-07 | Custom license: operator brand instead of Oduflow in the dashboard and MCP, domain-bound key, 30-day grace |
 
 ## Design docs
 

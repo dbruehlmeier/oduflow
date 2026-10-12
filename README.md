@@ -74,7 +74,8 @@ otherwise to `~/.oduflow/conf/oduflow.toml`. Fresh configs include generated
 secrets for HTTP access: `[team.1].auth_token` for MCP clients and
 `[team.1].ui_password` for the Web Dashboard. The file is created with mode
 `0600`; the secrets are never printed to the log, so read them from the config
-itself (`sudo grep -E 'auth_token|ui_password' /etc/oduflow/oduflow.toml`).
+itself: `sudo grep -E 'auth_token|ui_password' /etc/oduflow/oduflow.toml`
+(or the same `grep` on `~/.oduflow/conf/oduflow.toml` for a non-root install).
 
 By default, the server starts in **stdio** mode (for local MCP clients). For remote/multi-user deployments:
 
@@ -140,7 +141,7 @@ For full documentation, visit **[oduflow.dev](https://oduflow.dev)** or see the 
 
 ## Telemetry
 
-Oduflow collects anonymous usage telemetry (first startup and environment creation events) to understand adoption. Only the event name, version, and a random instance ID are sent — no personal data or environment details. To opt out, add `disable_telemetry = true` to the `[server]` section of your `oduflow.toml`. See the [documentation](https://oduflow.dev/installation/#telemetry) for details.
+Oduflow collects anonymous usage telemetry (first startup and environment creation events) to understand adoption. Only the event name, version, and a random instance ID are sent — no personal data or environment details. To opt out, add `disable_telemetry = true` to the `[server]` section of your `oduflow.toml`. To skip it for a single run (e.g. a test run), start Oduflow with `--no-telemetry`. See the [documentation](https://oduflow.dev/installation/#telemetry) for details.
 
 ## Licensing
 

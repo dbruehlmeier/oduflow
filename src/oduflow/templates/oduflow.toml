@@ -6,6 +6,14 @@ allow_local_path = true        # trusted single-user local development; disable 
 # allow_insecure_http = false  # serve HTTP /mcp with NO auth (only behind your own proxy)
 # trace = false                    # verbose tracing for git analysis & env ops
 
+# ── Server settings console ───────────────────────────
+# Browser editor for this whole file at /admin (HTTP mode): every section and
+# every team, validated before saving, with history and a restart button. It
+# has its own password, separate from all team logins. Empty = console off;
+# `oduflow admin enable` generates one. 2FA: `oduflow ui-2fa setup --admin`.
+[admin]
+password = ""
+
 # ── Routing ───────────────────────────────────────────
 [routing]
 mode = "port"                   # "port" | "traefik"
@@ -53,6 +61,8 @@ mode = "port"                   # "port" | "traefik"
 [database]
 user = "odoo"
 # password auto-generated on first launch. Set explicitly to override.
+# PostgreSQL 15-17. A newer major upgrades existing clusters on the next start:
+# https://docs.oduflow.dev/installation/#upgrading-postgresql
 image = "postgres:16"
 
 # ── Storage ───────────────────────────────────────────
@@ -82,6 +92,17 @@ prod_purge_hours = 0              # purge DB/files kept by a production deletion
 # claude_model = ""                # optional model override; empty = CLI default
 # codex_model = ""                 # optional model override; empty = CLI default
 # opencode_model = ""              # optional provider/model; empty = OpenCode default
+#                                  # (e.g. "litellm/glm-5.3" with the provider below)
+
+# Optional custom OpenCode provider: an OpenAI-compatible gateway (LiteLLM etc.)
+# reached over Chat Completions. Only variable NAMES go here; set their values
+# in each team's [team.X.agent_env]. Without this section OpenCode is unchanged.
+# [agent.opencode_provider]
+# id = "litellm"                   # provider id; select models as "<id>/<model>"
+# name = "LiteLLM"                 # display name; empty = id
+# base_url_env = "OPENCODE_PROVIDER_BASE_URL"  # variable with the base URL, incl. /v1
+# api_key_env = "OPENCODE_PROVIDER_API_KEY"    # variable with the API key
+# models = ["glm-5.3"]             # model ids as the gateway names them
 
 # ── Production hosting ────────────────────────────────
 # Productions (long-lived customer environments with their own domain and a

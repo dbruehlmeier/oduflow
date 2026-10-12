@@ -21,6 +21,7 @@ from typing import Any
 import docker
 from docker import DockerClient
 from oduflow import activity, env_share, secret_store, settings
+from oduflow.docker_ops import image_cleanup
 from oduflow.docker_ops.client import chown_recursive, get_client, get_odoo_uid_gid
 from oduflow.docker_ops.stats import default_env_limits
 from oduflow.docker_ops.system_ops import (
@@ -38,6 +39,7 @@ from oduflow.docker_ops.system_ops import (
     estimate_new_db_bytes,
     pg_clone_strategy_clause,
     reassign_db_ownership,
+    require_postgres_for_odoo,
 )
 from oduflow.domains import env_hostname
 from oduflow.env_credentials import create_credentials, load_credentials
@@ -433,6 +435,7 @@ def _ensure_system_ready(
     settings: Settings,
     team: TeamSettings,
     template_name: str | None = None,
+    odoo_image: str = "",
 ) -> None:
     try:
         db_container = client.containers.get(settings.shared_db_container)
@@ -444,6 +447,8 @@ def _ensure_system_ready(
         raise PrerequisiteNotMetError(
             f"{settings.shared_db_container} not found. System not initialized. Restart oduflow."
         )
+    if odoo_image:
+        require_postgres_for_odoo(client, settings, odoo_image)
 
     if template_name is not None:
         tpl_db = get_template_db_name(template_name, team.team_id)
@@ -1334,12 +1339,38 @@ def _install_repo_dependencies(
     return exit_code, pip_installed_any, logs
 
 
-def _odoo_registry_probe(env_db: str) -> list[str]:
-    """Build an in-container probe that forces the target registry to load."""
+def _decode_exec_output(output: Any) -> str:
+    """Text of an ``exec_run`` output, never raising on odd bytes.
+
+    Odoo's own output is UTF-8, but a traceback can quote bytes from a module's
+    data files or a third-party library's log, and a strict decode would then
+    raise over the :class:`ExternalCommandError` that carries the real failure.
+    """
+    if isinstance(output, bytes):
+        return output.decode("utf-8", errors="replace")
+    return str(output)
+
+
+def _odoo_registry_probe(env_db: str, *, accept_http_errors: bool = False) -> list[str]:
+    """Build an in-container probe that forces the target registry to load.
+
+    With *accept_http_errors* any HTTP response counts, error statuses
+    included: the request for ``env_db`` was served, so the registry for it
+    was at least set up, even if serving the page then failed.
+    """
+    answered = (
+        [
+            "except urllib.error.HTTPError:",
+            "    sys.exit(0)",
+        ]
+        if accept_http_errors
+        else []
+    )
     script = "\n".join(
         [
             "import http.cookiejar",
             "import sys",
+            "import urllib.error",
             "import urllib.parse",
             "import urllib.request",
             f"db = {env_db!r}",
@@ -1352,6 +1383,7 @@ def _odoo_registry_probe(env_db: str) -> list[str]:
             "    response = opener.open(url, timeout=5)",
             "    if response.status != 200:",
             "        raise RuntimeError(f'HTTP {response.status}')",
+            *answered,
             "except Exception as exc:",
             "    print(f'{type(exc).__name__}: {exc}', file=sys.stderr)",
             "    sys.exit(1)",
@@ -1370,7 +1402,11 @@ class _OdooReadinessResult:
 
 
 def _wait_for_container_odoo_ready(
-    container: Any, env_db: str, timeout: int = 120
+    container: Any,
+    env_db: str,
+    timeout: int = 120,
+    *,
+    accept_http_errors: bool = False,
 ) -> _OdooReadinessResult:
     """Wait until the serving Odoo process has finished registry startup.
 
@@ -1382,8 +1418,13 @@ def _wait_for_container_odoo_ready(
     databases both processes can otherwise race while re-creating the registry
     signaling sequences. ``/web/health`` is not sufficient here because it is
     database-independent and can respond before registry preloading completes.
+
+    *accept_http_errors* relaxes "ready" to "answered": an HTTP 500 for
+    ``env_db`` still means the serving process set up that registry's
+    signaling. Only the pre-readiness template upgrade uses it — the one
+    secondary command that has to run while the page cannot render yet.
     """
-    probe = _odoo_registry_probe(env_db)
+    probe = _odoo_registry_probe(env_db, accept_http_errors=accept_http_errors)
     started = time.monotonic()
     deadline = started + timeout
     attempts = 0
@@ -1461,6 +1502,118 @@ def _readiness_error(
     )
 
 
+def _template_module_upgrades(
+    client: DockerClient,
+    settings: Settings,
+    env_db: str,
+    odoo_volumes: dict[str, Any],
+    odoo_conf_path: str | None,
+    env_name: str,
+) -> tuple[dict[str, tuple[str, str]], str | None]:
+    """Installed modules whose checkout manifest is newer than the cloned DB.
+
+    Compares ``ir_module_module.latest_version`` with the manifests the
+    serving Odoo will load: the generated odoo.conf's addons_path, mapped back
+    to host paths through the container mounts. Returns ``({name: (installed,
+    checkout)}, failure_reason)``.
+
+    Best-effort: a failed check upgrades nothing, so creation continues as it
+    did before this check existed. But skipping it silently would leave only
+    the generic readiness timeout to explain a broken environment, so the
+    reason is returned for the caller to report.
+    """
+    from oduflow import module_versions
+
+    try:
+        raw = _exec_sql(
+            client,
+            settings,
+            "SELECT COALESCE(json_object_agg(name, latest_version), '{}'::json)::text "
+            "FROM ir_module_module WHERE state = 'installed';",
+            db=env_db,
+        )
+        installed = json.loads(raw or "{}")
+        # Without a generated conf the image's own odoo.conf applies, which
+        # points at the repository mount only.
+        addons_path = (
+            module_versions.addons_path_from_conf(odoo_conf_path)
+            if odoo_conf_path
+            else ["/mnt/extra-addons"]
+        )
+        mounts = {spec["bind"]: host for host, spec in odoo_volumes.items()}
+        available = module_versions.checkout_module_versions(
+            module_versions.host_addons_dirs(addons_path, mounts)
+        )
+        return module_versions.modules_newer_than_installed(installed, available), None
+    except Exception as exc:  # noqa: BLE001 - never fail creation over the check
+        logger.warning(
+            "Template module version check failed",
+            exc_info=True,
+            extra={"env_name": env_name},
+        )
+        return {}, f"{type(exc).__name__}: {exc}"
+
+
+def _upgrade_template_modules(
+    container: Any,
+    env_db: str,
+    upgrades: dict[str, tuple[str, str]],
+    env_name: str,
+) -> str:
+    """Upgrade modules whose checkout is newer than the template database.
+
+    A plain start loads these modules' current models against the template's
+    old tables, so ``/web/login`` fails with ``column ... does not exist``
+    until ``-u`` adds the columns. The upgrade runs inside the serving
+    container, where the generated odoo.conf and the repository's pip/apt
+    packages are already in place — the same way ``pull_and_apply`` upgrades.
+    It cannot wait for full readiness (that is what it fixes), so it waits for
+    Odoo to answer at all, which already rules out the signaling race.
+    """
+    from oduflow.docker_ops.odoo_ops import _validate_module_names
+
+    modules = sorted(upgrades)
+    _validate_module_names(modules)
+    modules_str = ",".join(modules)
+    readiness = _wait_for_container_odoo_ready(
+        container, env_db, accept_http_errors=True
+    )
+    if not readiness.ready:
+        raise _readiness_error(
+            container,
+            env_db,
+            readiness,
+            action=f"Upgrade of template modules {modules_str} was not attempted",
+        )
+
+    logger.info(
+        "Upgrading modules newer than the template database: %s",
+        modules_str,
+        extra={"env_name": env_name},
+    )
+    upgrade_cmd = (
+        f"/entrypoint.sh odoo -d {env_db} -u {modules_str} --stop-after-init --no-http"
+    )
+    exit_code, output = container.exec_run(upgrade_cmd)
+    output_str = _decode_exec_output(output)
+    if exit_code != 0:
+        logger.error(
+            "Template module upgrade failed (exit %d): %s",
+            exit_code,
+            output_str,
+            extra={"env_name": env_name},
+        )
+        raise ExternalCommandError(upgrade_cmd, exit_code, output_str[-20_000:])
+    details = ", ".join(
+        f"{name} {installed} -> {checkout}"
+        for name, (installed, checkout) in sorted(upgrades.items())
+    )
+    return (
+        f"[TEMPLATE-UPGRADE] odoo -u {modules_str} completed successfully "
+        f"(newer than the template: {details})"
+    )
+
+
 def _auto_install_modules(
     container: Any,
     settings: Settings,
@@ -1496,7 +1649,7 @@ def _auto_install_modules(
         f"/entrypoint.sh odoo -d {env_db} -i {modules_str} --stop-after-init --no-http"
     )
     exit_code, output = container.exec_run(install_cmd)
-    output_str = output.decode("utf-8") if isinstance(output, bytes) else str(output)
+    output_str = _decode_exec_output(output)
     if exit_code != 0:
         logger.error(
             "Auto-install modules failed (exit %d): %s",
@@ -1522,8 +1675,13 @@ def _configure_serving_environment(
     auto_install_modules: list[str] | None,
     odoo_conf_to_copy: str | None,
     extra_mount_paths: list[tuple[str, str]] | None = None,
+    template_upgrades: dict[str, tuple[str, str]] | None = None,
 ) -> list[str]:
-    """Run required post-start setup before the environment is declared ready."""
+    """Run required post-start setup before the environment is declared ready.
+
+    *template_upgrades* are installed modules whose checkout is newer than the
+    template database (see :func:`_template_module_upgrades`).
+    """
     setup_logs: list[str] = []
     if odoo_conf_to_copy:
         _copy_file_to_container(container, odoo_conf_to_copy, "/etc/odoo")
@@ -1541,6 +1699,15 @@ def _configure_serving_environment(
     # .oduflow/odoo.conf but no requirements.txt serving on the stock
     # addons_path and worker settings until some later restart.
     container.restart()
+    if template_upgrades:
+        # Before the strict gate: until these upgrades add the new columns, the
+        # serving registry cannot render /web/login and the gate would only
+        # time out on HTTP 500 and roll the environment back.
+        setup_logs.append(
+            _upgrade_template_modules(container, env_db, template_upgrades, env_name)
+        )
+        # The serving process still holds the pre-upgrade registry.
+        container.restart()
     logger.info(
         "Waiting for serving Odoo after the setup restart",
         extra={"env_name": env_name},
@@ -1817,6 +1984,116 @@ def _clone_repo(
         )
 
 
+# git's wording when the remote refuses a push for lack of rights: HTTPS
+# (403 / "Permission to ... denied"), SSH deploy keys ("marked as read only")
+# and a credential store that cannot authenticate at all.
+_PUSH_DENIED_KEYWORDS = (
+    "permission",
+    "denied",
+    "403",
+    "read only",
+    "read-only",
+    "write access",
+    "authentication failed",
+    "could not read username",
+    "terminal prompts disabled",
+    "invalid username or password",
+)
+
+
+def _clone_or_start_branch(
+    repo_url: str,
+    branch: str,
+    repo_path: str,
+    team: TeamSettings,
+    *,
+    git_user: str = "",
+    base_branch: str = "",
+) -> bool:
+    """Clone *branch*, or start it from *base_branch* when origin lacks it.
+
+    A new branch is pushed to origin straight away: every later step fetches
+    the branch from there (pull_and_apply, switch_branch, the agent's own
+    checkout), so a branch that exists only in this checkout would break them.
+    Returns whether the branch was created.
+    """
+    try:
+        _clone_repo(repo_url, branch, repo_path, team, git_user=git_user)
+        return False
+    except NotFoundError:
+        if not base_branch or base_branch == branch:
+            raise
+    try:
+        _clone_repo(repo_url, base_branch, repo_path, team, git_user=git_user)
+    except NotFoundError:
+        raise NotFoundError(
+            f"Branch '{branch}' does not exist on origin, and neither does its "
+            f"base branch '{base_branch}'."
+        ) from None
+    _push_new_branch(repo_url, branch, base_branch, repo_path, team)
+    logger.info(
+        "Created branch '%s' from '%s' on %s",
+        branch,
+        base_branch,
+        sanitize_repo_url(repo_url),
+    )
+    return True
+
+
+def _push_new_branch(
+    repo_url: str,
+    branch: str,
+    base_branch: str,
+    repo_path: str,
+    team: TeamSettings,
+    *,
+    timeout: int = 60,
+) -> None:
+    """Start *branch* at the checked-out base tip and publish it on origin."""
+    git_env = git_env_for_team(team.git_credentials_file(), team.ssh_dir())
+    steps = (
+        ("git checkout", ["git", "-C", repo_path, "checkout", "-b", branch]),
+        # HEAD:refs/heads/<branch> names exactly the new branch and can never
+        # be read as an option. No --force: a branch someone else pushed in
+        # the meantime is never overwritten.
+        (
+            "git push",
+            [
+                "git",
+                "-C",
+                repo_path,
+                "push",
+                "--set-upstream",
+                "origin",
+                f"HEAD:refs/heads/{branch}",
+            ],
+        ),
+    )
+    for label, cmd in steps:
+        try:
+            subprocess.run(
+                cmd, check=True, capture_output=True, timeout=timeout, env=git_env
+            )
+        except subprocess.CalledProcessError as e:
+            error_msg = redact_url_credentials(
+                e.stderr.decode("utf-8") if e.stderr else str(e)
+            )
+            lowered = error_msg.lower()
+            if label == "git push" and any(
+                kw in lowered for kw in _PUSH_DENIED_KEYWORDS
+            ):
+                raise RepoAuthError(
+                    f"Branch '{branch}' does not exist on origin and could not "
+                    f"be created from '{base_branch}': the git credential cannot "
+                    f"push to {sanitize_repo_url(repo_url)}. Push the branch "
+                    f"yourself (git push -u origin {branch}) or use a credential "
+                    "with write access, then retry."
+                )
+            raise ExternalCommandError(label, e.returncode, error_msg)
+        except subprocess.TimeoutExpired:
+            raise ExternalCommandError(label, -1, f"{label} timed out ({timeout}s).")
+
+
 def build_env_traefik_labels(
     settings: Settings,
     team: TeamSettings,
@@ -1948,8 +2225,14 @@ def create_environment(
     stack_labels: dict[str, str] | None = None,
     hostname: str = "",
     hostname_source: str = "",
+    base_branch: str = "",
 ) -> dict[str, Any]:
-    """Allocate routing state, then provision the environment itself."""
+    """Allocate routing state, then provision the environment itself.
+
+    *base_branch*, when given, is where a *branch* missing on origin starts
+    from. The new branch is pushed to origin and stays there even when a later
+    provisioning step fails: a retry then simply clones it.
+    """
     resolved_env_name = env_name or branch
     requested_hostname = validate_env_hostname(hostname) if hostname else ""
     if requested_hostname and settings.routing_mode != "traefik":
@@ -2044,6 +2327,7 @@ def create_environment(
             stack_labels=stack_labels,
             hostname=assigned_hostname,
             hostname_source=assigned_hostname_source,
+            base_branch=base_branch,
         )
     except Exception:
         if reservation_active:
@@ -2079,6 +2363,7 @@ def _create_environment_impl(
     stack_labels: dict[str, str] | None = None,
     hostname: str = "",
     hostname_source: str = "",
+    base_branch: str = "",
 ) -> dict[str, Any]:
     env_name = env_name or branch
     from oduflow.naming import PROD_ENV_PREFIX
@@ -2104,7 +2389,7 @@ def _create_environment_impl(
             f"Failed to connect to Docker daemon: {e}. Ensure Docker is running."
         )
 
-    _ensure_system_ready(client, settings, team, template_name)
+    _ensure_system_ready(client, settings, team, template_name, odoo_image)
 
     odoo_container_name = get_resource_name(
         env_name, "odoo", settings.prefix, team.team_id
@@ -2250,6 +2535,7 @@ def _create_environment_impl(
 
     os.makedirs(workspace_path, exist_ok=True)
 
+    branch_created = False
     if local_mount:
         # No clone: the agent's checkout is bind-mounted live. The directory
         # must already exist on the host (validated in the tool layer too).
@@ -2262,12 +2548,13 @@ def _create_environment_impl(
         # against this snapshot. Git is deliberately ignored in live-mount mode.
         _write_local_snapshot(repo_path, env_name, team)
     else:
-        _clone_repo(
+        branch_created = _clone_or_start_branch(
             repo_url,
             branch,
             repo_path,
             team,
             git_user=git_user,
+            base_branch=base_branch,
         )
 
     # The template database is a snapshot of some commit; this checkout may sit
@@ -2373,7 +2660,18 @@ def _create_environment_impl(
         )
         odoo_conf_to_copy = generated_conf
 
+    template_upgrades: dict[str, tuple[str, str]] = {}
+    template_check_error: str | None = None
     if template_name is not None:
+        template_upgrades, template_check_error = _template_module_upgrades(
+            client, settings, env_db, odoo_volumes, odoo_conf_to_copy, env_name
+        )
+        if template_upgrades:
+            logger.info(
+                "Checkout is newer than the template database for modules: %s",
+                ", ".join(sorted(template_upgrades)),
+                extra={"env_name": env_name},
+            )
         _mount_filestore(
             client,
             settings,
@@ -2434,6 +2732,7 @@ def _create_environment_impl(
     if settings.routing_mode == "port":
         run_kwargs["ports"] = {"8069/tcp": host_port}
 
+    image_cleanup.note_image_requested(odoo_image)
     try:
         logger.info("Pulling image %s", odoo_image)
         client.images.pull(odoo_image)
@@ -2441,6 +2740,14 @@ def _create_environment_impl(
         logger.warning("Could not pull image %s, using local copy: %s", odoo_image, exc)
 
     setup_logs: list[str] = []
+    if template_check_error:
+        # Without the comparison no module gets `-u`, so a checkout that moved
+        # ahead of the template fails the readiness gate below with nothing but
+        # a timeout to go on. Say why the check did not run.
+        setup_logs.append(
+            "[TEMPLATE-UPGRADE] version check skipped, modules newer than the "
+            f"template were not upgraded: {template_check_error}"
+        )
 
     # Greenfield (no template): initialize the empty DB with `-i base` in an
     # isolated, short-lived container BEFORE the serving container exists, so
@@ -2494,6 +2801,7 @@ def _create_environment_impl(
                 auto_install_modules,
                 odoo_conf_to_copy,
                 extra_mount_paths,
+                template_upgrades,
             )
         )
     except Exception:
@@ -2537,6 +2845,9 @@ def _create_environment_impl(
     result["extra_addons"] = extra_addons or {}
     result["extra_addons_revisions"] = extra_revisions
     result["local_path"] = repo_path if local_mount else ""
+    # Set when the branch was missing on origin and was started (and pushed)
+    # from this base branch.
+    result["branch_created_from"] = base_branch if branch_created else ""
     result["template_lineage"] = lineage
     result["elapsed_seconds"] = round(time.time() - start_time, 1)
     activity.touch(team, env_name)
@@ -3848,7 +4159,12 @@ def get_environment_info(
             result["odoo"]["mem_usage_mb"] = stats["mem_usage_mb"]
             result["odoo"]["mem_percent"] = stats["mem_percent"]
     except docker.errors.NotFound:
-        pass
+        # Every field above is derived from the name alone, so without a
+        # container or a workspace there is nothing real to report on.
+        if not os.path.isdir(result["workspace"]):
+            raise NotFoundError(
+                f"Environment '{env_name}' does not exist. Use create_environment first."
+            )
 
     rec = activity.get_all(team).get(env_name, {})
     result["protected"] = is_protected(settings, team, env_name)
@@ -5045,6 +5361,8 @@ def update_environment(
             labels.get(settings.image_label) or container.attrs["Config"]["Image"]
         )
     odoo_image = image_override or current_image
+    if image_override:
+        require_postgres_for_odoo(client, settings, odoo_image)
     try:
         old_digest = container.image.id
     except Exception:
@@ -5110,6 +5428,7 @@ def update_environment(
     # at all (#49). If the pull fails, fall back to a local copy; if there is
     # none, abort with the existing environment left untouched.
     image_updated = False
+    image_cleanup.note_image_requested(odoo_image)
     if pull_image:
         try:
             logger.info("Pulling image %s", odoo_image)
