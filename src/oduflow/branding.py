@@ -136,7 +136,11 @@ def compute(settings: Settings, now: datetime | None = None) -> Brand:
     now = now or datetime.now(timezone.utc)
     if info.status == "not_yet_valid":
         return Brand(reason="the custom license is not valid yet")
-    expires = datetime.fromisoformat(info.expires.replace("Z", "+00:00"))
+    expires = info.expires_at
+    if expires is None:
+        # Verification requires an expiry for a custom license; a key without
+        # one is not something to brand with forever.
+        return Brand(reason="the custom license has no expiry")
     if now > expires + timedelta(days=GRACE_DAYS):
         return Brand(
             reason=f"the custom license expired more than {GRACE_DAYS} days ago"
@@ -166,10 +170,10 @@ def grace_days_left(settings: Settings, now: datetime | None = None) -> int | No
     from oduflow.licensing import TYPE_CUSTOM, get_license_info
 
     info = get_license_info(settings.etc_dir)
-    if info.type != TYPE_CUSTOM or not info.expired:
+    expires = info.expires_at
+    if info.type != TYPE_CUSTOM or expires is None or not info.expired:
         return None
     now = now or datetime.now(timezone.utc)
-    expires = datetime.fromisoformat(info.expires.replace("Z", "+00:00"))
     left = (expires + timedelta(days=GRACE_DAYS) - now).total_seconds()
     return max(0, math.ceil(left / 86400))
 
@@ -182,7 +186,10 @@ def start_grace_renewal(get_settings: Callable[[], Settings]) -> threading.Threa
     """
 
     def loop() -> None:
-        last_attempt = 0.0
+        # Start out "due": time.monotonic() counts from boot, so a 0.0 start
+        # would gate the first attempt on the host's uptime and a machine that
+        # restarts more often than daily would never renew at all.
+        last_attempt = time.monotonic() - _RENEWAL_INTERVAL_SECONDS
         while True:
             try:
                 if time.monotonic() - last_attempt >= _RENEWAL_INTERVAL_SECONDS:

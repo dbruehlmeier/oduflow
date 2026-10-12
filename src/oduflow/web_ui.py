@@ -530,12 +530,18 @@ def _flow_error_status(e: FlowError) -> int:
 
 
 def _public_flow_error(e: FlowError, *, context: str = "Dashboard operation") -> str:
+    """The message a browser may see for a failed dashboard operation.
+
+    Rebranded here because this is the one place every REST and WebSocket error
+    message passes through - the same role handle_errors plays for the MCP
+    surface. Messages stay written as "Oduflow" wherever they are raised.
+    """
     if isinstance(e, ExternalCommandError):
         # Command output can contain tracebacks, filesystem paths, or connection
         # details. Keep it in the server log instead of returning it to browsers.
         logger.error("%s failed: %s", context, e)
-        return _EXTERNAL_COMMAND_UI_ERROR
-    return str(e)
+        return branding.rebrand(_EXTERNAL_COMMAND_UI_ERROR)
+    return branding.rebrand(str(e))
 
 
 def _error_response(e: FlowError) -> JSONResponse:
@@ -543,6 +549,11 @@ def _error_response(e: FlowError) -> JSONResponse:
         {"ok": False, "error": _public_flow_error(e)},
         status_code=_flow_error_status(e),
     )
+
+
+def _term_error(exc: Exception) -> str:
+    """A red error line for the WebSocket terminals, under the brand."""
+    return f"\x1b[31mError: {branding.rebrand(str(exc))}\x1b[0m\r\n"
 
 
 def _validate_dev_env_name(env_name: str) -> str:
@@ -666,6 +677,10 @@ def _annotate_acp_auth_error(
     recognizable authentication failures. In particular, quota/spend-limit
     failures must remain untouched: silently trying a different credential
     could switch accounts or billing modes.
+
+    The guidance and the marker that makes this idempotent are rebranded
+    together: the marker is what the next frame is checked against, so a brand
+    in one but not the other would append the guidance again on every frame.
     """
     if agent_type not in {"claude", "opencode"}:
         return frame
@@ -680,21 +695,21 @@ def _annotate_acp_auth_error(
     if not isinstance(error_message, str):
         return frame
 
+    brand = branding.current()
     lowered = error_message.lower()
     if agent_type == "opencode":
         if "provider authentication required" not in lowered:
             return frame
-        if _OPENCODE_AUTH_GUIDANCE_MARKER in error_message:
+        guidance_marker = brand.rebrand(_OPENCODE_AUTH_GUIDANCE_MARKER)
+        if guidance_marker in error_message:
             return frame
-        guidance = (
+        guidance = brand.rebrand(
             "Open Agent CLI and run `opencode auth login`, or configure the "
             "selected provider's credential in "
             f"[team.{team_id}.agent_env] (or the single-team server environment), "
             "then restart Oduflow."
         )
-        error["message"] = (
-            f"{error_message}\n\n{_OPENCODE_AUTH_GUIDANCE_MARKER} {guidance}"
-        )
+        error["message"] = f"{error_message}\n\n{guidance_marker} {guidance}"
         return json.dumps(message, separators=(",", ":"), ensure_ascii=False)
 
     specific_markers = (
@@ -709,7 +724,8 @@ def _annotate_acp_auth_error(
     )
     if not generic_401 and not any(marker in lowered for marker in specific_markers):
         return frame
-    if _CLAUDE_AUTH_GUIDANCE_MARKER in error_message:
+    guidance_marker = brand.rebrand(_CLAUDE_AUTH_GUIDANCE_MARKER)
+    if guidance_marker in error_message:
         return frame
 
     if auth_mode == "setup_token":
@@ -734,7 +750,7 @@ def _annotate_acp_auth_error(
             "reopen Agent Chat."
         )
 
-    error["message"] = f"{error_message}\n\n{_CLAUDE_AUTH_GUIDANCE_MARKER} {guidance}"
+    error["message"] = f"{error_message}\n\n{guidance_marker} {brand.rebrand(guidance)}"
     return json.dumps(message, separators=(",", ":"), ensure_ascii=False)
 
 
@@ -5027,7 +5043,7 @@ def _build_routes(
             try:
                 validate_env_name(branch)
             except ValueError as e:
-                await websocket.send_text(f"\x1b[31mError: {e}\x1b[0m\r\n")
+                await websocket.send_text(_term_error(e))
                 await websocket.close(code=1008)
                 return
 
@@ -5150,7 +5166,7 @@ def _build_routes(
         except Exception as e:
             logger.exception("WebSocket terminal error for branch %s", branch)
             try:
-                await websocket.send_text(f"\x1b[31mError: {e}\x1b[0m\r\n")
+                await websocket.send_text(_term_error(e))
                 await websocket.close(code=1011)
             except Exception:
                 pass
@@ -5170,7 +5186,7 @@ def _build_routes(
             try:
                 validate_env_name(branch)
             except ValueError as e:
-                await websocket.send_text(f"\x1b[31mError: {e}\x1b[0m\r\n")
+                await websocket.send_text(_term_error(e))
                 await websocket.close(code=1008)
                 return
 
@@ -5212,7 +5228,7 @@ def _build_routes(
                     allow_fallback=False,
                 )
             except MissingCredentialsError as e:
-                await websocket.send_text(f"\x1b[31mError: {e}\x1b[0m\r\n")
+                await websocket.send_text(_term_error(e))
                 await websocket.close(code=1011)
                 return
 
@@ -5302,7 +5318,7 @@ def _build_routes(
         except Exception as e:
             logger.exception("WebSocket SQL terminal error for branch %s", branch)
             try:
-                await websocket.send_text(f"\x1b[31mError: {e}\x1b[0m\r\n")
+                await websocket.send_text(_term_error(e))
                 await websocket.close(code=1011)
             except Exception:
                 pass
@@ -5322,7 +5338,7 @@ def _build_routes(
             try:
                 validate_env_name(branch)
             except ValueError as e:
-                await websocket.send_text(f"\x1b[31mError: {e}\x1b[0m\r\n")
+                await websocket.send_text(_term_error(e))
                 await websocket.close(code=1008)
                 return
 
@@ -5546,7 +5562,7 @@ def _build_routes(
         except Exception as e:
             logger.exception("WebSocket agent console error for branch %s", branch)
             try:
-                await websocket.send_text(f"\x1b[31mError: {e}\x1b[0m\r\n")
+                await websocket.send_text(_term_error(e))
                 await websocket.close(code=1011)
             except Exception:
                 pass

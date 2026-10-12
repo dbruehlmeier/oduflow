@@ -65,6 +65,29 @@ _LOW_SPEED_ENV = {
 }
 
 
+def _seed_commit_env() -> dict[str, str]:
+    """Git environment for the seed commit of a local (origin-less) extra repo.
+
+    A clean environment has no git identity configured, so the commit would
+    fail - supply one explicitly for that operation only. Under white label it
+    carries the brand: this commit lands in the client's own repository
+    history, where the vendor name has no business being (see
+    oduflow.branding, git_ops.ssh_key_comment). Stock values are unchanged,
+    since the stock brand is named "Oduflow" with the slug "oduflow".
+    """
+    from oduflow import branding
+
+    brand = branding.current()
+    identity = f"import@{brand.slug}.local"
+    return {
+        **GIT_ENV,
+        "GIT_AUTHOR_NAME": brand.name,
+        "GIT_AUTHOR_EMAIL": identity,
+        "GIT_COMMITTER_NAME": brand.name,
+        "GIT_COMMITTER_EMAIL": identity,
+    }
+
+
 def validate_extra_repo_name(name: str) -> None:
     """Reject repo names unsafe as path components (used under workspaces)."""
     if not _NAME_RE.match(name):
@@ -406,15 +429,7 @@ def create_local_repo(
 
     os.makedirs(team.shared_repos_dir, exist_ok=True)
 
-    # A clean environment has no git identity configured, so the seed commit
-    # would fail — supply one explicitly for this operation only.
-    seed_env = {
-        **GIT_ENV,
-        "GIT_AUTHOR_NAME": "Oduflow",
-        "GIT_AUTHOR_EMAIL": "import@oduflow.local",
-        "GIT_COMMITTER_NAME": "Oduflow",
-        "GIT_COMMITTER_EMAIL": "import@oduflow.local",
-    }
+    seed_env = _seed_commit_env()
 
     def _git(args: list[str], timeout: int = 300) -> None:
         subprocess.run(

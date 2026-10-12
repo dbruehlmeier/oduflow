@@ -3339,8 +3339,7 @@ def export_module_translations(
         if not result["host_path"]:
             local_path = artifact_tokens.materialize(str(result["filename"]), content)
             lines.append(
-                f"Host path: {local_path}  "
-                "(temporary; removed when this Oduflow process stops)"
+                f"Host path: {local_path}  (temporary; removed when this process stops)"
             )
     else:
         token = artifact_tokens.issue(str(result["filename"]), content)
@@ -6461,8 +6460,12 @@ def _apply_agent_feedback(settings: Settings) -> None:
     Registered disabled, so by default the tool is absent from ``list_tools``
     and calling it answers "Unknown tool". Enabling also appends a one-liner to
     the MCP instructions every client receives in the initialize handshake.
+
+    White label hides the vendor surfaces (see _apply_branding), so the decision
+    is made here, before anything is published: hiding the tool afterwards would
+    leave the hint telling every client to call a tool that no longer exists.
     """
-    if not settings.agent_feedback:
+    if not settings.agent_feedback or branding.is_white_label():
         return
     from oduflow import agent_feedback as feedback_mod
 

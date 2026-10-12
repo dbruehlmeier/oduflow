@@ -66,10 +66,14 @@ class LicenseInfo:
     domains: tuple[str, ...] = ()
 
     @property
+    def expires_at(self) -> datetime | None:
+        """Expiry as an aware UTC datetime; None when the license is perpetual."""
+        return _parse_date(self.expires) if self.expires else None
+
+    @property
     def expired(self) -> bool:
-        return bool(self.expires) and _parse_date(self.expires) <= datetime.now(
-            timezone.utc
-        )
+        expires = self.expires_at
+        return expires is not None and expires <= datetime.now(timezone.utc)
 
     @property
     def status(self) -> str:
@@ -131,6 +135,7 @@ def get_license_path(etc_dir: str | None = None) -> str:
 
 
 def _verify_license_text(raw: str) -> LicenseInfo:
+    from cryptography.exceptions import InvalidSignature
     from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.asymmetric import padding, rsa
     from cryptography.hazmat.primitives.serialization import load_pem_public_key
@@ -146,15 +151,22 @@ def _verify_license_text(raw: str) -> LicenseInfo:
     pub_key = load_pem_public_key(_PUBLIC_KEY_PEM.encode())
     if not isinstance(pub_key, rsa.RSAPublicKey):
         raise ValueError("License public key must be an RSA key")
-    pub_key.verify(
-        signature,
-        payload_bytes,
-        padding.PSS(
-            mgf=padding.MGF1(hashes.SHA256()),
-            salt_length=padding.PSS.MAX_LENGTH,
-        ),
-        hashes.SHA256(),
-    )
+    try:
+        pub_key.verify(
+            signature,
+            payload_bytes,
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.MAX_LENGTH,
+            ),
+            hashes.SHA256(),
+        )
+    except InvalidSignature as exc:
+        # Every rejection leaves this function as a ValueError. InvalidSignature
+        # is a bare Exception with an empty message, so letting it out means the
+        # CLI prints a traceback with no reason and the dashboard answers 500
+        # instead of naming the problem.
+        raise ValueError("Invalid license signature") from exc
 
     data = json.loads(payload_bytes)
     if not isinstance(data, dict):
@@ -169,8 +181,13 @@ def _verify_license_text(raw: str) -> LicenseInfo:
     # in older keys are ignored.
     valid_from = _optional_str(data, "valid_from")
     expires = _optional_str(data, "expires")
+    # Parsed here even when there is nothing to compare: LicenseInfo.status and
+    # oduflow.branding do arithmetic on these, so a naive or malformed timestamp
+    # has to be rejected now (degrading to unlicensed) rather than raise later
+    # from a dashboard request or an MCP call.
     if expires:
-        if valid_from and _parse_date(expires) <= _parse_date(valid_from):
+        expires_at = _parse_date(expires)
+        if valid_from and expires_at <= _parse_date(valid_from):
             raise ValueError("Invalid license period")
     elif valid_from:
         raise ValueError("Invalid license period")

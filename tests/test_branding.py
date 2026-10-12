@@ -219,6 +219,91 @@ def test_handle_errors_rebrands_results_and_errors(tmp_path, sign):
         asyncio.run(tool_error())
 
 
+def test_rest_errors_are_rebranded(tmp_path, sign, monkeypatch):
+    """Dashboard errors are rebranded at the one place they pass through.
+
+    _public_flow_error is to the REST and WebSocket surface what handle_errors
+    is to MCP, so messages raised anywhere in the codebase stay written as
+    "Oduflow".
+    """
+    from oduflow import web_ui
+    from oduflow.errors import ProtectedError
+
+    def _protected(*args, **kwargs):
+        raise ProtectedError("Unprotect it in the Oduflow dashboard first.")
+
+    _install(tmp_path, sign)
+    client = _client(_settings(tmp_path))
+    monkeypatch.setattr(web_ui.env_ops, "list_environments", _protected)
+
+    response = client.get("/api/environments")
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "Unprotect it in the AcmeFlow dashboard first."
+
+
+def test_terminal_errors_are_rebranded(tmp_path, sign):
+    from oduflow import web_ui
+    from oduflow.errors import FlowError
+
+    _install(tmp_path, sign)
+    branding.configure(lambda: _settings(tmp_path))
+
+    line = web_ui._term_error(FlowError("Restart Oduflow and retry."))
+
+    assert "Restart AcmeFlow and retry." in line
+    assert "Oduflow" not in line
+
+
+@pytest.mark.parametrize(
+    "agent_type,provider_error,marker",
+    [
+        ("claude", "401 failed to authenticate", "AcmeFlow authentication guidance:"),
+        (
+            "opencode",
+            "provider authentication required",
+            "AcmeFlow OpenCode authentication guidance:",
+        ),
+    ],
+)
+def test_acp_auth_guidance_is_rebranded_and_appended_once(
+    tmp_path, sign, agent_type, provider_error, marker
+):
+    """The marker is both what the client reads and the idempotency check.
+
+    Rebranding the guidance but not the marker would stop matching the frame it
+    already annotated, appending the advice again on every error frame.
+    """
+    import json
+
+    from oduflow import web_ui
+
+    _install(tmp_path, sign)
+    branding.configure(lambda: _settings(tmp_path))
+    frame = json.dumps({"error": {"code": -32603, "message": provider_error}})
+
+    once = web_ui._annotate_acp_auth_error(frame, agent_type, "setup_token", "1")
+    twice = web_ui._annotate_acp_auth_error(once, agent_type, "setup_token", "1")
+
+    assert marker in once
+    assert "Oduflow" not in once
+    assert twice == once
+
+
+def test_seed_commits_carry_the_brand(tmp_path, sign):
+    # The seed commit of a local extra repo lands in the client's own history.
+    from oduflow import extra_addons
+
+    _install(tmp_path, sign)
+    assert extra_addons._seed_commit_env()["GIT_AUTHOR_NAME"] == "Oduflow"
+
+    branding.configure(lambda: _settings(tmp_path))
+    seed_env = extra_addons._seed_commit_env()
+
+    assert seed_env["GIT_AUTHOR_NAME"] == "AcmeFlow"
+    assert seed_env["GIT_COMMITTER_EMAIL"] == "import@acmeflow.local"
+
+
 def test_mcp_surface_is_rebranded_and_vendor_tools_hidden(tmp_path, sign):
     from oduflow import server
 
@@ -294,6 +379,71 @@ def test_grace_renewal_installs_a_renewed_key(tmp_path, sign, monkeypatch):
     assert (tmp_path / "license.key").read_text() == renewed
     assert branding.grace_days_left(settings) is None
     assert not branding._renew_in_grace(settings)
+
+
+def test_white_label_withholds_the_agent_feedback_surface(tmp_path, sign):
+    """A hidden tool must not be advertised in the MCP instructions.
+
+    White label hides submit_agent_feedback, so publishing its hint would tell
+    every client to call a tool that answers "Unknown tool".
+    """
+    import dataclasses
+
+    from oduflow import agent_feedback, server
+
+    _install(tmp_path, sign)
+    settings = dataclasses.replace(_settings(tmp_path), agent_feedback=True)
+    branding.configure(lambda: settings)
+    saved = server.mcp.instructions
+    try:
+        server._apply_agent_feedback(settings)
+
+        assert agent_feedback.MCP_HINT not in (server.mcp.instructions or "")
+        assert not server.mcp._tool_manager._tools["submit_agent_feedback"].enabled
+    finally:
+        server.mcp.instructions = saved
+        server.submit_agent_feedback.disable()
+
+
+def test_grace_renewal_attempts_once_at_startup(tmp_path, monkeypatch):
+    """The daily gate must not be measured against the host's uptime.
+
+    time.monotonic() counts from boot, so starting the gate at zero made the
+    first attempt wait for a day of uptime; a server restarted more often than
+    that never renewed at all, and white label lapsed after the grace period
+    despite a paid renewal. Here the host has been up for five minutes.
+    """
+    import threading
+
+    attempts: list[Settings] = []
+    parked = threading.Event()
+    forever = threading.Event()
+
+    class _JustBooted:
+        """Stands in for the ``time`` module inside oduflow.branding."""
+
+        @staticmethod
+        def monotonic() -> float:
+            return 300.0
+
+        @staticmethod
+        def sleep(seconds: float) -> None:
+            # One iteration is enough; park the daemon thread for good.
+            parked.set()
+            forever.wait()
+
+    def _attempt(settings: Settings) -> bool:
+        attempts.append(settings)
+        return True
+
+    monkeypatch.setattr(branding, "time", _JustBooted)
+    monkeypatch.setattr(branding, "_renew_in_grace", _attempt)
+    settings = _settings(tmp_path)
+
+    branding.start_grace_renewal(lambda: settings)
+
+    assert parked.wait(timeout=10)
+    assert attempts == [settings]
 
 
 def test_payload_helpers_are_base64():

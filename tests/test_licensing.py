@@ -1,5 +1,4 @@
 import pytest
-from cryptography.exceptions import InvalidSignature
 
 from oduflow import licensing
 from oduflow.licensing import TYPE_BUSINESS, TYPE_INDIVIDUAL, LicenseInfo
@@ -141,7 +140,7 @@ class TestVerifyLicenseText:
         ).encode()
         tampered = sig_b64 + "." + base64.b64encode(forged).decode()
 
-        with pytest.raises(InvalidSignature):
+        with pytest.raises(ValueError, match="Invalid license signature"):
             licensing._verify_license_text(tampered)
 
     def test_a_license_signed_by_another_key_is_rejected(self, monkeypatch):
@@ -150,7 +149,7 @@ class TestVerifyLicenseText:
         monkeypatch.setattr(licensing, "_PUBLIC_KEY_PEM", our_pem)
         key = self._sign(other_private, {"type": "business", "name": "Acme"})
 
-        with pytest.raises(InvalidSignature):
+        with pytest.raises(ValueError, match="Invalid license signature"):
             licensing._verify_license_text(key)
 
     def test_unknown_license_type_is_rejected(self, signer):
@@ -296,6 +295,45 @@ def test_legacy_key_remains_perpetual(annual_signer):
 def test_rejects_malformed_annual_terms(annual_signer, change):
     with pytest.raises(ValueError):
         licensing._verify_license_text(annual_signer(annual_payload(**change)))
+
+
+@pytest.mark.parametrize("expires", ["garbage", "2028-01-01T00:00:00"])
+def test_rejects_a_bad_expiry_without_a_valid_from(annual_signer, expires):
+    # A key carrying only an expiry used to skip date parsing altogether, so a
+    # malformed or timezone-naive timestamp was accepted here and raised later
+    # instead - from LicenseInfo.status or oduflow.branding, in the middle of a
+    # dashboard request or an MCP call.
+    payload = annual_payload(expires=expires)
+    payload.pop("valid_from")
+
+    with pytest.raises(ValueError):
+        licensing._verify_license_text(annual_signer(payload))
+
+
+def test_license_cli_names_a_wrongly_signed_key(tmp_path):
+    # Verified against the real product key, so the signature cannot match.
+    # The CLI has to report the reason instead of printing a traceback with an
+    # empty message (InvalidSignature carries none).
+    import argparse
+
+    from oduflow.errors import FlowError
+    from oduflow.server import _run_license_cli
+    from oduflow.settings import Settings
+
+    private, _ = TestVerifyLicenseText._keypair()
+    key_path = tmp_path / "bad.key"
+    key_path.write_text(
+        TestVerifyLicenseText._sign(private, {"type": "business", "name": "Acme"}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(FlowError, match="Invalid license signature"):
+        _run_license_cli(
+            Settings(etc_dir=str(tmp_path)),
+            argparse.Namespace(license_action="install", file=str(key_path)),
+        )
+
+    assert not (tmp_path / "license.key").exists()
 
 
 @pytest.mark.parametrize(
