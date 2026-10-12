@@ -644,7 +644,13 @@ def _parse_extra_addons(raw: str) -> dict[str, str]:
 
 
 def _guide_title(filepath: str) -> str:
-    """A guide's first heading under the brand, as get_agent_instructions shows it."""
+    """A guide's first heading under the brand, as get_agent_instructions shows it.
+
+    A guide without a heading falls back to its file name, which is rebranded
+    too (after title-casing, so the brand's own capitalization survives): a
+    team guide saved as ``oduflow_tips.md`` would otherwise list the product
+    name in the Agent Guides tab.
+    """
     try:
         with open(filepath, "r", encoding="utf-8") as f:
             for line in f:
@@ -653,7 +659,8 @@ def _guide_title(filepath: str) -> str:
                     return branding.rebrand(line[2:].strip())
     except Exception:
         pass
-    return os.path.basename(filepath).replace("_", " ").replace(".md", "").title()
+    name = os.path.basename(filepath).replace("_", " ").replace(".md", "").title()
+    return branding.rebrand(name)
 
 
 def _acp_adapter_cmd(agent_type: str) -> list[str]:

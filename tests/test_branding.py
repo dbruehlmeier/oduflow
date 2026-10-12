@@ -485,17 +485,61 @@ def test_white_label_agent_instructions_omit_the_feedback_section(
 
     from tool_helpers import call_tool
 
+    from oduflow import server
+
     _install(tmp_path, sign)
     settings = dataclasses.replace(_settings(tmp_path), agent_feedback=True)
     _feedback_instance(monkeypatch, settings)
-    assert "Session Feedback" in call_tool("get_agent_instructions", ctx=None)
 
+    saved = server.mcp.instructions
+    try:
+        # Stock startup publishes the tool, so the guide documents it.
+        server._apply_agent_feedback(settings)
+        assert "Session Feedback" in call_tool("get_agent_instructions", ctx=None)
+    finally:
+        server.mcp.instructions = saved
+        server.submit_agent_feedback.disable()
+
+    # Under white label startup withholds the tool, and the guide follows the
+    # published surface rather than re-deciding per call.
     branding.configure(lambda: settings)
+    server._apply_agent_feedback(settings)
     guide = call_tool("get_agent_instructions", ctx=None)
 
     assert "Session Feedback" not in guide
     assert "submit_agent_feedback" not in guide
     assert "AcmeFlow" in guide and "Oduflow" not in guide
+
+
+def test_agent_instructions_follow_the_published_feedback_tool(
+    tmp_path, sign, monkeypatch
+):
+    """An expiring license must not start advertising a withheld tool.
+
+    The tool surface is published once at startup, while the brand is re-read
+    per call: once the license is gone the prose is stock again, but
+    submit_agent_feedback is still absent from list_tools until a restart.
+    """
+    import dataclasses
+
+    from tool_helpers import call_tool
+
+    from oduflow import server
+
+    _install(tmp_path, sign)
+    settings = dataclasses.replace(_settings(tmp_path), agent_feedback=True)
+    _feedback_instance(monkeypatch, settings)
+    branding.configure(lambda: settings)
+    server._apply_agent_feedback(settings)
+    assert not server.submit_agent_feedback.enabled
+
+    (tmp_path / "license.key").unlink()
+    assert not branding.is_white_label()
+
+    guide = call_tool("get_agent_instructions", ctx=None)
+
+    assert "Session Feedback" not in guide
+    assert "submit_agent_feedback" not in guide
 
 
 def _guide_settings(tmp_path) -> Settings:
@@ -508,6 +552,10 @@ def _guide_settings(tmp_path) -> Settings:
     (tmp_path / "team" / "agent_guides").mkdir(parents=True)
     (tmp_path / "team" / "agent_guides" / "team_notes.md").write_text(
         "# Oduflow team notes\n\nAsk the Oduflow operator.\n", encoding="utf-8"
+    )
+    # No heading: the viewer falls back to the file name for the title.
+    (tmp_path / "team" / "agent_guides" / "oduflow_handover.md").write_text(
+        "Ask the operator before deploying.\n", encoding="utf-8"
     )
     return settings
 
@@ -525,6 +573,7 @@ def test_white_label_agent_guides_viewer_is_rebranded(tmp_path, sign):
     team = client.get("/api/agent-guides/team_notes.md").json()["content"]
 
     assert titles["team_notes.md"] == "AcmeFlow team notes"
+    assert titles["oduflow_handover.md"] == "AcmeFlow Handover"
     assert titles["agent_instructions.md"].startswith("AcmeFlow")
     assert "Oduflow" not in bundled and "AcmeFlow" in bundled
     assert team == "# AcmeFlow team notes\n\nAsk the AcmeFlow operator.\n"
@@ -544,6 +593,7 @@ def test_stock_agent_guides_viewer_serves_the_files_as_they_are(tmp_path):
     bundled = client.get("/api/agent-guides/agent_instructions.md").json()["content"]
 
     assert titles["team_notes.md"] == "Oduflow team notes"
+    assert titles["oduflow_handover.md"] == "Oduflow Handover"
     assert bundled == (
         _TEMPLATE_DIR / "agent_guides" / "agent_instructions.md"
     ).read_text(encoding="utf-8")

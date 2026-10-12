@@ -1857,10 +1857,14 @@ def get_agent_instructions(ctx: Context | None = None) -> str:
 
     team = _resolve_team(ctx)
     guide = _guide_body()
-    # The feedback section ships nowhere on disk — it exists only while the
-    # (undocumented) [server] agent_feedback option is on. White label hides
-    # submit_agent_feedback, so the guide must not point agents at it.
-    if _get_settings().agent_feedback and not branding.is_white_label():
+    # The feedback section ships nowhere on disk — it exists only while
+    # submit_agent_feedback is actually published (the undocumented [server]
+    # agent_feedback option, withheld under white label). Read that published
+    # state instead of re-deriving it from settings and branding: the decision
+    # is made once in _apply_agent_feedback, while branding is live, so a
+    # license that expires (or is installed) mid-run would otherwise leave the
+    # guide pointing agents at a tool that is not in list_tools.
+    if submit_agent_feedback.enabled:
         from oduflow import agent_feedback as feedback_mod
 
         guide = guide.rstrip() + "\n\n" + feedback_mod.INSTRUCTIONS_SECTION
