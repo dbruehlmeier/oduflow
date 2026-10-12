@@ -755,9 +755,9 @@ def _codex_cli_cmd(mcp_url: str, model: str = "") -> list[str]:
         "codex",
         "--dangerously-bypass-approvals-and-sandbox",
         "-c",
-        f'mcp_servers.oduflow.url="{mcp_url}"',
+        f'mcp_servers.{env_ops.AGENT_MCP_SERVER}.url="{mcp_url}"',
         "-c",
-        'mcp_servers.oduflow.bearer_token_env_var="ODUFLOW_MCP_TOKEN"',
+        f'mcp_servers.{env_ops.AGENT_MCP_SERVER}.bearer_token_env_var="ODUFLOW_MCP_TOKEN"',
     ]
     if model:
         cmd += ["--model", model]
@@ -830,7 +830,7 @@ def _opencode_config(
     if model:
         config["model"] = model
     if include_oduflow:
-        config.setdefault("mcp", {})["oduflow"] = {
+        config.setdefault("mcp", {})[env_ops.AGENT_MCP_SERVER] = {
             "type": "remote",
             "url": mcp_url,
             "enabled": True,
@@ -920,7 +920,12 @@ def _wire_client_acp_mcp(
         server
         for server in servers
         if not isinstance(server, dict)
-        or server.get("name") not in {"agent_browser", "oduflow"}
+        or server.get("name")
+        not in {
+            "agent_browser",
+            env_ops.AGENT_MCP_SERVER,
+            env_ops.LEGACY_AGENT_MCP_SERVER,
+        }
     ]
     servers.append(
         {
@@ -940,7 +945,7 @@ def _wire_client_acp_mcp(
         servers.append(
             {
                 "type": "http",
-                "name": "oduflow",
+                "name": env_ops.AGENT_MCP_SERVER,
                 "url": mcp_url,
                 "headers": [{"name": "Authorization", "value": f"Bearer {mcp_token}"}],
             }

@@ -143,6 +143,10 @@ With an active Custom license:
   visible), and the license banner and dialog. The `report_issue` and
   `submit_agent_feedback` MCP tools are hidden.
 - Your clients see nothing about licensing, also after expiry.
+- The agent's default commit identity uses the brand: `<brand>-coder` with an
+  `@<brand>.local` address, also in existing checkouts, instead of
+  `oduflow-coder` and `@oduflow.local`. The seed commit of a local extra repo is
+  authored by the brand name.
 
 Technical names on your servers keep the product name: the `oduflow` package and
 CLI, `oduflow.toml`, container, volume and database names, and paths. Avoid a

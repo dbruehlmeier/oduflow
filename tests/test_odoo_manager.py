@@ -4327,6 +4327,52 @@ class TestAgentContainer:
         assert "ODUFLOW_MCP_TOKEN" in cmd[2]
         assert container.exec_run.call_args.kwargs["user"] == "agent"
 
+    def test_refresh_agent_mcp_config_renames_server_and_follows_brand(self, tmp_path):
+        import json
+        import shutil
+        import subprocess
+
+        if not (shutil.which("jq") and shutil.which("git")):
+            pytest.skip("jq and git are required to run the refresh script")
+        team = self._team(hostname="mirageflow.ca")
+        settings = self._settings(team=team, routing_mode="traefik")
+        container = MagicMock()
+        container.exec_run.return_value = (0, b"")
+        env_ops.refresh_agent_mcp_config(container, settings, team, "feature/x")
+        cmd = container.exec_run.call_args.args[0]
+        assert cmd[6:] == ["oduflow", "development", "oduflow"]
+
+        checkout = tmp_path / "feature-x"
+        subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+        subprocess.run(
+            ["git", "-C", str(checkout), "config", "user.email", "dev@oduflow.local"],
+            check=True,
+        )
+        config = checkout / ".mcp.json"
+        config.write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "oduflow": {"type": "http", "url": "http://old"},
+                        "custom": {"command": "custom-mcp"},
+                    }
+                }
+            )
+        )
+        script_args = [*cmd[:4], str(config), cmd[5], "acmeflow", *cmd[7:]]
+        subprocess.run(script_args, check=True)
+
+        servers = json.loads(config.read_text())["mcpServers"]
+        assert set(servers) == {"custom", "development"}
+        assert servers["development"]["url"] == "https://mirageflow.ca/mcp/feature/x"
+        email = subprocess.run(
+            ["git", "-C", str(checkout), "config", "user.email"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        assert email == "dev@acmeflow.local"
+
     def test_disabled_creates_nothing(self, mock_docker_client):
         team = self._team(agent_enabled=False)
         env_ops._ensure_agent_container(

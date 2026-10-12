@@ -170,6 +170,21 @@ def test_stock_dashboard_keeps_vendor_surfaces(tmp_path):
     assert client.get("/api/license").status_code == 200
 
 
+def test_admin_console_login_follows_the_brand(tmp_path, sign):
+    from oduflow import admin_ui
+
+    page = admin_ui._render_login()
+    assert "<title>Oduflow — Server settings</title>" in page
+    assert "__" not in page.split("<body", 1)[1].split("<script", 1)[0]
+
+    _install(tmp_path, sign)
+    branding.configure(lambda: _settings(tmp_path))
+    page = admin_ui._render_login()
+    assert "<title>AcmeFlow — Server settings</title>" in page
+    assert 'alt="AcmeFlow logo"' in page
+    assert "__BRAND_NAME__" not in page and "__LOGO_CLASS__" not in page
+
+
 def test_white_label_images_come_from_the_config_dir(tmp_path, sign):
     _install(tmp_path, sign)
     (tmp_path / "branding").mkdir()

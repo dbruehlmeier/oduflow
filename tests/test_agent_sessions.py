@@ -186,9 +186,9 @@ def test_codex_cli_cmd_uses_docker_as_the_sandbox():
         "codex",
         "--dangerously-bypass-approvals-and-sandbox",
         "-c",
-        'mcp_servers.oduflow.url="http://scoped/mcp/env"',
+        'mcp_servers.development.url="http://scoped/mcp/env"',
         "-c",
-        'mcp_servers.oduflow.bearer_token_env_var="ODUFLOW_MCP_TOKEN"',
+        'mcp_servers.development.bearer_token_env_var="ODUFLOW_MCP_TOKEN"',
         "--model",
         "gpt-test",
     ]
@@ -217,7 +217,7 @@ def test_opencode_cli_and_session_config():
         "--tools",
         "all",
     ]
-    assert config["mcp"]["oduflow"] == {
+    assert config["mcp"]["development"] == {
         "type": "remote",
         "url": "http://scoped/mcp/env",
         "enabled": True,
@@ -360,8 +360,15 @@ def test_wire_client_acp_mcp_adds_scoped_server_and_preserves_others():
                     {"name": "agent_browser", "command": "wrong-browser"},
                     {
                         "type": "http",
-                        "name": "oduflow",
+                        "name": "development",
                         "url": "http://wrong",
+                        "headers": [],
+                    },
+                    # A client still sending the server under its legacy name.
+                    {
+                        "type": "http",
+                        "name": "oduflow",
+                        "url": "http://old",
                         "headers": [],
                     },
                 ],
@@ -389,7 +396,7 @@ def test_wire_client_acp_mcp_adds_scoped_server_and_preserves_others():
         },
         {
             "type": "http",
-            "name": "oduflow",
+            "name": "development",
             "url": "http://scoped/mcp/env",
             "headers": [{"name": "Authorization", "value": "Bearer scoped-token"}],
         },
@@ -416,7 +423,7 @@ def test_wire_client_acp_mcp_handles_load_but_not_other_frames():
     )["params"]["mcpServers"]
     assert [server["name"] for server in load_servers] == [
         "agent_browser",
-        "oduflow",
+        "development",
     ]
 
     prompt = '{"jsonrpc":"2.0","method":"session/prompt","params":{}}'

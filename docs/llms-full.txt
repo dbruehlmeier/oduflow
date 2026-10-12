@@ -958,7 +958,7 @@ prod_purge_hours = 0        # purge DB/files kept by a production deletion after
 # from the dashboard (Agent Chat / Agent CLI). Opt-in per team via
 # agent_enabled below.
 # [agent]
-# image = "oduist/oduflow-coder:0.3.2"
+# image = "oduist/oduflow-coder:0.3.3"
 # claude_model = ""         # optional Claude model override; empty = CLI default
 # codex_model = ""          # optional Codex model override; empty = CLI default
 # opencode_model = ""       # optional provider/model override; empty = OpenCode default
@@ -1077,7 +1077,7 @@ The global `[agent]` section holds deployment-wide settings for the per-team cod
 
 | Key | Default | Description |
 |---|---|---|
-| `[agent].image` | `oduist/oduflow-coder:0.3.2` | Immutable image for the per-team coding-agent container (Claude Code + OpenAI Codex + OpenCode); the default is coupled to the Oduflow release |
+| `[agent].image` | `oduist/oduflow-coder:0.3.3` | Immutable image for the per-team coding-agent container (Claude Code + OpenAI Codex + OpenCode); the default is coupled to the Oduflow release |
 | `[agent].claude_model` | *(empty)* | Optional Claude model override for the agent; empty = CLI default |
 | `[agent].codex_model` | *(empty)* | Optional Codex model override for the agent; empty = CLI default |
 | `[agent].opencode_model` | *(empty)* | Optional OpenCode model override in `provider/model` format; empty = OpenCode default |
@@ -3581,7 +3581,10 @@ The agent never touches host files. It holds one full git checkout per
 environment (at `/workspace/<slug>` in the container), edits its own clone,
 `git push`es, and then drives the environment **only through the Oduflow MCP
 server** (`pull_and_apply`, `run_odoo_tests`, etc.) — the same closed loop a
-remote MCP client uses.
+remote MCP client uses. Inside the agent this server is named `development`, so
+its tools appear as `development_*` in OpenCode and `mcp__development__*` in
+Claude Code and Codex. Checkouts created by earlier releases had it under
+`oduflow`; that entry is replaced before the next session.
 
 The image also includes **Agent Browser MCP** backed by Debian Chromium. It is
 wired automatically into Claude, Codex, and OpenCode with the complete Agent
@@ -3609,7 +3612,7 @@ enablement and credentials live in the `[team.*]` sections:
 ```toml
 # Deployment-wide (optional)
 [agent]
-image = "oduist/oduflow-coder:0.3.2"
+image = "oduist/oduflow-coder:0.3.3"
 # claude_model = ""     # optional Claude model override; empty = CLI default
 # codex_model = ""      # optional Codex model override; empty = CLI default
 # opencode_model = ""   # optional provider/model override; empty = OpenCode default
@@ -10959,6 +10962,10 @@ With an active Custom license:
   visible), and the license banner and dialog. The `report_issue` and
   `submit_agent_feedback` MCP tools are hidden.
 - Your clients see nothing about licensing, also after expiry.
+- The agent's default commit identity uses the brand: `<brand>-coder` with an
+  `@<brand>.local` address, also in existing checkouts, instead of
+  `oduflow-coder` and `@oduflow.local`. The seed commit of a local extra repo is
+  authored by the brand name.
 
 Technical names on your servers keep the product name: the `oduflow` package and
 CLI, `oduflow.toml`, container, volume and database names, and paths. Avoid a

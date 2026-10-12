@@ -35,7 +35,10 @@ The agent never touches host files. It holds one full git checkout per
 environment (at `/workspace/<slug>` in the container), edits its own clone,
 `git push`es, and then drives the environment **only through the Oduflow MCP
 server** (`pull_and_apply`, `run_odoo_tests`, etc.) — the same closed loop a
-remote MCP client uses.
+remote MCP client uses. Inside the agent this server is named `development`, so
+its tools appear as `development_*` in OpenCode and `mcp__development__*` in
+Claude Code and Codex. Checkouts created by earlier releases had it under
+`oduflow`; that entry is replaced before the next session.
 
 The image also includes **Agent Browser MCP** backed by Debian Chromium. It is
 wired automatically into Claude, Codex, and OpenCode with the complete Agent
@@ -63,7 +66,7 @@ enablement and credentials live in the `[team.*]` sections:
 ```toml
 # Deployment-wide (optional)
 [agent]
-image = "oduist/oduflow-coder:0.3.2"
+image = "oduist/oduflow-coder:0.3.3"
 # claude_model = ""     # optional Claude model override; empty = CLI default
 # codex_model = ""      # optional Codex model override; empty = CLI default
 # opencode_model = ""   # optional provider/model override; empty = OpenCode default
