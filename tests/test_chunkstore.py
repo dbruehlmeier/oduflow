@@ -836,6 +836,111 @@ class TestChunkerParameters:
         assert second == [b"b" * 500]
 
 
+def _reference_chunks(
+    seed: bytes, data: bytes, *, min_size: int, avg_size: int, max_size: int
+) -> list[bytes]:
+    """The chunking rule straight from the module docstring, with every
+    window hashed from scratch (no rolling, no buffering) — slow, but
+    independent of the streaming implementation."""
+    table = derive_table(seed)
+    mask = avg_size - 1
+
+    def window_hash(window: bytes) -> int:
+        h = 0
+        for b in window:
+            h = (((h << 1) | (h >> 63)) & (2**64 - 1)) ^ table[b]
+        return h
+
+    chunks, start = [], 0
+    while len(data) - start >= min_size:
+        end = min(len(data), start + max_size)
+        cut = next(
+            (
+                p
+                for p in range(start + min_size, end + 1)
+                if window_hash(data[p - min_size : p]) & mask == 0
+            ),
+            None,
+        )
+        if cut is None:
+            if end - start < max_size:
+                break  # tail without a boundary
+            cut = end  # forced cut
+        chunks.append(data[start:cut])
+        start = cut
+    if start < len(data):
+        chunks.append(data[start:])
+    return chunks
+
+
+class _CountingTable(list):
+    """Rolling-hash table that counts lookups (one per byte hashed in)."""
+
+    lookups = 0
+
+    def __getitem__(self, index):
+        self.lookups += 1
+        return super().__getitem__(index)
+
+
+class TestChunkerStreaming:
+    """Issue #309: chunks must not depend on how the stream is split across
+    update() calls, and splitting it finely must not multiply the work —
+    the first filestore backup feeds the chunker one small file at a time."""
+
+    TINY = dict(min_size=64, avg_size=256, max_size=1024)
+
+    @pytest.mark.parametrize("block", [1, 7, 100, 1000, 25_000])
+    def test_chunks_match_the_reference_for_any_split(self, block):
+        data = random.Random(11).randbytes(20_000)
+        expected = _reference_chunks(b"seed", data, **self.TINY)
+
+        assert _chunk_all(Chunker(b"seed", **self.TINY), data, block=block) == (
+            expected
+        )
+
+    def test_uniform_input_matches_the_reference(self):
+        # No boundary ever fires: every chunk is a forced cut at max_size.
+        data = b"\x00" * 5000
+        expected = _reference_chunks(b"seed", data, **self.TINY)
+
+        assert _chunk_all(Chunker(b"seed", **self.TINY), data, block=3) == expected
+
+    def test_file_sized_updates_match_a_single_update(self):
+        rnd = random.Random(12)
+        files = [rnd.randbytes(rnd.randint(1, 3000)) for _ in range(150)]
+        chunker = Chunker(b"seed", **SMALL)
+        streamed = [c for f in files for c in chunker.update(f)]
+        streamed.extend(chunker.flush())
+
+        assert streamed == _chunk_all(
+            Chunker(b"seed", **SMALL), b"".join(files), block=10**9
+        )
+
+    def test_each_byte_is_hashed_at_most_once(self):
+        # Before the fix every update() re-hashed the whole buffer from the
+        # chunk start: O(updates x max_size) instead of O(bytes).
+        data = random.Random(13).randbytes(200_000)
+        chunker = Chunker(b"seed", **SMALL)
+        chunker._table = _CountingTable(chunker._table)
+
+        chunks = _chunk_all(chunker, data, block=50)
+
+        assert b"".join(chunks) == data
+        assert chunker._table.lookups <= len(data)
+
+    def test_flush_resets_the_resumed_scan(self):
+        # State carried from a cut-off stream must not leak into the next.
+        data = random.Random(14).randbytes(30_000)
+        chunker = Chunker(b"seed", **SMALL)
+        list(chunker.update(random.Random(15).randbytes(3000)))
+        list(chunker.flush())
+
+        assert _chunk_all(chunker, data, block=500) == _chunk_all(
+            Chunker(b"seed", **SMALL), data
+        )
+
+
 class TestDeriveTable:
     def test_yields_exactly_256_entries(self):
         # One entry per byte value; 255 or 257 would index out of range or
