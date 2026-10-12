@@ -365,3 +365,117 @@ class TestProductionDatabaseRouting:
         assert deploy["from_commit"] == old_head
         assert deploy["to_commit"] == new_head
         container.restart.assert_called_once()
+
+
+@pytest.fixture
+def prod_origin(prod_repo, tmp_path):
+    """prod_repo with a bare 'origin' at the same tip (nothing to pull)."""
+    repo_path, old_head, new_head = prod_repo
+    origin = str(tmp_path / "origin.git")
+    subprocess.run(
+        ["git", "clone", "-q", "--bare", repo_path, origin],
+        check=True,
+        capture_output=True,
+    )
+    _git(repo_path, "remote", "add", "origin", origin)
+    return repo_path, old_head, new_head
+
+
+def _synced_container():
+    container = _container()
+    container.labels["oduflow.git_branch"] = "main"
+    return container
+
+
+def _deploy(settings, team, container, calls, **kwargs):
+    """Run update_production recording the order of hook and pull calls."""
+
+    def hook(*args):
+        calls.append("hook")
+
+    def fake_pull(*args, **kw):
+        calls.append("pull")
+        return {"action": "upgrade", "exit_code": 0, "changed_files": ["a.py"]}
+
+    with (
+        patch.object(production_ops, "pre_update_hooks", [hook]),
+        patch.object(production_ops, "get_client", return_value=MagicMock()),
+        patch.object(production_ops, "_require_container", return_value=container),
+        patch("oduflow.docker_ops.env_ops.pull_environment", side_effect=fake_pull),
+        patch.object(production_ops, "wait_production_healthy", return_value=True),
+        patch.object(production_ops, "_has_routing_drift", return_value=False),
+    ):
+        return production_ops.update_production(settings, team, "erp", **kwargs)
+
+
+class TestNoOpDeploySkipsSnapshot:
+    """Issue #309: the pre-update snapshot (minutes on a large filestore) must
+    not run when the deploy has nothing to apply."""
+
+    def test_nothing_upstream_returns_before_hooks(self, settings, team, prod_origin):
+        repo_path, _old, new_head = prod_origin
+        calls: list[str] = []
+
+        result = _deploy(settings, team, _synced_container(), calls)
+
+        assert calls == []
+        assert result["action"] == "none"
+        assert result["commit"] == new_head
+        assert production_ops.read_deploys(team, "erp", limit=0) == []
+        record = production_registry.get_production(team, "erp")
+        assert not record.get("deploy_in_progress")
+
+    def test_new_upstream_commit_snapshots_before_pull(
+        self, settings, team, prod_origin
+    ):
+        from oduflow.git_ops import reset_hard
+
+        repo_path, old_head, _new = prod_origin
+        reset_hard(repo_path, old_head)  # origin/main is now one commit ahead
+        calls: list[str] = []
+
+        result = _deploy(settings, team, _synced_container(), calls)
+
+        assert calls == ["hook", "pull"]
+        assert result["action"] == "upgrade"
+
+    def test_explicit_action_deploys_without_upstream_changes(
+        self, settings, team, prod_origin
+    ):
+        calls: list[str] = []
+        with patch.object(production_ops, "_upstream_has_changes") as probe:
+            _deploy(settings, team, _synced_container(), calls, upgrade=["m"])
+
+        probe.assert_not_called()
+        assert calls == ["hook", "pull"]
+
+    def test_failed_probe_deploys_as_usual(self, settings, team, prod_repo):
+        # No origin remote: the fetch fails, so the snapshot must still run.
+        calls: list[str] = []
+
+        _deploy(settings, team, _synced_container(), calls)
+
+        assert calls == ["hook", "pull"]
+
+    @pytest.mark.parametrize("ahead", [False, True])
+    def test_probe_compares_extra_worktrees(self, team, prod_origin, ahead):
+        repo_path, _old, _new = prod_origin
+        wt_path = os.path.join(production_ops._workspace(team, "erp"), "extra", "lib")
+        subprocess.run(
+            ["git", "clone", "-q", repo_path, wt_path], check=True, capture_output=True
+        )
+        # The worktree is reset to its branch ref after a fetch; a ref ahead of
+        # HEAD means the pull would move it.
+        _git(wt_path, "branch", "17.0", "HEAD")
+        if ahead:
+            _git(wt_path, "checkout", "-q", "--detach", "HEAD~1")
+        container = _synced_container()
+        container.labels["oduflow.extra_addons"] = '{"lib": "17.0"}'
+
+        with patch("oduflow.extra_addons.fetch_extra_repo") as fetch:
+            changed = production_ops._upstream_has_changes(
+                team, "erp", repo_path, container
+            )
+
+        fetch.assert_called_once_with(team, "lib", branch="17.0")
+        assert changed is ahead

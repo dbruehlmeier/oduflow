@@ -2303,6 +2303,42 @@ def _worktree_heads(team: TeamSettings, name: str) -> dict[str, str]:
     return heads
 
 
+def _upstream_has_changes(
+    team: TeamSettings, name: str, repo_path: str, container: Any
+) -> bool:
+    """Fetch-only probe: would a pull move any of the production's checkouts?
+
+    Fetches the main branch and every extra-addon branch without touching the
+    working trees, comparing each HEAD with the commit
+    :func:`env_ops.pull_environment` would reset it to. Lets a deploy with
+    nothing to apply return before the pre-update snapshot (issue #309).
+    Errors propagate: the caller must then assume there are changes.
+    """
+    from oduflow.docker_ops.env_ops import _normalize_extra_addons
+    from oduflow.extra_addons import fetch_extra_repo
+    from oduflow.git_ops import fetch_branch, rev_parse
+
+    labels = container.labels
+    if labels.get("oduflow.local_path"):
+        return True  # live-mount: no upstream to compare against
+    branch = labels.get("oduflow.git_branch", prod_env_name(name))
+    remote_head = fetch_branch(repo_path, branch, team.git_credentials_file())
+    if remote_head != rev_parse(repo_path):
+        return True
+    extra_addons = _normalize_extra_addons(
+        json.loads(labels.get("oduflow.extra_addons", "{}"))
+    )
+    extra_dir = os.path.join(_workspace(team, name), "extra")
+    for repo_name, extra_branch in extra_addons.items():
+        wt_path = os.path.join(extra_dir, repo_name)
+        if not os.path.isdir(wt_path):
+            continue
+        fetch_extra_repo(team, repo_name, branch=extra_branch)
+        if rev_parse(wt_path, extra_branch) != rev_parse(wt_path):
+            return True
+    return False
+
+
 def _reset_code(repo_path: str, old_head: str, worktree_heads: dict[str, str]) -> None:
     """git reset --hard the main repo and every extra worktree."""
     from oduflow.git_ops import reset_hard
@@ -2348,6 +2384,9 @@ def update_production(
       any changed file Odoo loads requires at least a container restart).
       A ``none`` outcome (Markdown-only changes) is left alone: there is
       nothing for the server to pick up;
+    - without an explicit action, a fetch-only probe runs first: when no
+      checkout would move, the call returns before the pre-update hooks
+      (no snapshot, no deploy record);
     - the deploy is verified (module exit codes + in-container health
       poll); on failure the checkout (and extra worktrees) are reset to
       the pre-update commits, the conf is re-applied and the container
@@ -2378,6 +2417,26 @@ def update_production(
 
     ts_start = _now_iso()
     old_head = rev_parse(repo_path)
+    if not (install or upgrade or restart):
+        # Nothing upstream means nothing to deploy: return before the
+        # pre-update hooks, whose snapshot can run for minutes. Only an
+        # explicit action deploys without new commits.
+        try:
+            has_changes = _upstream_has_changes(team, name, repo_path, container)
+        except Exception as exc:
+            logger.warning(
+                "Change probe for production '%s' failed (deploying as usual): %s",
+                name,
+                exc,
+            )
+            has_changes = True
+        if not has_changes:
+            return {
+                "action": "none",
+                "message": "Already up to date.",
+                "name": name,
+                "commit": old_head,
+            }
     old_worktrees = _worktree_heads(team, name)
     production_registry.update_production(team, name, {"deploy_in_progress": True})
 
