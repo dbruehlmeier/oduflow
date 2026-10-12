@@ -64,16 +64,16 @@ fi
 # a single container serves many environments/users).
 if [ -n "$GIT_USER" ]; then
     git -C "$DEST" config user.name "$GIT_USER"
-    git -C "$DEST" config user.email "${GIT_USER}@oduflow.local"
+    git -C "$DEST" config user.email "${GIT_USER}@${ODUFLOW_BRAND_SLUG:-oduflow}.local"
 fi
 
 # Claude Code: project-scoped .mcp.json at the checkout root. Agent Browser is
-# always available as a local stdio MCP. When present, the Oduflow Authorization
-# value is a ${VAR} placeholder — Claude expands it from the scoped token in the
+# always available as a local stdio MCP. When present, the scoped `development`
+# server's Authorization value is a ${VAR} placeholder — Claude expands it from the scoped token in the
 # session's exec env, so no secret is written to the checkout.
 jq -n \
     --arg url "$MCP_URL" \
-    '{mcpServers: ({agent_browser: {type: "stdio", command: "agent-browser", args: ["mcp", "--tools", "all"]}} + (if $url == "" then {} else {oduflow: {type: "http", url: $url, headers: {Authorization: "Bearer ${ODUFLOW_MCP_TOKEN}"}}} end))}' \
+    '{mcpServers: ({agent_browser: {type: "stdio", command: "agent-browser", args: ["mcp", "--tools", "all"]}} + (if $url == "" then {} else {development: {type: "http", url: $url, headers: {Authorization: "Bearer ${ODUFLOW_MCP_TOKEN}"}}} end))}' \
     > "$DEST/.mcp.json"
 # Not secret (the Oduflow value is a placeholder, not a token), but still a
 # generated artifact a `git add -A` by the agent should never push. Local

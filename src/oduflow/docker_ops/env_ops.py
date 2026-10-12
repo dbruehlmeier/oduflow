@@ -20,7 +20,7 @@ from typing import Any
 
 import docker
 from docker import DockerClient
-from oduflow import activity, env_share, secret_store, settings
+from oduflow import activity, branding, env_share, secret_store, settings
 from oduflow.docker_ops import image_cleanup
 from oduflow.docker_ops.client import chown_recursive, get_client, get_odoo_uid_gid
 from oduflow.docker_ops.stats import default_env_limits
@@ -91,6 +91,11 @@ logger = logging.getLogger("oduflow")
 
 AGENT_USER = "agent"
 AGENT_HOME = "/home/agent"
+# The environment-scoped MCP server in every agent config: its tools appear as
+# development_* (OpenCode) or mcp__development__* (Claude, Codex). Checkouts
+# written by earlier releases named it "oduflow"; that entry is dropped.
+AGENT_MCP_SERVER = "development"
+LEGACY_AGENT_MCP_SERVER = "oduflow"
 ENV_HOSTNAME_LABEL = "oduflow.hostname"
 ENV_HOSTNAME_SOURCE_LABEL = "oduflow.hostname_source"
 HOSTNAME_SOURCE_CUSTOM = "custom"
@@ -2944,26 +2949,33 @@ def refresh_agent_mcp_config(
     team: TeamSettings,
     env_name: str,
 ) -> None:
-    """Refresh an existing Claude checkout's generated Oduflow MCP entry.
+    """Refresh an existing Claude checkout's generated MCP entry and identity.
 
     Agent workspaces persist across Oduflow/coder upgrades, so a checkout may
-    still contain the old host-gateway URL even after URL selection is fixed.
-    Rewrite only the generated ``oduflow`` entry, preserving Agent Browser and
-    any user-added servers. The token remains an environment placeholder and
-    is never written to disk.
+    still contain the old host-gateway URL or the old ``oduflow`` server name.
+    Rewrite only the generated ``development`` entry and drop the legacy one,
+    preserving Agent Browser and any user-added servers. The token remains an
+    environment placeholder and is never written to disk. A generated
+    per-checkout commit email (``<user>@<slug>.local``) follows the brand.
     """
     config_path = os.path.join(get_agent_checkout_dir(env_name), ".mcp.json")
     script = """\
 set -eu
 config_path=$1
 mcp_url=$2
+brand_slug=$3
 [ -f "$config_path" ] || exit 0
 tmp_path="${config_path}.tmp.$$"
 trap 'rm -f "$tmp_path"' EXIT
-jq --arg url "$mcp_url" \
-  '.mcpServers.oduflow = {type: "http", url: $url, headers: {Authorization: "Bearer ${ODUFLOW_MCP_TOKEN}"}}' \
+jq --arg url "$mcp_url" --arg name "$4" --arg legacy "$5" \
+  '.mcpServers |= (del(.[$legacy]) | .[$name] = {type: "http", url: $url, headers: {Authorization: "Bearer ${ODUFLOW_MCP_TOKEN}"}})' \
   "$config_path" > "$tmp_path"
 mv "$tmp_path" "$config_path"
+checkout=$(dirname "$config_path")
+email=$(git -C "$checkout" config --local user.email 2>/dev/null || true)
+case "$email" in
+  *@*.local) git -C "$checkout" config user.email "${email%@*}@${brand_slug}.local" ;;
+esac
 """
     exit_code, output = container.exec_run(
         [
@@ -2973,6 +2985,9 @@ mv "$tmp_path" "$config_path"
             "sh",
             config_path,
             get_agent_mcp_url(settings, team, env_name),
+            branding.current().slug,
+            AGENT_MCP_SERVER,
+            LEGACY_AGENT_MCP_SERVER,
         ],
         user=AGENT_USER,
     )
@@ -3179,6 +3194,12 @@ def _ensure_agent_container(
         # SCOPED token + /mcp/<env> URL into its own `docker exec` env instead
         # (see web_ui.ws_agent_console / ws_agent_acp and ADR 0028).
         agent_env = dict(_agent_env_vars(settings, team))
+        brand = branding.current()
+        if brand.white_label:
+            # The agent's default commit identity follows the brand. Stock adds
+            # nothing, so existing containers keep their hash and are not
+            # recreated; a brand change does recreate the container.
+            agent_env.setdefault("ODUFLOW_BRAND_SLUG", brand.slug)
         cred_file = team.git_credentials_file()
         has_git_credentials = os.path.isfile(cred_file)
         from oduflow import git_ops

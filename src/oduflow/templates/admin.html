@@ -7,7 +7,7 @@
 <link rel="preload" href="/static/source-code-pro-latin.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="icon" href="/favicon.ico" sizes="16x16 32x32">
 <link rel="icon" href="/static/icon.png" type="image/png" sizes="32x32">
-<title>Oduflow — Server settings</title>
+<title>__BRAND_NAME__ — Server settings</title>
 <script>
   // Same theme bootstrap as the dashboard (DESIGN.md §2): stored mode, else the OS.
   (function () {
@@ -129,7 +129,7 @@
   }
   .brand-lockup { display: flex; align-items: center; gap: 10px; min-width: 0; }
   .brand-lockup img { height: 28px; }
-  :root[data-theme="light"] .brand-lockup img { filter: brightness(0); }
+  :root[data-theme="light"] .brand-lockup img:not(.custom-logo) { filter: brightness(0); }
   .brand-copy { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
   header h1 { font-size: var(--text-xl); font-weight: 600; line-height: 1.05; }
   .brand-byline {
@@ -365,7 +365,7 @@
 <body>
 <header>
   <div class="brand-lockup">
-    <img src="/logo.png" alt="Oduflow logo">
+    <img class="__LOGO_CLASS__" src="/logo.png?v=__ASSET_VERSION__" alt="__BRAND_NAME__ logo">
     <div class="brand-copy">
       <h1>Server settings</h1>
       <div class="brand-byline" id="config-path" title="Config file">oduflow.toml · v__ODUFLOW_VERSION__</div>
