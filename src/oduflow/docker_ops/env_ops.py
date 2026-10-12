@@ -446,11 +446,11 @@ def _ensure_system_ready(
         db_container = client.containers.get(settings.shared_db_container)
         if db_container.status != "running":
             raise PrerequisiteNotMetError(
-                f"{settings.shared_db_container} is not running. System not initialized. Restart oduflow."
+                f"{settings.shared_db_container} is not running. System not initialized. Restart Oduflow."
             )
     except docker.errors.NotFound:
         raise PrerequisiteNotMetError(
-            f"{settings.shared_db_container} not found. System not initialized. Restart oduflow."
+            f"{settings.shared_db_container} not found. System not initialized. Restart Oduflow."
         )
     if odoo_image:
         require_postgres_for_odoo(client, settings, odoo_image)
@@ -470,11 +470,11 @@ def _ensure_system_ready(
             t = client.containers.get(settings.traefik_container)
             if t.status != "running":
                 raise PrerequisiteNotMetError(
-                    f"{settings.traefik_container} is not running. System not initialized. Restart oduflow."
+                    f"{settings.traefik_container} is not running. System not initialized. Restart Oduflow."
                 )
         except docker.errors.NotFound:
             raise PrerequisiteNotMetError(
-                f"{settings.traefik_container} not found. System not initialized. Restart oduflow."
+                f"{settings.traefik_container} not found. System not initialized. Restart Oduflow."
             )
 
 
@@ -3985,7 +3985,7 @@ def start_environment(
             db_container.start()
     except docker.errors.NotFound:
         raise PrerequisiteNotMetError(
-            f"{settings.shared_db_container} not found. System not initialized. Restart oduflow."
+            f"{settings.shared_db_container} not found. System not initialized. Restart Oduflow."
         )
 
     started = [settings.shared_db_container]

@@ -69,7 +69,7 @@ commented-out line is uncommented in place.
 The console applies live changes on its own and keeps everything else out of
 the running process until a restart, so the server never runs half on the old
 configuration and half on the new one. When saved changes are waiting, a
-banner lists them with a **Restart Oduflow** button. The restart stops the
+banner lists them with a **Restart server** button. The restart stops the
 server gracefully and starts it again with the same command line;
 environments, services and productions keep running. The console refuses to
 restart while an operation (a deploy, an environment build) holds a lock.

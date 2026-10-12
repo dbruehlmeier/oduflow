@@ -4818,8 +4818,8 @@ supported because the cluster is not published on a host port.
 | `GET` | `/api/agent-guides/{filename}` | Read a guide |
 
 Under an active [Custom license](licensing.md#custom-license-white-label) the
-`/api/license*` endpoints answer `404`: the operator manages the license with
-`oduflow license` on the server.
+`/api/license*`, `/api/version` and `/api/feedback/link` endpoints answer `404`:
+the operator manages the license with `oduflow license` on the server.
 
 ## Coding agent endpoints
 
@@ -9783,7 +9783,7 @@ commented-out line is uncommented in place.
 The console applies live changes on its own and keeps everything else out of
 the running process until a restart, so the server never runs half on the old
 configuration and half on the new one. When saved changes are waiting, a
-banner lists them with a **Restart Oduflow** button. The restart stops the
+banner lists them with a **Restart server** button. The restart stops the
 server gracefully and starts it again with the same command line;
 environments, services and productions keep running. The console refuses to
 restart while an operation (a deploy, an environment build) holds a lock.
@@ -10956,16 +10956,21 @@ With an active Custom license:
 
 - The dashboard, sign-in page, browser title and MCP server show your **brand
   name** instead of "Oduflow". Tool descriptions, instructions and messages use
-  it too.
-- Vendor surfaces are not rendered: the "a product by Oduist" byline, **Docs**,
-  **Feedback**, the release check behind the version number (the version stays
-  visible), and the license banner and dialog. The `report_issue` and
-  `submit_agent_feedback` MCP tools are hidden.
+  it too, as do the dashboard's agent guides viewer and error messages and the
+  Odoo.sh import script.
+- Vendor surfaces are not rendered: the "a product by Oduist" byline, **Docs**
+  (also in the server settings console), **Feedback**, the release check behind
+  the version number (the version stays visible), and the license banner and
+  dialog. The `report_issue` and `submit_agent_feedback` MCP tools are hidden,
+  and `/api/version` and `/api/feedback/link` answer `404`.
 - Your clients see nothing about licensing, also after expiry.
 - The agent's default commit identity uses the brand: `<brand>-coder` with an
   `@<brand>.local` address, also in existing checkouts, instead of
   `oduflow-coder` and `@oduflow.local`. The seed commit of a local extra repo is
   authored by the brand name.
+- Requests to your clients' productions, git hosting APIs and GitHub downloads
+  identify themselves with the brand (User-Agent `<brand>-production` and
+  `<brand>`).
 
 Technical names on your servers keep the product name: the `oduflow` package and
 CLI, `oduflow.toml`, container, volume and database names, and paths. Avoid a

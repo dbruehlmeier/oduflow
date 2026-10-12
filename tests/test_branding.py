@@ -466,3 +466,273 @@ def test_payload_helpers_are_base64():
     private, _ = TestVerifyLicenseText._keypair()
     key = TestVerifyLicenseText._sign(private, {"type": "custom"})
     assert base64.b64decode(key.split(".")[1]) == b'{"type": "custom"}'
+
+
+def _feedback_instance(monkeypatch, settings: Settings) -> None:
+    from oduflow import server
+
+    team = settings.teams["1"]
+    monkeypatch.setattr(server, "_get_settings", lambda: settings)
+    monkeypatch.setattr(server, "_resolve_team", lambda ctx: team)
+    monkeypatch.setattr(server.env_ops, "list_environments", lambda *a, **k: [])
+
+
+def test_white_label_agent_instructions_omit_the_feedback_section(
+    tmp_path, sign, monkeypatch
+):
+    """The guide must not send agents to submit_agent_feedback, hidden there."""
+    import dataclasses
+
+    from tool_helpers import call_tool
+
+    _install(tmp_path, sign)
+    settings = dataclasses.replace(_settings(tmp_path), agent_feedback=True)
+    _feedback_instance(monkeypatch, settings)
+    assert "Session Feedback" in call_tool("get_agent_instructions", ctx=None)
+
+    branding.configure(lambda: settings)
+    guide = call_tool("get_agent_instructions", ctx=None)
+
+    assert "Session Feedback" not in guide
+    assert "submit_agent_feedback" not in guide
+    assert "AcmeFlow" in guide and "Oduflow" not in guide
+
+
+def _guide_settings(tmp_path) -> Settings:
+    import dataclasses
+
+    settings = _settings(tmp_path)
+    settings.teams["1"] = dataclasses.replace(
+        settings.teams["1"], data_dir=str(tmp_path / "team")
+    )
+    (tmp_path / "team" / "agent_guides").mkdir(parents=True)
+    (tmp_path / "team" / "agent_guides" / "team_notes.md").write_text(
+        "# Oduflow team notes\n\nAsk the Oduflow operator.\n", encoding="utf-8"
+    )
+    return settings
+
+
+def test_white_label_agent_guides_viewer_is_rebranded(tmp_path, sign):
+    """Bundled and team guides are rebranded for display, not on disk."""
+    _install(tmp_path, sign)
+    client = _client(_guide_settings(tmp_path))
+
+    titles = {
+        g["filename"]: g["title"]
+        for g in client.get("/api/agent-guides").json()["guides"]
+    }
+    bundled = client.get("/api/agent-guides/agent_instructions.md").json()["content"]
+    team = client.get("/api/agent-guides/team_notes.md").json()["content"]
+
+    assert titles["team_notes.md"] == "AcmeFlow team notes"
+    assert titles["agent_instructions.md"].startswith("AcmeFlow")
+    assert "Oduflow" not in bundled and "AcmeFlow" in bundled
+    assert team == "# AcmeFlow team notes\n\nAsk the AcmeFlow operator.\n"
+    on_disk = tmp_path / "team" / "agent_guides" / "team_notes.md"
+    assert "Oduflow" in on_disk.read_text(encoding="utf-8")
+
+
+def test_stock_agent_guides_viewer_serves_the_files_as_they_are(tmp_path):
+    from oduflow.web_ui import _TEMPLATE_DIR
+
+    client = _client(_guide_settings(tmp_path))
+
+    titles = {
+        g["filename"]: g["title"]
+        for g in client.get("/api/agent-guides").json()["guides"]
+    }
+    bundled = client.get("/api/agent-guides/agent_instructions.md").json()["content"]
+
+    assert titles["team_notes.md"] == "Oduflow team notes"
+    assert bundled == (
+        _TEMPLATE_DIR / "agent_guides" / "agent_instructions.md"
+    ).read_text(encoding="utf-8")
+
+
+def test_validation_errors_are_rebranded(tmp_path, sign, monkeypatch):
+    """ValueError messages reach the dashboard through _error_text_response."""
+    import dataclasses
+
+    from oduflow import web_ui
+
+    def _managed_key(*args, **kwargs):
+        raise ValueError(
+            "odoo.conf keys managed by Oduflow cannot be overridden: db_host"
+        )
+
+    monkeypatch.setattr(web_ui.production_ops, "set_production_odoo_conf", _managed_key)
+    settings = dataclasses.replace(_settings(tmp_path), prod_enabled=True)
+    body = {"options": {"db_host": "elsewhere"}}
+
+    stock = _client(settings).post("/api/productions/erp/odoo-conf", json=body)
+    assert stock.status_code == 400
+    assert stock.json()["error"] == (
+        "odoo.conf keys managed by Oduflow cannot be overridden: db_host"
+    )
+
+    _install(tmp_path, sign)
+    branded = _client(settings).post("/api/productions/erp/odoo-conf", json=body)
+    assert branded.status_code == 400
+    assert branded.json() == {
+        "ok": False,
+        "error": "odoo.conf keys managed by AcmeFlow cannot be overridden: db_host",
+    }
+
+
+def test_import_script_is_rebranded(tmp_path, sign):
+    import subprocess
+
+    from oduflow.web_ui import _TEMPLATE_DIR
+
+    on_disk = (_TEMPLATE_DIR / "import-odoo.sh").read_text(encoding="utf-8")
+    client = _client(_settings(tmp_path))
+    assert client.get("/import-odoo.sh").text == on_disk
+    assert "https://YOUR-SERVER/import-odoo.sh" in on_disk
+
+    _install(tmp_path, sign)
+    script = _client(_settings(tmp_path)).get("/import-odoo.sh").text
+
+    assert "Oduflow" not in script
+    assert ">> Importing '$DB' into AcmeFlow at $SERVER" in script
+    assert "points at your AcmeFlow dashboard URL" in script
+    assert "unexpected finalize response (not AcmeFlow JSON):" in script
+    assert "$HOME/.oduflow-addon-" in script  # technical names stay
+    subprocess.run(["bash", "-n"], input=script, text=True, check=True)
+
+
+def test_import_script_brand_is_inert_in_shell_quotes(tmp_path, sign):
+    """The brand lands in bash and inline-Python quotes; quoting chars are dropped."""
+    import subprocess
+
+    _install(tmp_path, sign, brand_name='O\'Hara "Cloud" $(id)')
+    script = _client(_settings(tmp_path)).get("/import-odoo.sh").text
+
+    assert ">> Importing '$DB' into OHara Cloud id at $SERVER" in script
+    subprocess.run(["bash", "-n"], input=script, text=True, check=True)
+
+
+def test_vendor_endpoints_are_hidden_under_white_label(tmp_path, sign, monkeypatch):
+    from oduflow import updates, web_ui
+
+    checks = []
+
+    def _check(*args, **kwargs):
+        checks.append(1)
+        return updates.UpdateCheck(current="1.0.0", status="current")
+
+    monkeypatch.setattr(web_ui.updates, "check_for_update", _check)
+    feedback = {"kind": "bug", "title": "t", "details": "d"}
+
+    stock = _client(_settings(tmp_path))
+    assert stock.get("/api/version").status_code == 200
+    link = stock.post("/api/feedback/link", json=feedback)
+    assert link.status_code == 200 and "github.com/oduflow" in link.json()["url"]
+
+    _install(tmp_path, sign)
+    branded = _client(_settings(tmp_path))
+    assert branded.get("/api/version").status_code == 404
+    assert branded.post("/api/feedback/link", json=feedback).status_code == 404
+    assert len(checks) == 1
+
+
+def _admin_client(tmp_path) -> TestClient:
+    import dataclasses
+
+    settings = dataclasses.replace(_settings(tmp_path), admin_password="console-pw-1")
+    client = _client(settings)
+    client.post("/admin/login", data={"password": "console-pw-1"})
+    return client
+
+
+def test_admin_console_hides_vendor_docs_and_agent_feedback(tmp_path, sign):
+    from oduflow import config_schema
+
+    def _feedback_field(schema):
+        server = next(g for g in schema if g["id"] == "server")
+        return [f for f in server["fields"] if f["key"] == "agent_feedback"]
+
+    stock = _admin_client(tmp_path).get("/admin").text
+    assert "https://docs.oduflow.dev/admin/" in stock
+    assert "IF-STOCK" not in stock
+    assert _feedback_field(config_schema.schema_json())
+
+    _install(tmp_path, sign)
+    page = _admin_client(tmp_path).get("/admin").text
+    assert "<h1>Server settings</h1>" in page
+    assert "docs.oduflow.dev" not in page and "IF-STOCK" not in page
+    assert "Oduflow" not in page.split("<body", 1)[1]
+    assert not _feedback_field(config_schema.schema_json(white_label=True))
+    # The key stays known to the parser and validator; it is only not offered.
+    assert config_schema.find_field(("server", "agent_feedback")) is not None
+
+
+def test_outbound_user_agents_follow_the_brand(tmp_path, sign, monkeypatch):
+    """Requests seen by the client's production and git hosts carry the brand."""
+    import io
+    import urllib.request
+
+    import httpx
+
+    from oduflow import production_mcp, production_registry, walg
+
+    seen: dict[str, str] = {}
+
+    class _Response(io.BytesIO):
+        status = 200
+
+    def _urlopen(request, timeout=None):
+        seen[request.full_url] = request.get_header("User-agent")
+        return _Response(b"")
+
+    def _odumcp(request: httpx.Request) -> httpx.Response:
+        seen[str(request.url)] = request.headers["User-Agent"]
+        return httpx.Response(200, json={"ok": True, "data": {}})
+
+    original = httpx.Client
+    monkeypatch.setattr(
+        production_mcp.httpx,
+        "Client",
+        lambda **kwargs: original(transport=httpx.MockTransport(_odumcp), **kwargs),
+    )
+    monkeypatch.setattr(urllib.request, "urlopen", _urlopen)
+    team = TeamSettings(
+        team_id="1", data_dir=str(tmp_path / "team"), production_token="p" * 40
+    )
+    prod = Settings(teams={"1": team}, prod_enabled=True, routing_mode="traefik")
+    production_registry.create_production(team, "erp", {"domain": "erp.example.com"})
+
+    def _requests() -> list[str]:
+        seen.clear()
+        production_mcp.execute(prod, team, "erp", "changes.status", {})
+        git_ops._check_token_with_provider("github.com", "", "t")
+        walg._download("https://github.com/wal-g/x", str(tmp_path / "walg"))
+        return sorted(seen.values())
+
+    assert _requests() == ["oduflow", "oduflow", "oduflow-production"]
+    _install(tmp_path, sign)
+    branding.configure(lambda: _settings(tmp_path))
+    assert _requests() == ["acmeflow", "acmeflow", "acmeflow-production"]
+
+
+def test_opencode_provider_warning_is_rebranded(tmp_path, sign):
+    """Shown in Agent CLI and Agent Chat, outside _public_flow_error."""
+    import dataclasses
+
+    from oduflow.settings import OpenCodeProviderSettings
+    from oduflow.web_ui import _opencode_provider_env_warning
+
+    settings = dataclasses.replace(
+        _settings(tmp_path),
+        agent_opencode_model="litellm/glm-5.3",
+        agent_opencode_provider=OpenCodeProviderSettings(
+            id="litellm", name="LiteLLM", models=("glm-5.3",)
+        ),
+    )
+    team = settings.teams["1"]
+    assert "and restart Oduflow;" in _opencode_provider_env_warning(settings, team)
+
+    _install(tmp_path, sign)
+    branding.configure(lambda: settings)
+    warning = _opencode_provider_env_warning(settings, team)
+
+    assert "and restart AcmeFlow;" in warning and "Oduflow" not in warning

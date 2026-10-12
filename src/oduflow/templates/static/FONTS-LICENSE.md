@@ -1,6 +1,6 @@
 # Bundled font licenses
 
-The dashboard and login pages ship their own webfonts so Oduflow renders
+The dashboard and login pages ship their own webfonts so they render
 identically on an air-gapped host — no CDN, ever (see DESIGN.md). Both bundled
 faces are licensed under the SIL Open Font License, Version 1.1, which permits
 bundling and redistribution inside a commercial or proprietary product; the

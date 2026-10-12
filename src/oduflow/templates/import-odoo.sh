@@ -11,8 +11,8 @@
 # and only sends the missing pieces (manifest, dump, individual filestore
 # hash-directories, or addon repositories).
 #
-#   curl -sSfL https://YOUR-ODUFLOW/import-odoo.sh | bash -s -- \
-#        --server https://YOUR-ODUFLOW --token <TOKEN>
+#   curl -sSfL https://YOUR-SERVER/import-odoo.sh | bash -s -- \
+#        --server https://YOUR-SERVER --token <TOKEN>
 #
 # Optional flags (usually set for you by the dashboard checkboxes) also bring
 # over the addons Odoo.sh ran with, beyond the standard modules in the image:

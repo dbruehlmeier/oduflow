@@ -337,7 +337,7 @@ def build_admin_routes(
             "path": snapshot.path,
             "revision": snapshot.revision,
             "boot_id": runtime.boot_id if runtime else "",
-            "schema": schema.schema_json(),
+            "schema": schema.schema_json(white_label=branding.is_white_label()),
             # None when the file does not even parse: the forms would show
             # empty values, so the page sends the admin to Raw TOML instead.
             "values": config_store.mask_raw(file_raw) if file_raw else None,

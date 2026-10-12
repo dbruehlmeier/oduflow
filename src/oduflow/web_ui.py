@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import hashlib
 import hmac
 import html
@@ -530,7 +531,22 @@ def _public_flow_error(e: FlowError, *, context: str = "Dashboard operation") ->
         # details. Keep it in the server log instead of returning it to browsers.
         logger.error("%s failed: %s", context, e)
         return branding.rebrand(_EXTERNAL_COMMAND_UI_ERROR)
+    return _public_error_text(e)
+
+
+def _public_error_text(e: BaseException) -> str:
+    """A validation message (ValueError and the like) as the browser sees it.
+
+    The raw exception text is still the message; only the product name follows
+    the brand, as in _public_flow_error.
+    """
     return branding.rebrand(str(e))
+
+
+def _error_text_response(e: BaseException, status_code: int = 400) -> JSONResponse:
+    return JSONResponse(
+        {"ok": False, "error": _public_error_text(e)}, status_code=status_code
+    )
 
 
 def _error_response(e: FlowError) -> JSONResponse:
@@ -628,12 +644,13 @@ def _parse_extra_addons(raw: str) -> dict[str, str]:
 
 
 def _guide_title(filepath: str) -> str:
+    """A guide's first heading under the brand, as get_agent_instructions shows it."""
     try:
         with open(filepath, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if line.startswith("# "):
-                    return line[2:].strip()
+                    return branding.rebrand(line[2:].strip())
     except Exception:
         pass
     return os.path.basename(filepath).replace("_", " ").replace(".md", "").title()
@@ -864,7 +881,7 @@ def _opencode_provider_env_warning(settings: Settings, team: TeamSettings) -> st
     ]
     if not missing:
         return ""
-    return (
+    return branding.rebrand(
         f"the OpenCode model {settings.agent_opencode_model} reads "
         f"{', '.join(missing)}, which this team's agent environment does not "
         "set, so its requests will fail. Set the variables in "
@@ -1435,7 +1452,7 @@ def _build_routes(
         except FlowError as e:
             return _error_response(e)
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except Exception:
             logger.exception("Unexpected error in api_modules")
             return JSONResponse(
@@ -1446,7 +1463,7 @@ def _build_routes(
         try:
             branch = _validate_dev_env_name(request.path_params["branch"])
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         team = _get_ui_team(request)
         try:
             body = await request.json()
@@ -1559,7 +1576,7 @@ def _build_routes(
         except FlowError as e:
             return _error_response(e)
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except Exception:
             logger.exception("Unexpected error in api_modules_apply")
             return JSONResponse(
@@ -1610,7 +1627,7 @@ def _build_routes(
         except FlowError as e:
             return _error_response(e)
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except Exception:
             logger.exception("Unexpected error in api_switch_branch")
             return JSONResponse(
@@ -1691,7 +1708,7 @@ def _build_routes(
         except ValueError as e:
             # A rejected new_name (validate_env_name); the message is written
             # for the operator reading it.
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except Exception:
             logger.exception("Unexpected error in api_update")
             return JSONResponse(
@@ -1883,7 +1900,7 @@ def _build_routes(
         try:
             validate_template_name(template_name)
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         # Team lock (not just the env): publishing can remount other envs' overlay
         # filestores, so it must serialize against the whole team like the MCP tool.
         try:
@@ -1915,7 +1932,7 @@ def _build_routes(
                 }
             )
         except ValueError as e:  # invalid template name
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except FlowError as e:
             return _error_response(e)
         except Exception:
@@ -2011,7 +2028,7 @@ def _build_routes(
                 validate_branch_name(base_branch)
                 validate_branch_name(branch)
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
 
         team = _get_ui_team(request)
         # Acquire the env lock in its own try so a BusyError returns WITHOUT
@@ -2144,7 +2161,7 @@ def _build_routes(
             # messages are authored for the user, so surface them as 400
             # instead of masking them behind a 500.
             logger.warning("create_environment rejected %s: %s", env_name, e)
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except Exception:
             logger.exception("Unexpected error in api_create")
             return JSONResponse(
@@ -2404,7 +2421,7 @@ def _build_routes(
         try:
             validate_template_name(template_name)
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
 
         # New templates need only their own key; replacements also protect
         # environments while changing their overlay lower layer.
@@ -2513,7 +2530,7 @@ def _build_routes(
                 )
             return JSONResponse({"ok": True, "result": result})
         except ValueError as e:  # invalid template name
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except FlowError as e:
             return _error_response(e)
         except Exception:
@@ -2529,7 +2546,7 @@ def _build_routes(
             result = system_ops.get_template_metadata(team, name)
             return JSONResponse({"ok": True, **result})
         except ValueError as e:  # invalid template name
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except FlowError as e:
             return _error_response(e)
         except UnicodeDecodeError:
@@ -2553,7 +2570,7 @@ def _build_routes(
             validate_template_name(name)
             body = await request.json()
         except (TypeError, ValueError) as e:
-            message = str(e) or "Invalid JSON body"
+            message = _public_error_text(e) or "Invalid JSON body"
             return JSONResponse({"ok": False, "error": message}, status_code=400)
 
         if not isinstance(body, dict):
@@ -2586,9 +2603,9 @@ def _build_routes(
                 )
             return JSONResponse({"ok": True, **result})
         except ConflictError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=409)
+            return _error_text_response(e, 409)
         except (TypeError, ValueError) as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except FlowError as e:
             return _error_response(e)
         except Exception:
@@ -2706,6 +2723,11 @@ def _build_routes(
 
     def import_odoo_script(request: Request) -> Response:
         script = (_TEMPLATE_DIR / "import-odoo.sh").read_text(encoding="utf-8")
+        brand = branding.current()
+        # The script quotes its messages for bash and for an inline Python
+        # program, so only characters that are inert in both reach it.
+        name = re.sub(r"[^\w .&+-]", "", brand.name).strip() or brand.slug
+        script = dataclasses.replace(brand, name=name).rebrand(script)
         return Response(
             script,
             media_type="text/x-shellscript; charset=utf-8",
@@ -2751,7 +2773,7 @@ def _build_routes(
                 addon_error_policy=addon_error_policy,
             )
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except Exception:
             logger.exception("Unexpected error in api_import_token")
             return JSONResponse(
@@ -2787,7 +2809,7 @@ def _build_routes(
         except FlowError as e:
             return _error_response(e)
         except ValueError as e:  # invalid template name
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         return JSONResponse(
             {
                 "ok": True,
@@ -2832,7 +2854,7 @@ def _build_routes(
                 os.path.join(staging, "metadata.json"), metadata, sort_keys=False
             )
         except ValueError as e:  # invalid template name
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         return JSONResponse({"ok": True})
 
     async def _receive_offset_chunk(
@@ -2872,7 +2894,7 @@ def _build_routes(
         try:
             staging = team.get_import_staging_dir(template_name)
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         os.makedirs(staging, exist_ok=True)
         dest = os.path.join(staging, "dump.sql.gz")
         part = f"{dest}.part"
@@ -2943,7 +2965,7 @@ def _build_routes(
         try:
             staging = team.get_import_staging_dir(template_name)
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         fs_dir = os.path.join(staging, "filestore")
         os.makedirs(staging, exist_ok=True)
         fd, tmp_tar = tempfile.mkstemp(
@@ -3033,7 +3055,7 @@ def _build_routes(
         try:
             staging = team.get_import_staging_dir(template_name)
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         addons_dir = os.path.join(staging, "addons")
         os.makedirs(staging, exist_ok=True)
         part = os.path.join(staging, f".addon_{name}.tar.part")
@@ -3183,7 +3205,7 @@ def _build_routes(
 
             await _offload(_record_remote_addon)
         except ValueError as e:  # invalid template name
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         return JSONResponse({"ok": True})
 
     def api_import_finalize(request: Request) -> JSONResponse:
@@ -3195,7 +3217,7 @@ def _build_routes(
         try:
             progress = _import_progress(team, template_name)
         except ValueError as e:  # invalid template name
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         if not progress["manifest"] or not progress["dump"]:
             return JSONResponse(
                 {
@@ -3285,7 +3307,7 @@ def _build_routes(
                 headers={"Cache-Control": "no-store"},
             )
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except FlowError as e:
             return _error_response(e)
         except Exception:
@@ -3316,7 +3338,7 @@ def _build_routes(
                 headers={"Cache-Control": "no-store"},
             )
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except FlowError as e:
             return _error_response(e)
         except Exception:
@@ -3344,7 +3366,7 @@ def _build_routes(
                 headers={"Cache-Control": "no-store"},
             )
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except FlowError as e:
             return _error_response(e)
         except Exception:
@@ -3369,7 +3391,7 @@ def _build_routes(
             )
             return JSONResponse({"ok": True, "result": result})
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except FlowError as e:
             return _error_response(e)
         except Exception:
@@ -3401,7 +3423,7 @@ def _build_routes(
             result = service_database_ops.set_protected(team, name, protected)
             return JSONResponse({"ok": True, "result": result})
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except FlowError as e:
             return _error_response(e)
         except Exception:
@@ -3461,7 +3483,7 @@ def _build_routes(
             cap_add = ["NET_ADMIN"] if net_admin else None
             command = _command_from_body(body.get("command")) or None
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except FlowError as e:
             return _error_response(e)
         except Exception:
@@ -3494,7 +3516,7 @@ def _build_routes(
             )
             return JSONResponse({"ok": True, "result": result})
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except FlowError as e:
             return _error_response(e)
         except Exception:
@@ -3582,7 +3604,7 @@ def _build_routes(
             )
             return JSONResponse({"ok": True, "result": result})
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except FlowError as e:
             return _error_response(e)
         except Exception:
@@ -3764,7 +3786,7 @@ def _build_routes(
                 except NotFoundError:
                     pass
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except FlowError as e:
             return _error_response(e)
         except Exception:
@@ -3798,7 +3820,7 @@ def _build_routes(
             )
             return JSONResponse({"ok": True, "result": result})
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except FlowError as e:
             return _error_response(e)
         except Exception:
@@ -3953,7 +3975,15 @@ def _build_routes(
                 return JSONResponse(
                     {"ok": False, "error": "Guide not found"}, status_code=404
                 )
-            return JSONResponse({"ok": True, "content": content, "filename": filename})
+            # Rebranded for display only, like the MCP tools serving the same
+            # files; the copies on disk keep the product name.
+            return JSONResponse(
+                {
+                    "ok": True,
+                    "content": branding.rebrand(content),
+                    "filename": filename,
+                }
+            )
         except Exception:
             logger.exception("Unexpected error in api_agent_guide_get")
             return JSONResponse(
@@ -4055,9 +4085,7 @@ def _build_routes(
         try:
             agent_uploads.normalize_filename(filename)
         except agent_uploads.AttachmentError as e:
-            return JSONResponse(
-                {"ok": False, "error": str(e)}, status_code=e.status_code
-            )
+            return _error_text_response(e, e.status_code)
 
         content_length = request.headers.get("content-length")
         if content_length:
@@ -4127,8 +4155,9 @@ def _build_routes(
                 )
                 return JSONResponse({"ok": True, "attachment": attachment})
             except agent_uploads.AttachmentError as e:
-                return JSONResponse(
-                    {"ok": False, "error": str(e)}, status_code=e.status_code
+                return _error_text_response(
+                    e,
+                    e.status_code,
                 )
             except FlowError as e:
                 return _error_response(e)
@@ -4159,9 +4188,7 @@ def _build_routes(
             )
             return JSONResponse({"ok": True})
         except agent_uploads.AttachmentError as e:
-            return JSONResponse(
-                {"ok": False, "error": str(e)}, status_code=e.status_code
-            )
+            return _error_text_response(e, e.status_code)
         except FlowError as e:
             return _error_response(e)
         except Exception:
@@ -4174,7 +4201,8 @@ def _build_routes(
 
     def _white_label_hidden() -> JSONResponse | None:
         # Under white label the operator's clients use this dashboard; the
-        # operator manages the license with `oduflow license` on the server.
+        # operator manages the license with `oduflow license` on the server,
+        # and the vendor's update check and issue tracker are not theirs.
         if branding.is_white_label():
             return JSONResponse({"ok": False, "error": "Not found"}, status_code=404)
         return None
@@ -4231,6 +4259,8 @@ def _build_routes(
         for. Failures are reported in the payload, never as a 5xx: "could
         not reach GitHub" is an answer the dialog shows, not a server error.
         """
+        if hidden := _white_label_hidden():
+            return hidden
         result = await _offload(updates.check_for_update)
         return JSONResponse({"ok": True, "version": result.to_dict()})
 
@@ -4248,7 +4278,7 @@ def _build_routes(
             info = install_license_from_text(key_text, settings.etc_dir)
             return JSONResponse({"ok": True, "license": info.to_dict()})
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except Exception:
             logger.exception("Unexpected error in api_license_activate")
             return JSONResponse(
@@ -4262,6 +4292,8 @@ def _build_routes(
         length budget have one owner (oduflow.feedback) shared with the
         report_issue MCP tool.
         """
+        if hidden := _white_label_hidden():
+            return hidden
         try:
             try:
                 body = await request.json()
@@ -4357,7 +4389,7 @@ def _build_routes(
         except FlowError as e:
             return _error_response(e)
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except Exception:
             logger.exception("Unexpected error in api_extra_repo_add")
             return JSONResponse(
@@ -4435,7 +4467,7 @@ def _build_routes(
         except FlowError as e:
             return _error_response(e)
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except Exception:
             logger.exception("Unexpected error in api_extra_repo_branches")
             return JSONResponse(
@@ -4453,7 +4485,7 @@ def _build_routes(
         except FlowError as e:
             return _error_response(e)
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except Exception:
             logger.exception("Unexpected error in api_extra_repo_remote_branches")
             return JSONResponse(
@@ -4483,7 +4515,7 @@ def _build_routes(
         except FlowError as e:
             return _error_response(e)
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except Exception:
             logger.exception("Unexpected error in api_extra_repo_add_branches")
             return JSONResponse(
@@ -4510,7 +4542,7 @@ def _build_routes(
         except FlowError as e:
             return _error_response(e)
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except Exception:
             logger.exception("Unexpected error in api_extra_repo_remove_branch")
             return JSONResponse(
@@ -4799,7 +4831,7 @@ def _build_routes(
             )
             return JSONResponse({"ok": True, "result": result})
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except FlowError as e:
             return _error_response(e)
         except Exception:
@@ -4831,7 +4863,7 @@ def _build_routes(
             )
             return JSONResponse({"ok": True, "result": result})
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except FlowError as e:
             return _error_response(e)
         except Exception:
@@ -4847,7 +4879,7 @@ def _build_routes(
             secret_store.delete_secret(team, name)
             return JSONResponse({"ok": True, "result": {"deleted": name}})
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except FlowError as e:
             return _error_response(e)
         except Exception:
@@ -5783,7 +5815,7 @@ def _build_routes(
         try:
             validate_env_name(branch)
         except ValueError as e:
-            await _err(str(e), close_code=1008)
+            await _err(_public_error_text(e), close_code=1008)
             return
 
         try:
@@ -6079,7 +6111,7 @@ def _build_routes(
         except FlowError as e:
             return _error_response(e)
         except Exception as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         raw_extra = data.get("extra_addons")
         try:
             locks.acquire_env(_prod_lock_key(team, name))
@@ -6130,7 +6162,7 @@ def _build_routes(
         except FlowError as e:
             return _error_response(e)
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except Exception:
             logger.exception("api_production_create failed")
             return JSONResponse(
@@ -6170,7 +6202,7 @@ def _build_routes(
         except FlowError as e:
             return _error_response(e)
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except Exception:
             logger.exception("production action failed for '%s'", name)
             return JSONResponse(
@@ -6212,7 +6244,7 @@ def _build_routes(
         except FlowError as e:
             return _error_response(e)
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except Exception:
             logger.exception("production action failed for '%s'", name)
             return JSONResponse(
@@ -6436,7 +6468,7 @@ def _build_routes(
         try:
             validate_template_name(template_name)
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         # Fail fast on an unknown production before taking a team-wide lock.
         try:
             production_registry.get_production(team, name)
@@ -6479,7 +6511,7 @@ def _build_routes(
                 }
             )
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except ConflictError as e:
             # The dashboard offers a re-baseline instead of a dead end, so it
             # has to tell "that name is taken" apart from every other 400.
