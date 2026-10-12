@@ -169,7 +169,7 @@ def _ui_auth_off_at_boot(s: Settings) -> bool:
 
 
 _PUBLIC_SCHEME_HELP = (
-    "Scheme of every URL Oduflow hands out. Empty derives it from the routing "
+    "Scheme of every URL the server hands out. Empty derives it from the routing "
     "mode (https with Traefik, http in port mode). Set http only when nothing "
     "terminates TLS in front of a tls = false deployment."
 )
@@ -179,7 +179,7 @@ GROUPS: tuple[Group, ...] = (
         id="server",
         title="Server",
         table=("server",),
-        description="The Oduflow process itself: listener and safety switches.",
+        description="The server process itself: listener and safety switches.",
         fields=(
             Field(
                 "bind",
@@ -291,7 +291,7 @@ GROUPS: tuple[Group, ...] = (
         title="Extra routes",
         table=("route", "*"),
         description="Traefik only. Forward an external hostname to an upstream "
-        "URL for a service Oduflow does not manage. http://127.0.0.1 means "
+        "URL for a service the server does not manage. http://127.0.0.1 means "
         "the Docker host.",
         presence_apply=RESTART,
         presence_note="Traefik's dynamic config is rewritten on restart.",
@@ -560,7 +560,7 @@ GROUPS: tuple[Group, ...] = (
                 "walg_version",
                 "str",
                 "WAL-G version",
-                "Empty = the version Oduflow pins.",
+                "Empty = the pinned version.",
                 default="",
                 advanced=True,
             ),
@@ -999,8 +999,21 @@ def is_secret_path(path: tuple[str, ...]) -> bool:
     return bool(re.search(r"(password|token|secret|key)", path[-1], re.I))
 
 
-def schema_json() -> list[dict[str, Any]]:
-    return [group.to_json() for group in GROUPS]
+# Keys of vendor surfaces that white label withholds whatever their value
+# (server._apply_agent_feedback), so the console does not offer them either.
+_VENDOR_KEYS = frozenset({("server", "agent_feedback")})
+
+
+def schema_json(*, white_label: bool = False) -> list[dict[str, Any]]:
+    groups = [group.to_json() for group in GROUPS]
+    if white_label:
+        for group in groups:
+            group["fields"] = [
+                f
+                for f in group["fields"]
+                if (group["id"], f["key"]) not in _VENDOR_KEYS
+            ]
+    return groups
 
 
 class CoercionError(ValueError):

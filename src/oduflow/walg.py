@@ -47,6 +47,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from oduflow import branding
 from oduflow.errors import ExternalCommandError, PrerequisiteNotMetError
 from oduflow.settings import Settings
 
@@ -107,7 +108,9 @@ def _docker_arch() -> str:
 
 
 def _download(url: str, dest: str, timeout: int = 120) -> None:
-    request = urllib.request.Request(url, headers={"User-Agent": "oduflow"})
+    request = urllib.request.Request(
+        url, headers={"User-Agent": branding.current().slug}
+    )
     with (
         urllib.request.urlopen(request, timeout=timeout) as resp,
         open(dest, "wb") as out,

@@ -238,8 +238,8 @@ supported because the cluster is not published on a host port.
 | `GET` | `/api/agent-guides/{filename}` | Read a guide |
 
 Under an active [Custom license](licensing.md#custom-license-white-label) the
-`/api/license*` endpoints answer `404`: the operator manages the license with
-`oduflow license` on the server.
+`/api/license*`, `/api/version` and `/api/feedback/link` endpoints answer `404`:
+the operator manages the license with `oduflow license` on the server.
 
 ## Coding agent endpoints
 

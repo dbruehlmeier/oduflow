@@ -640,7 +640,7 @@ def reset_admin_password(
     except docker.errors.NotFound:
         raise NotFoundError(
             f"Database container '{settings.shared_db_container}' is not running. "
-            "System not initialized. Restart oduflow."
+            "System not initialized. Restart Oduflow."
         )
 
     sql = f"UPDATE res_users SET password = '{hashed}' WHERE login = 'admin'"
@@ -677,7 +677,7 @@ def _execute_db_query(
     except docker.errors.NotFound:
         raise NotFoundError(
             f"Database container '{settings.shared_db_container}' is not running. "
-            "System not initialized. Restart oduflow."
+            "System not initialized. Restart Oduflow."
         )
 
     creds = load_credentials(
@@ -1185,7 +1185,7 @@ def list_env_users(
     except docker.errors.NotFound:
         raise NotFoundError(
             f"Database container '{settings.shared_db_container}' is not running. "
-            "System not initialized. Restart oduflow."
+            "System not initialized. Restart Oduflow."
         )
     # json_agg → a single JSON array so the value parses cleanly without CSV
     # quoting concerns (partner names may contain commas).

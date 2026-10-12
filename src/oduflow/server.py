@@ -1858,8 +1858,9 @@ def get_agent_instructions(ctx: Context | None = None) -> str:
     team = _resolve_team(ctx)
     guide = _guide_body()
     # The feedback section ships nowhere on disk — it exists only while the
-    # (undocumented) [server] agent_feedback option is on.
-    if _get_settings().agent_feedback:
+    # (undocumented) [server] agent_feedback option is on. White label hides
+    # submit_agent_feedback, so the guide must not point agents at it.
+    if _get_settings().agent_feedback and not branding.is_white_label():
         from oduflow import agent_feedback as feedback_mod
 
         guide = guide.rstrip() + "\n\n" + feedback_mod.INSTRUCTIONS_SECTION
