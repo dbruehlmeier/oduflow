@@ -120,35 +120,40 @@ class Chunker:
             n = len(buf)
             if n < min_size:
                 break
-            view = memoryview(buf)
             pos, h = self._scan_pos, self._hash
             cut = 0
-            if pos == 0:
-                # First window of a new chunk.
-                for b in view[:min_size]:
-                    h = (((h << 1) | (h >> 63)) & _MASK64) ^ table[b]
-                pos = min_size
-                if (h & mask) == 0:
-                    cut = min_size
-            if not cut:
-                # Roll one byte at a time: drop buf[pos-min_size], add buf[pos].
-                upper = min(n, max_size)
-                for out_b, in_b in zip(
-                    view[pos - min_size : upper - min_size], view[pos:upper]
-                ):
-                    h = (
-                        (((h << 1) | (h >> 63)) & _MASK64)
-                        ^ out_table[out_b]
-                        ^ table[in_b]
-                    )
-                    pos += 1
+            # Every view (slices included) is released by its with-block, not
+            # by refcounting: a live export makes the del/extend of the
+            # buffer raise BufferError.
+            with memoryview(buf) as view:
+                if pos == 0:
+                    # First window of a new chunk.
+                    with view[:min_size] as first:
+                        for b in first:
+                            h = (((h << 1) | (h >> 63)) & _MASK64) ^ table[b]
+                    pos = min_size
                     if (h & mask) == 0:
-                        cut = pos
-                        break
-                else:
-                    if upper == max_size:
-                        cut = max_size
-            view.release()
+                        cut = min_size
+                if not cut:
+                    # Roll one byte at a time: drop buf[pos-min_size], add buf[pos].
+                    upper = min(n, max_size)
+                    with (
+                        view[pos - min_size : upper - min_size] as outgoing,
+                        view[pos:upper] as incoming,
+                    ):
+                        for out_b, in_b in zip(outgoing, incoming):
+                            h = (
+                                (((h << 1) | (h >> 63)) & _MASK64)
+                                ^ out_table[out_b]
+                                ^ table[in_b]
+                            )
+                            pos += 1
+                            if (h & mask) == 0:
+                                cut = pos
+                                break
+                        else:
+                            if upper == max_size:
+                                cut = max_size
             if cut:
                 self._pending.append(bytes(buf[:cut]))
                 del buf[:cut]
@@ -169,10 +174,7 @@ class Chunker:
     def update(self, data: bytes) -> Iterator[bytes]:
         """Feed data; yield any chunks completed by it."""
         self._buffer.extend(data)
-        # Batch tiny updates: the scan resumes where it stopped, so this
-        # only amortizes the per-call overhead.
-        if len(self._buffer) >= self.min_size * 2 or len(self._buffer) >= self.max_size:
-            self._scan(final=False)
+        self._scan(final=False)
         while self._pending:
             yield self._pending.pop(0)
 
