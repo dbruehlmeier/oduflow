@@ -7,7 +7,7 @@ import shutil
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, NamedTuple
 
 logger = logging.getLogger("oduflow")
 
@@ -19,8 +19,11 @@ TYPE_UNLICENSED = "unlicensed"
 TYPE_INDIVIDUAL = "individual"
 TYPE_BUSINESS = "business"
 TYPE_INTEGRATOR = "integrator"
+# Individually agreed hosting / white-label license: carries a signed brand
+# name and the hostnames it may be shown on (see oduflow.branding).
+TYPE_CUSTOM = "custom"
 
-VALID_TYPES = {TYPE_INDIVIDUAL, TYPE_BUSINESS, TYPE_INTEGRATOR}
+VALID_TYPES = {TYPE_INDIVIDUAL, TYPE_BUSINESS, TYPE_INTEGRATOR, TYPE_CUSTOM}
 
 # Display labels
 TYPE_LABELS = {
@@ -28,6 +31,7 @@ TYPE_LABELS = {
     TYPE_INDIVIDUAL: "Licensed to individual",
     TYPE_BUSINESS: "Licensed to company",
     TYPE_INTEGRATOR: "Licensed to Odoo integrator",
+    TYPE_CUSTOM: "Licensed to",
 }
 
 TYPE_SUFFIXES = {
@@ -55,18 +59,21 @@ class LicenseInfo:
     email: str
     issued: str = ""
     plan: str = ""
-    scope: str = ""
     license_id: str = ""
-    subscription_id: str = ""
-    paddle_environment: str = ""
     valid_from: str = ""
     expires: str = ""
+    brand_name: str = ""
+    domains: tuple[str, ...] = ()
+
+    @property
+    def expires_at(self) -> datetime | None:
+        """Expiry as an aware UTC datetime; None when the license is perpetual."""
+        return _parse_date(self.expires) if self.expires else None
 
     @property
     def expired(self) -> bool:
-        return bool(self.expires) and _parse_date(self.expires) <= datetime.now(
-            timezone.utc
-        )
+        expires = self.expires_at
+        return expires is not None and expires <= datetime.now(timezone.utc)
 
     @property
     def status(self) -> str:
@@ -106,9 +113,6 @@ class LicenseInfo:
             "expires": self.expires,
             "perpetual": self.type != TYPE_UNLICENSED and not self.expires,
             "can_refresh": self.type != TYPE_UNLICENSED,
-            "can_subscribe": bool(self.license_id)
-            and not self.subscription_id
-            and self.expired,
         }
 
 
@@ -131,6 +135,7 @@ def get_license_path(etc_dir: str | None = None) -> str:
 
 
 def _verify_license_text(raw: str) -> LicenseInfo:
+    from cryptography.exceptions import InvalidSignature
     from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.asymmetric import padding, rsa
     from cryptography.hazmat.primitives.serialization import load_pem_public_key
@@ -146,15 +151,22 @@ def _verify_license_text(raw: str) -> LicenseInfo:
     pub_key = load_pem_public_key(_PUBLIC_KEY_PEM.encode())
     if not isinstance(pub_key, rsa.RSAPublicKey):
         raise ValueError("License public key must be an RSA key")
-    pub_key.verify(
-        signature,
-        payload_bytes,
-        padding.PSS(
-            mgf=padding.MGF1(hashes.SHA256()),
-            salt_length=padding.PSS.MAX_LENGTH,
-        ),
-        hashes.SHA256(),
-    )
+    try:
+        pub_key.verify(
+            signature,
+            payload_bytes,
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.MAX_LENGTH,
+            ),
+            hashes.SHA256(),
+        )
+    except InvalidSignature as exc:
+        # Every rejection leaves this function as a ValueError. InvalidSignature
+        # is a bare Exception with an empty message, so letting it out means the
+        # CLI prints a traceback with no reason and the dashboard answers 500
+        # instead of naming the problem.
+        raise ValueError("Invalid license signature") from exc
 
     data = json.loads(payload_bytes)
     if not isinstance(data, dict):
@@ -163,54 +175,71 @@ def _verify_license_text(raw: str) -> LicenseInfo:
     if license_type not in VALID_TYPES:
         raise ValueError(f"Unknown license type: {license_type}")
 
-    annual_fields = (
-        "license_id",
-        "plan",
-        "scope",
-        "subscription_id",
-        "paddle_environment",
-        "valid_from",
-        "expires",
-    )
-    if data.get("version") in (2, 3) or any(data.get(field) for field in annual_fields):
-        expected = {
-            "solo": (TYPE_INDIVIDUAL, "individual-commercial"),
-            "business": (TYPE_BUSINESS, "internal-use"),
-            "integrator": (TYPE_INTEGRATOR, "client-services"),
-        }
-        required = ("plan", "scope", "paddle_environment", "valid_from", "expires")
-        version = data.get("version")
+    # The signature already proves the license server issued these terms; the
+    # client only checks what it relies on. How a period was paid (and with
+    # which provider) is the license server's business, so any provider fields
+    # in older keys are ignored.
+    valid_from = _optional_str(data, "valid_from")
+    expires = _optional_str(data, "expires")
+    # Parsed here even when there is nothing to compare: LicenseInfo.status and
+    # oduflow.branding do arithmetic on these, so a naive or malformed timestamp
+    # has to be rejected now (degrading to unlicensed) rather than raise later
+    # from a dashboard request or an MCP call.
+    if expires:
+        expires_at = _parse_date(expires)
+        if valid_from and expires_at <= _parse_date(valid_from):
+            raise ValueError("Invalid license period")
+    elif valid_from:
+        raise ValueError("Invalid license period")
+    license_id = _optional_str(data, "license_id")
+    if license_id and not re.fullmatch(
+        r"[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}", license_id
+    ):
+        raise ValueError("Invalid license ID")
+
+    brand_name = ""
+    domains: tuple[str, ...] = ()
+    if license_type == TYPE_CUSTOM:
+        brand_name = _optional_str(data, "brand_name")
+        raw_domains = data.get("domains")
         if (
-            version not in (2, 3)
+            not license_id
+            or not expires
+            or not brand_name
+            or brand_name != brand_name.strip()
+            or len(brand_name) > 60
+            or re.search(r"[\x00-\x1f\x7f<>]", brand_name)
+            or not isinstance(raw_domains, list)
+            or not raw_domains
             or not all(
-                isinstance(data.get(field), str) and data[field] for field in required
+                isinstance(d, str) and _DOMAIN_RE.fullmatch(d) for d in raw_domains
             )
-            or expected.get(data["plan"]) != (license_type, data["scope"])
-            or (
-                version == 3
-                and not re.fullmatch(
-                    r"[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}",
-                    str(data.get("license_id", "")),
-                )
-            )
-            or (
-                (version == 2 or data.get("subscription_id"))
-                and not re.fullmatch(
-                    r"sub_[a-z0-9]{26}", str(data.get("subscription_id", ""))
-                )
-            )
-            or data["paddle_environment"] not in ("sandbox", "production")
-            or _parse_date(data["expires"]) <= _parse_date(data["valid_from"])
         ):
-            raise ValueError("Invalid annual license terms")
+            raise ValueError("Invalid custom license terms")
+        domains = tuple(raw_domains)
 
     return LicenseInfo(
         type=license_type,
-        name=data.get("name", ""),
-        email=data.get("email", ""),
-        issued=data.get("issued", ""),
-        **{field: data.get(field, "") for field in annual_fields},
+        name=_optional_str(data, "name"),
+        email=_optional_str(data, "email"),
+        issued=_optional_str(data, "issued"),
+        plan=_optional_str(data, "plan"),
+        license_id=license_id,
+        valid_from=valid_from,
+        expires=expires,
+        brand_name=brand_name,
+        domains=domains,
     )
+
+
+_DOMAIN_RE = re.compile(r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}")
+
+
+def _optional_str(data: dict[str, Any], field: str) -> str:
+    value = data.get(field, "")
+    if not isinstance(value, str):
+        raise ValueError(f"Invalid license field: {field}")
+    return value
 
 
 def get_license_info(etc_dir: str | None = None) -> LicenseInfo:
@@ -253,8 +282,22 @@ def install_license_from_text(key_text: str, etc_dir: str | None = None) -> Lice
     return info
 
 
-def refresh_license(etc_dir: str | None = None) -> tuple[LicenseInfo, bool]:
-    """Manually check a paid renewal; never called during normal operation."""
+class RefreshResult(NamedTuple):
+    info: LicenseInfo
+    renewed: bool
+    # The license server found no paid period to install and the holder can
+    # subscribe again (get_license_checkout_url). The server decides; the
+    # client never needs to know how payments are processed.
+    subscription_required: bool = False
+
+
+def refresh_license(etc_dir: str | None = None) -> RefreshResult:
+    """Ask the license server for a renewed key and install it if there is one.
+
+    Called when an operator asks (dashboard button, ``oduflow license refresh``)
+    and, for a custom license, by the daily check during the grace period after
+    expiry (oduflow.branding).
+    """
     import httpx
     from cryptography.exceptions import InvalidSignature
 
@@ -278,7 +321,7 @@ def refresh_license(etc_dir: str | None = None) -> tuple[LicenseInfo, bool]:
     if not isinstance(data, dict):
         raise ValueError("Invalid license server response")
     if not data.get("renewed"):
-        return current, False
+        return RefreshResult(current, False, bool(data.get("subscription_required")))
     key = data.get("license_key")
     if not isinstance(key, str) or len(key) > 16384:
         raise ValueError("Invalid renewal key")
@@ -288,10 +331,9 @@ def refresh_license(etc_dir: str | None = None) -> tuple[LicenseInfo, bool]:
         raise ValueError("Invalid renewal signature or payload") from exc
     identity_fields = ["type", "name", "email"]
     if current.expires:
-        identity_fields.extend(["plan", "scope", "paddle_environment"])
-        identity_fields.append(
-            "license_id" if current.license_id else "subscription_id"
-        )
+        identity_fields.append("plan")
+        if current.license_id:
+            identity_fields.append("license_id")
     elif not updated.license_id:
         raise ValueError("Legacy migration requires a stable license identity")
     for field in identity_fields:
@@ -308,7 +350,7 @@ def refresh_license(etc_dir: str | None = None) -> tuple[LicenseInfo, bool]:
             raise ValueError(
                 "The installed license changed. Please check its status again."
             )
-    return install_license_from_text(key, etc_dir), True
+    return RefreshResult(install_license_from_text(key, etc_dir), True)
 
 
 def get_license_checkout_url(etc_dir: str | None = None) -> str:

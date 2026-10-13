@@ -113,7 +113,7 @@ def _keep_reason(
     if _is_staging(image.tags):
         return "Image build staging image."
     if image.id in _requested_image_ids(client):
-        return "Recently requested by an Oduflow operation."
+        return "Recently requested by an operation."
     return None
 
 

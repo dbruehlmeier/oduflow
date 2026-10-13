@@ -108,7 +108,7 @@ def test_removal_lists_containers_once_and_skips_images_that_must_stay():
         _id("b"): "Now used by a container.",
         _id("c"): "Image build staging image.",
         _id("d"): "Now has child images.",
-        _id("e"): "Recently requested by an Oduflow operation.",
+        _id("e"): "Recently requested by an operation.",
     }
     assert client.images.remove.call_args_list == [
         call(_id("a"), force=False, noprune=True),

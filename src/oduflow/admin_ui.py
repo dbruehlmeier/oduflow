@@ -34,8 +34,8 @@ from starlette.responses import (
 )
 from starlette.routing import BaseRoute, Route
 
+from oduflow import branding, config_store, feedback, ui_totp
 from oduflow import config_schema as schema
-from oduflow import config_store, feedback, ui_totp
 from oduflow.errors import ConfigError, ConflictError, FlowError
 from oduflow.settings import Settings, TeamSettings, secret_matches
 
@@ -123,12 +123,12 @@ def has_admin_session(request: Request, settings: Settings) -> bool:
 def _render_login(error: str = "") -> str:
     page = (_TEMPLATE_DIR / "login.html").read_text(encoding="utf-8")
     banner = f'<div class="error">{html.escape(error)}</div>' if error else ""
-    return (
+    return branding.render_page(
         page.replace('action="/login"', f'action="{PREFIX}/login"')
         .replace("<h1>Sign in</h1>", "<h1>Server settings</h1>")
         .replace(
-            "<title>Oduflow — Sign in</title>",
-            "<title>Oduflow — Server settings</title>",
+            "<title>__BRAND_NAME__ — Sign in</title>",
+            "<title>__BRAND_NAME__ — Server settings</title>",
         )
         .replace("<!--ERROR-->", banner)
     )
@@ -234,7 +234,7 @@ def build_admin_routes(
             return RedirectResponse(f"{PREFIX}/login", status_code=302)
         html_text = (_TEMPLATE_DIR / "admin.html").read_text(encoding="utf-8")
         return HTMLResponse(
-            html_text.replace(
+            branding.render_page(html_text).replace(
                 "__ODUFLOW_VERSION__", html.escape(feedback.oduflow_version())
             )
         )
@@ -337,7 +337,7 @@ def build_admin_routes(
             "path": snapshot.path,
             "revision": snapshot.revision,
             "boot_id": runtime.boot_id if runtime else "",
-            "schema": schema.schema_json(),
+            "schema": schema.schema_json(white_label=branding.is_white_label()),
             # None when the file does not even parse: the forms would show
             # empty values, so the page sends the admin to Raw TOML instead.
             "values": config_store.mask_raw(file_raw) if file_raw else None,

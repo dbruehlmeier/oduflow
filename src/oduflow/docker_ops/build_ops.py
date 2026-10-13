@@ -258,7 +258,7 @@ def run_build_async(
     thread.start()
 
 
-_LOG_TRUNCATED_MARKER = b"\n[oduflow] build log truncated at configured limit\n"
+_LOG_TRUNCATED_MARKER = b"\n[build] build log truncated at configured limit\n"
 
 
 class _CappedLog:
@@ -336,7 +336,7 @@ def _docker_build_worker(
                     result["error"] = redact_url_credentials(
                         str(detail.get("message") or chunk.get("error") or "")
                     )
-                    log.write(f"\n[oduflow] build error: {result['error']}\n")
+                    log.write(f"\n[build] build error: {result['error']}\n")
                     break
             else:
                 image = client.images.get(local_tag)
@@ -409,14 +409,14 @@ def _run_build(
                 error = "Cancelled by request."
                 _terminate_build_process(process)
                 _append_capped_log(
-                    log_path, "\n[oduflow] build cancelled\n", max_log_bytes
+                    log_path, "\n[build] build cancelled\n", max_log_bytes
                 )
                 break
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 error = f"Build timed out after {registry_cfg.build_timeout_seconds}s."
                 _terminate_build_process(process)
-                _append_capped_log(log_path, f"\n[oduflow] {error}\n", max_log_bytes)
+                _append_capped_log(log_path, f"\n[build] {error}\n", max_log_bytes)
                 break
             process.join(timeout=min(0.25, remaining))
         else:

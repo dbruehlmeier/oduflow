@@ -1,5 +1,4 @@
 import pytest
-from cryptography.exceptions import InvalidSignature
 
 from oduflow import licensing
 from oduflow.licensing import TYPE_BUSINESS, TYPE_INDIVIDUAL, LicenseInfo
@@ -141,7 +140,7 @@ class TestVerifyLicenseText:
         ).encode()
         tampered = sig_b64 + "." + base64.b64encode(forged).decode()
 
-        with pytest.raises(InvalidSignature):
+        with pytest.raises(ValueError, match="Invalid license signature"):
             licensing._verify_license_text(tampered)
 
     def test_a_license_signed_by_another_key_is_rejected(self, monkeypatch):
@@ -150,7 +149,7 @@ class TestVerifyLicenseText:
         monkeypatch.setattr(licensing, "_PUBLIC_KEY_PEM", our_pem)
         key = self._sign(other_private, {"type": "business", "name": "Acme"})
 
-        with pytest.raises(InvalidSignature):
+        with pytest.raises(ValueError, match="Invalid license signature"):
             licensing._verify_license_text(key)
 
     def test_unknown_license_type_is_rejected(self, signer):
@@ -238,7 +237,6 @@ class TestLicenseLabel:
             "expires": "",
             "perpetual": True,
             "can_refresh": True,
-            "can_subscribe": False,
         }
 
 
@@ -289,15 +287,70 @@ def test_legacy_key_remains_perpetual(annual_signer):
         {"expires": "garbage"},
         {"expires": "2019-01-01T00:00:00Z"},
         {"expires": "2028-01-01T00:00:00"},
-        {"plan": "business"},
-        {"scope": "hosting"},
-        {"subscription_id": ""},
-        {"version": 1},
+        {"expires": ""},
+        {"license_id": "not-a-uuid"},
+        {"name": 42},
     ],
 )
 def test_rejects_malformed_annual_terms(annual_signer, change):
     with pytest.raises(ValueError):
         licensing._verify_license_text(annual_signer(annual_payload(**change)))
+
+
+@pytest.mark.parametrize("expires", ["garbage", "2028-01-01T00:00:00"])
+def test_rejects_a_bad_expiry_without_a_valid_from(annual_signer, expires):
+    # A key carrying only an expiry used to skip date parsing altogether, so a
+    # malformed or timezone-naive timestamp was accepted here and raised later
+    # instead - from LicenseInfo.status or oduflow.branding, in the middle of a
+    # dashboard request or an MCP call.
+    payload = annual_payload(expires=expires)
+    payload.pop("valid_from")
+
+    with pytest.raises(ValueError):
+        licensing._verify_license_text(annual_signer(payload))
+
+
+def test_license_cli_names_a_wrongly_signed_key(tmp_path):
+    # Verified against the real product key, so the signature cannot match.
+    # The CLI has to report the reason instead of printing a traceback with an
+    # empty message (InvalidSignature carries none).
+    import argparse
+
+    from oduflow.errors import FlowError
+    from oduflow.server import _run_license_cli
+    from oduflow.settings import Settings
+
+    private, _ = TestVerifyLicenseText._keypair()
+    key_path = tmp_path / "bad.key"
+    key_path.write_text(
+        TestVerifyLicenseText._sign(private, {"type": "business", "name": "Acme"}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(FlowError, match="Invalid license signature"):
+        _run_license_cli(
+            Settings(etc_dir=str(tmp_path)),
+            argparse.Namespace(license_action="install", file=str(key_path)),
+        )
+
+    assert not (tmp_path / "license.key").exists()
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"paddle_environment": "elsewhere"},
+        {"subscription_id": "anything"},
+        {"scope": "whatever"},
+        {"version": 7},
+    ],
+)
+def test_payment_provider_fields_are_opaque(annual_signer, change):
+    # How a period was paid is the license server's business: the client
+    # neither validates nor keeps provider fields.
+    info = licensing._verify_license_text(annual_signer(annual_payload(**change)))
+    assert info.expires == "2021-01-01T00:00:00Z"
+    assert not hasattr(info, "subscription_id")
 
 
 def test_manual_refresh_installs_only_matching_newer_signed_key(
@@ -327,7 +380,7 @@ def test_manual_refresh_installs_only_matching_newer_signed_key(
         )
 
     monkeypatch.setattr(httpx, "post", post)
-    info, changed = licensing.refresh_license(str(tmp_path))
+    info, changed, _ = licensing.refresh_license(str(tmp_path))
     assert changed and info.status == "active"
     assert (tmp_path / "license.key").read_text() == renewed
     assert calls[0][0] == "https://license.oduist.com/oduflow/check_license"
@@ -374,7 +427,7 @@ def test_failed_refresh_never_overwrites_installed_key(
 
     monkeypatch.setattr(httpx, "post", post)
     if kind == "unpaid":
-        info, changed = licensing.refresh_license(str(tmp_path))
+        info, changed, _ = licensing.refresh_license(str(tmp_path))
         assert not changed and info.expired
     else:
         with pytest.raises(Exception):
@@ -391,15 +444,35 @@ def manual_payload(**changes):
     )
 
 
-def test_manual_key_displays_expiry_and_allows_checkout(annual_signer):
+def test_manual_key_displays_expiry_and_allows_refresh(annual_signer):
     info = licensing._verify_license_text(annual_signer(manual_payload()))
     assert info.expired
     assert info.to_dict()["can_refresh"]
-    assert info.to_dict()["can_subscribe"]
+
+
+def test_refresh_reports_that_the_server_requires_a_subscription(
+    tmp_path, monkeypatch, annual_signer
+):
+    import httpx
+
+    original = annual_signer(manual_payload())
+    (tmp_path / "license.key").write_text(original)
+    monkeypatch.setattr(
+        httpx,
+        "post",
+        lambda url, **kw: httpx.Response(
+            200,
+            json={"renewed": False, "status": "expired", "subscription_required": True},
+            request=httpx.Request("POST", url),
+        ),
+    )
+    result = licensing.refresh_license(str(tmp_path))
+    assert not result.renewed and result.subscription_required
+    assert (tmp_path / "license.key").read_text() == original
 
 
 @pytest.mark.parametrize("legacy", [True, False])
-def test_manual_migration_and_paddle_attachment(
+def test_manual_migration_and_subscription_attachment(
     tmp_path, monkeypatch, annual_signer, legacy
 ):
     import httpx
@@ -432,9 +505,8 @@ def test_manual_migration_and_paddle_attachment(
             request=httpx.Request("POST", url),
         ),
     )
-    info, renewed = licensing.refresh_license(str(tmp_path))
+    info, renewed, _ = licensing.refresh_license(str(tmp_path))
     assert renewed and info.license_id == MANUAL_ID
-    assert info.subscription_id.startswith("sub_")
     assert (tmp_path / "license.key").read_text() == updated
 
 
@@ -495,3 +567,50 @@ def test_checkout_exchanges_key_in_post_body_and_validates_destination(
     else:
         with pytest.raises(ValueError):
             licensing.get_license_checkout_url(str(tmp_path))
+
+
+def custom_payload(**changes):
+    return {
+        "version": 4,
+        "type": "custom",
+        "plan": "custom",
+        "license_id": MANUAL_ID,
+        "name": "Acme Cloud",
+        "email": "ops@acme.example",
+        "brand_name": "AcmeFlow",
+        "domains": ["acme-cloud.com"],
+        "valid_from": "2026-01-01T00:00:00Z",
+        "expires": "2099-01-01T00:00:00Z",
+        **changes,
+    }
+
+
+def test_custom_license_carries_brand_and_domains(annual_signer):
+    info = licensing._verify_license_text(annual_signer(custom_payload()))
+    assert info.type == licensing.TYPE_CUSTOM
+    assert info.brand_name == "AcmeFlow"
+    assert info.domains == ("acme-cloud.com",)
+    assert info.label == "Licensed to: Acme Cloud"
+    assert info.status == "active"
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"brand_name": ""},
+        {"brand_name": " Padded"},
+        {"brand_name": "<script>"},
+        {"brand_name": "x" * 61},
+        {"domains": []},
+        {"domains": ["Not A Domain"]},
+        {"domains": "acme-cloud.com"},
+        {"license_id": ""},
+        {"expires": ""},
+    ],
+)
+def test_rejects_malformed_custom_terms(annual_signer, change):
+    payload = custom_payload(**change)
+    if change.get("expires") == "":
+        payload.pop("valid_from")
+    with pytest.raises(ValueError):
+        licensing._verify_license_text(annual_signer(payload))

@@ -7,7 +7,7 @@
 <link rel="preload" href="/static/source-code-pro-latin.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="icon" href="/favicon.ico" sizes="16x16 32x32">
 <link rel="icon" href="/static/icon.png" type="image/png" sizes="32x32">
-<title>Oduflow — Server settings</title>
+<title>__BRAND_NAME__ — Server settings</title>
 <script>
   // Same theme bootstrap as the dashboard (DESIGN.md §2): stored mode, else the OS.
   (function () {
@@ -129,7 +129,7 @@
   }
   .brand-lockup { display: flex; align-items: center; gap: 10px; min-width: 0; }
   .brand-lockup img { height: 28px; }
-  :root[data-theme="light"] .brand-lockup img { filter: brightness(0); }
+  :root[data-theme="light"] .brand-lockup img:not(.custom-logo) { filter: brightness(0); }
   .brand-copy { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
   header h1 { font-size: var(--text-xl); font-weight: 600; line-height: 1.05; }
   .brand-byline {
@@ -365,7 +365,7 @@
 <body>
 <header>
   <div class="brand-lockup">
-    <img src="/logo.png" alt="Oduflow logo">
+    <img class="__LOGO_CLASS__" src="/logo.png?v=__ASSET_VERSION__" alt="__BRAND_NAME__ logo">
     <div class="brand-copy">
       <h1>Server settings</h1>
       <div class="brand-byline" id="config-path" title="Config file">oduflow.toml · v__ODUFLOW_VERSION__</div>
@@ -373,7 +373,7 @@
   </div>
   <div class="actions">
     <a class="header-link" href="/">Dashboard</a>
-    <a class="header-link" href="https://docs.oduflow.dev/admin/" target="_blank" rel="noopener">Docs &#8599;</a>
+    <!--IF-STOCK--><a class="header-link" href="https://docs.oduflow.dev/admin/" target="_blank" rel="noopener">Docs &#8599;</a><!--/IF-STOCK-->
     <button id="theme-toggle" type="button" onclick="cycleTheme()" aria-label="Theme"></button>
     <form method="post" action="/admin/logout"><button class="btn" type="submit">Sign out</button></form>
   </div>
@@ -446,7 +446,7 @@
 <!-- Restart progress -->
 <div class="modal-overlay" id="restart-modal">
   <div class="modal modal-sm" role="dialog" aria-modal="true" aria-labelledby="restart-title">
-    <div class="modal-header"><h2 id="restart-title">Restarting Oduflow</h2></div>
+    <div class="modal-header"><h2 id="restart-title">Restarting the server</h2></div>
     <div class="modal-body"><p class="modal-note" id="restart-status"><span class="spinner"></span> Waiting for the server to stop…</p></div>
   </div>
 </div>
@@ -488,7 +488,7 @@ const SECTIONS = [
 const APPLY_TEXT = { live: 'Live', restart: 'Restart', recreate: 'Recreate', locked: 'Read-only' };
 const APPLY_TITLE = {
   live: 'Takes effect immediately after saving',
-  restart: 'Saved now, takes effect after an Oduflow restart',
+  restart: 'Saved now, takes effect after a server restart',
   recreate: 'Takes effect after a restart, and for existing environments/services only once they are recreated',
   locked: 'Shown read-only: changing it in the file alone breaks the deployment'
 };
@@ -688,7 +688,7 @@ function renderBanners() {
       ' not active in the running server yet: ' + names + '</span><span class="banner-actions">' +
       '<button class="btn" onclick="showPending()">Details</button>' +
       (live.length && !rest.length ? '<button class="btn" onclick="reloadLive()">Apply now</button>' : '') +
-      (rest.length && STATE.restart_available ? '<button class="btn warn" onclick="restartServer()">Restart Oduflow</button>' : '') +
+      (rest.length && STATE.restart_available ? '<button class="btn warn" onclick="restartServer()">Restart server</button>' : '') +
       '</span></div>';
   }
   document.getElementById('banners').innerHTML = html;
@@ -1278,9 +1278,9 @@ async function startReview(body, source) {
   } else {
     var worst = data.apply;
     var summary = worst === 'live' ? 'Everything applies as soon as you save.'
-      : worst === 'restart' ? 'Some changes apply only after an Oduflow restart; live ones apply at once.'
+      : worst === 'restart' ? 'Some changes apply only after a server restart; live ones apply at once.'
       : worst === 'recreate' ? 'Some changes need a restart and then recreating existing environments/services.'
-      : 'Some changes need manual steps outside Oduflow — read the notes.';
+      : 'Some changes need manual steps outside the server — read the notes.';
     html += '<p class="change-summary">' + applyBadge(worst) + ' ' + esc(summary) + '</p>';
     (data.warnings || []).forEach(function (w) { html += '<div class="callout">' + esc(w) + '</div>'; });
     if (data.signs_out) html += '<div class="callout">The console password changes: you will be signed out and must sign in with the new one.</div>';
@@ -1336,7 +1336,7 @@ async function restartServer() {
   if (DRAFT.size) { showToast('Save or discard your unsaved changes first', true); return; }
   var target = movedConsoleUrl();
   if (!(await confirmDialog({
-    title: 'Restart Oduflow',
+    title: 'Restart server',
     message: 'The server stops serving for a few seconds and starts again with the saved config: dashboards, MCP clients and this console reconnect. Environments, services and productions keep running.' +
       (target ? ' The port changes: afterwards the console is at ' + target + '.' : ''),
     confirmLabel: 'Restart'
@@ -1354,7 +1354,7 @@ async function restartServer() {
   if (moved) {
     // A new listener port: this origin will not answer again, so hand over
     // the new address instead of polling one that stays dark.
-    status.innerHTML = 'Oduflow restarts on a new port. Open the console at <a href="' + esc(moved) +
+    status.innerHTML = 'The server restarts on a new port. Open the console at <a href="' + esc(moved) +
       '">' + esc(moved) + '</a> in a few seconds.';
     return;
   }
@@ -1373,7 +1373,7 @@ async function restartServer() {
       if (d.ok && d.boot_id && d.boot_id !== before) {
         clearInterval(timer);
         closeModal('restart-modal');
-        showToast('Oduflow restarted with the saved config');
+        showToast('Server restarted with the saved config');
         loadState();
         return;
       }

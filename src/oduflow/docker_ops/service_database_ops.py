@@ -192,9 +192,7 @@ def create_database(
                 f'TABLESPACE "{tablespace}";'
             )
         safe_password = _sql_literal(password)
-        safe_comment = _sql_literal(
-            f"Oduflow service database team={team.team_id} name={name}"
-        )
+        safe_comment = _sql_literal(f"Service database team={team.team_id} name={name}")
         role_created = False
         database_created = False
         try:
