@@ -3194,9 +3194,17 @@ next to the production's status on the dashboard, returned as `progress` by
 `list_productions` / `get_production_info`, and quoted in the `BusyError` a
 concurrent call on the same production receives.
 
+A deploy started from the dashboard (or by a GitHub push) while another
+operation holds the production — a scheduled snapshot, a restart, another
+deploy — queues instead of failing: the production shows a `queued` badge with
+the waiting time and what it waits for, and a second click while one is already
+queued is refused. If the production stays busy past the wait limit (5 min for
+the dashboard, 30 min for webhooks), the deploy is not started and a `skipped`
+entry with the reason lands in the deploy history.
+
 Every deploy lands in the production's history (`production_deploys`):
 commits, action, modules, status (`success` / `rolled_back` /
-`rollback_failed`), trigger (mcp / ui / webhook / schedule).
+`rollback_failed` / `skipped`), trigger (mcp / ui / webhook / schedule).
 
 Manual code rollback to any commit: `rollback_production(name, to_commit)`.
 
@@ -7757,7 +7765,7 @@ Lock: production.
 ### `production_deploys`
 
 Deploy history, newest last: commits, actions, modules, status
-(`success` / `rolled_back` / `rollback_failed`) and errors.
+(`success` / `rolled_back` / `rollback_failed` / `skipped`) and errors.
 
 **Parameters**
 

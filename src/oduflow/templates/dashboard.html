@@ -9421,6 +9421,24 @@ function prodProgressBadge(p) {
     _fmtElapsed(Date.now() - since) + '</span></span>';
 }
 
+function prodQueuedBadge(p) {
+  var q = p.queued || [];
+  if (!q.length) return '';
+  var since = Date.now() - (q[0].seconds || 0) * 1000;
+  return '<span class="badge badge-neutral">queued: ' + esc(q[0].operation || 'operation') +
+    (q.length > 1 ? ' +' + (q.length - 1) : '') + ' <span data-prod-since="' + since + '">' +
+    _fmtElapsed(Date.now() - since) + '</span></span>';
+}
+
+function prodQueuedMeta(p) {
+  var q = p.queued || [];
+  if (!q.length) return '';
+  // The holder's own progress is already in the badges; name it otherwise.
+  var behind = p.progress ? '' : (p.busy ? ' — busy: ' + esc(p.busy) : '');
+  return '<span>Queued: <strong>' + esc(q.map(function(w) { return w.operation || 'operation'; }).join(', ')) +
+    '</strong>, starts when the production is free' + behind + '</span>';
+}
+
 function prodProgressMeta(p) {
   var pr = p.progress;
   if (!pr) return '';
@@ -9502,6 +9520,7 @@ function renderProductions() {
           }).join('') +
           '<span class="badge ' + prodBadgeClass(p.status) + '">' + esc(p.status) + '</span>' +
           prodProgressBadge(p) +
+          prodQueuedBadge(p) +
           (p.auto_update ? '<span class="badge badge-neutral" title="Deploys automatically on GitHub push">auto</span>' : '') +
           (allowCopy ? '' : '<span class="badge badge-neutral" title="Agents cannot publish new copies of this production into dev over MCP; the dashboard still can">copy off</span>') +
         '</div>' +
@@ -9539,6 +9558,7 @@ function renderProductions() {
         '<span>Server: <strong>' + esc(p.server_mode || 'workers') + '</strong></span>' +
         '<span>DB: <strong class="prod-mono">' + esc(p.db_name) + '</strong></span>' +
         prodProgressMeta(p) +
+        prodQueuedMeta(p) +
         lastHtml +
         snapHtml +
       '</div>' +
@@ -9548,7 +9568,7 @@ function renderProductions() {
   Object.keys(_prodOpen).forEach(function(name) {
     if (_prodOpen[name]) _loadProdSection(name, _prodOpen[name]);
   });
-  if (!_prodProgressTicker && cachedProds.some(function(p) { return p.progress; })) {
+  if (!_prodProgressTicker && cachedProds.some(function(p) { return p.progress || (p.queued || []).length; })) {
     _prodProgressTicker = setInterval(_tickProdProgress, 1000);
   }
 }
@@ -9586,8 +9606,11 @@ async function _loadProdSection(name, section) {
       var rows = (d2.deploys || []).slice().reverse().map(function(d) {
         return '<tr><td class="prod-mono">' + esc((d.ts_end || d.ts_start || '').slice(0, 19)) + '</td>' +
           '<td>' + esc(d.action || '') + '</td>' +
-          '<td class="prod-mono">' + esc((d.from_commit || '').slice(0, 10)) + ' → ' + esc((d.to_commit || '').slice(0, 10)) + '</td>' +
-          '<td><span class="badge ' + (d.status === 'success' ? 'badge-running' : 'badge-exited') + '">' + esc(d.status || '') + '</span></td>' +
+          '<td class="prod-mono">' + (d.from_commit || d.to_commit
+            ? esc((d.from_commit || '').slice(0, 10)) + ' → ' + esc((d.to_commit || '').slice(0, 10))
+            : '—') + '</td>' +
+          '<td><span class="badge ' + (d.status === 'success' ? 'badge-running' : 'badge-exited') + '">' + esc(d.status || '') + '</span>' +
+            (d.error ? '<div class="hint">' + esc(d.error) + '</div>' : '') + '</td>' +
           '<td>' + esc(d.trigger || '') + '</td></tr>';
       }).join('');
       el.innerHTML = rows
@@ -9803,9 +9826,12 @@ async function prodUpdate(name) {
     message: 'Pull the latest commits of "' + name + '" and deploy. If the deploy fails, the CODE is rolled back automatically (the database is not).',
     confirmLabel: 'Deploy'
   }))) return;
-  var data = await _prodPost(API_PRODUCTIONS + '/' + encodeURIComponent(name) + '/update', undefined,
-    'Deploy of "' + name + '" started (watch status and deploy history)');
-  if (data) setTimeout(loadProductions, 5000);
+  var data = await _prodPost(API_PRODUCTIONS + '/' + encodeURIComponent(name) + '/update', undefined, '');
+  if (!data) return;
+  showToast(data.queued
+    ? 'Deploy of "' + name + '" queued: the production is busy (' + data.busy + '). It starts when that finishes.'
+    : 'Deploy of "' + name + '" started (watch status and deploy history)');
+  setTimeout(loadProductions, 5000);
 }
 
 async function prodRollback(name) {

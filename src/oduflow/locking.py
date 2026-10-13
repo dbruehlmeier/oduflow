@@ -238,6 +238,27 @@ def describe_progress(key: str) -> str:
     return f"{text} for {_format_age(cast(int, progress['phase_seconds']))}"
 
 
+# Callers queued in acquire_env_blocking (dashboard and webhook deploys wait
+# for a production's lock instead of failing). Until they get the lock they
+# report nothing, so without this a queued deploy is invisible — and one that
+# gives up on its timeout vanishes without a trace.
+_waiters: dict[str, list[dict[str, object]]] = {}
+
+
+def current_waiters(key: str) -> list[dict[str, object]]:
+    """``[{"operation", "seconds"}]`` of the callers queued for *key*, oldest
+    first."""
+    now = time.monotonic()
+    with _progress_guard:
+        return [
+            {
+                "operation": waiter["operation"],
+                "seconds": int(now - cast(float, waiter["since"])),
+            }
+            for waiter in _waiters.get(key, [])
+        ]
+
+
 def _describe_key(key: str, with_team: bool = False) -> str:
     """How a lock key reads in a message: "production 'erp'" for production
     keys (the raw 'prod:<team>:<name>' means nothing to the reader),
@@ -355,9 +376,21 @@ class LockManager:
     ) -> bool:
         """Blocking acquire with a timeout — webhook-triggered production
         deploys queue behind a running one instead of dropping the push.
-        Returns False when the timeout expires (caller skips the run)."""
+        Returns False when the timeout expires (caller skips the run).
+        While waiting, the caller is listed by :func:`current_waiters`."""
         lock = self._get_env_lock(env_name)
-        acquired = lock.acquire(blocking=True, timeout=timeout)
+        waiter: dict[str, object] = {"operation": operation, "since": time.monotonic()}
+        with _progress_guard:
+            _waiters.setdefault(env_name, []).append(waiter)
+        try:
+            acquired = lock.acquire(blocking=True, timeout=timeout)
+        finally:
+            with _progress_guard:
+                queue = [w for w in _waiters.get(env_name, []) if w is not waiter]
+                if queue:
+                    _waiters[env_name] = queue
+                else:
+                    _waiters.pop(env_name, None)
         if not acquired:
             return False
         with self._map_lock:

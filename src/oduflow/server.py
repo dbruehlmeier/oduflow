@@ -6110,7 +6110,7 @@ def rollback_production(
 def production_deploys(name: str, limit: int = 20, ctx: Context | None = None) -> str:
     """
     Deploy history of a production (newest last): commits, actions, modules,
-    status (success / rolled_back / rollback_failed), errors.
+    status (success / rolled_back / rollback_failed / skipped), errors.
 
     Args:
         name: The production name.
