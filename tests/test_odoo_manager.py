@@ -1394,6 +1394,58 @@ class TestPullEnvironmentLocalAndSharedExtraCheckouts:
         )
         container.restart.assert_not_called()
 
+    @pytest.mark.parametrize(
+        "pulled", [[], ["README.md"]], ids=["up-to-date", "markdown-only"]
+    )
+    def test_before_apply_skipped_when_nothing_to_apply(
+        self, mock_docker_client, tmp_path, pulled
+    ):
+        # Issue #309: production's pre-update snapshot hangs off before_apply;
+        # a deploy with nothing to apply must not pay for it.
+        team = TeamSettings(team_id="1", data_dir=str(tmp_path / "team"))
+        settings = Settings(teams={"1": team})
+        repo = tmp_path / "team" / "workspaces" / "env" / "repo"
+        repo.mkdir(parents=True)
+        container = MagicMock()
+        container.labels = {"oduflow.git_branch": "main"}
+        mock_docker_client.containers.get.return_value = container
+        before_apply = MagicMock()
+
+        with patch("oduflow.git_ops.pull_repo", return_value=("old-head", pulled)):
+            result = env_ops.pull_environment(
+                settings, team, "env", before_apply=before_apply
+            )
+
+        assert result["action"] == "none"
+        before_apply.assert_not_called()
+
+    @patch("oduflow.docker_ops.env_ops._apply_actions")
+    def test_before_apply_runs_once_before_an_explicit_action(
+        self, mock_apply, mock_docker_client, tmp_path
+    ):
+        team = TeamSettings(team_id="1", data_dir=str(tmp_path / "team"))
+        settings = Settings(teams={"1": team})
+        repo = tmp_path / "team" / "workspaces" / "env" / "repo"
+        repo.mkdir(parents=True)
+        container = MagicMock()
+        container.labels = {"oduflow.git_branch": "main"}
+        mock_docker_client.containers.get.return_value = container
+        order: list[str] = []
+        mock_apply.side_effect = lambda *a, **kw: (
+            order.append("apply") or {"action": "restart", "exit_code": 0}
+        )
+
+        with patch("oduflow.git_ops.pull_repo", return_value=("old-head", [])):
+            env_ops.pull_environment(
+                settings,
+                team,
+                "env",
+                restart=True,
+                before_apply=lambda: order.append("before_apply"),
+            )
+
+        assert order == ["before_apply", "apply"]
+
     @patch("oduflow.docker_ops.env_ops._apply_actions")
     def test_local_requirements_change_passes_deps_changed(
         self, mock_apply, mock_docker_client, tmp_path

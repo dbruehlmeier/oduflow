@@ -16,8 +16,11 @@ from oduflow.errors import BusyError
 from oduflow.locking import (
     LockManager,
     _format_age,
+    clear_progress,
+    current_progress,
     keyed_mutex,
     prod_backups_lock_key,
+    report_progress,
     service_lock_key,
     volume_lock_key,
 )
@@ -68,6 +71,45 @@ class TestEnvLockDiagnostics:
         locks = LockManager()
         assert locks.acquire_env_blocking("prod:1:erp", 0.1, operation="webhook deploy")
         assert "webhook deploy" in locks.describe_env_holder("prod:1:erp")
+
+
+class TestProgressDiagnostics:
+    """Issue #309: a deploy blocked for minutes behind a snapshot looked hung.
+    The holder reports its step; the rejected caller sees it."""
+
+    def test_busy_error_names_production_and_current_step(self):
+        locks = LockManager()
+        key = prod_lock_key("1", "erp")
+        locks.acquire_env(key, operation="update_production")
+        report_progress(key, "pre-update snapshot", "filestore 10/20 files")
+        with pytest.raises(BusyError) as exc:
+            locks.acquire_env(key, operation="restart_production")
+        message = str(exc.value)
+        assert "production 'erp'" in message
+        assert "prod:1:erp" not in message
+        assert "update_production: pre-update snapshot" in message
+        assert "filestore 10/20 files" in message
+        assert "running for" in message
+        locks.release_env(key)
+
+    def test_phase_timer_survives_detail_updates(self):
+        key = "prod:1:timer"
+        report_progress(key, "pre-update snapshot", "database")
+        report_progress(key, "pre-update snapshot", "filestore 1/2 files")
+        activity = current_progress(key)
+        assert activity is not None
+        assert activity["phase"] == "pre-update snapshot"
+        assert activity["detail"] == "filestore 1/2 files"
+        clear_progress(key)
+        assert current_progress(key) is None
+
+    def test_release_forgets_the_activity(self):
+        locks = LockManager()
+        key = prod_lock_key("1", "erp")
+        locks.acquire_env(key)
+        report_progress(key, "verifying health")
+        locks.release_env(key)
+        assert current_progress(key) is None
 
 
 class TestTeamLockDiagnostics:
@@ -322,7 +364,7 @@ class TestSystemLockExcludesProductions:
         with pytest.raises(BusyError) as exc:
             locks.acquire_system(operation="restore_cluster_pitr")
         message = str(exc.value)
-        assert "prod:1:erp" in message
+        assert "production 'erp' of team '1'" in message
         assert "update_production" in message
 
     def test_the_system_lock_blocks_a_production_lock(self):

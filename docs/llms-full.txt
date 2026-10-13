@@ -3182,7 +3182,17 @@ config re-applied and the container restarted — **the code rolls back
 automatically**. The database is *never* rolled back automatically: if a
 module upgrade left it inconsistent, restore a snapshot explicitly
 (`restore_production`). A snapshot is taken automatically before every deploy
-when backups are configured.
+when backups are configured — but only once the pull has found something to
+apply: a deploy with nothing new on the branch, or with Markdown-only changes
+(and no explicit `install` / `upgrade` / `restart`), skips it. The snapshot is
+taken with the checkout still on the pre-deploy commit, so it records the code
+its database ran against.
+
+While a deploy runs, its current step (fetching code, pre-update snapshot with
+file progress, applying changes, verifying health, rolling back code) is shown
+next to the production's status on the dashboard, returned as `progress` by
+`list_productions` / `get_production_info`, and quoted in the `BusyError` a
+concurrent call on the same production receives.
 
 Every deploy lands in the production's history (`production_deploys`):
 commits, action, modules, status (`success` / `rolled_back` /
@@ -10767,7 +10777,14 @@ the work continues server-side. Wait for it to finish and retry; restarting or
 recreating the environment interrupts real work instead of clearing anything.
 
 Background operations take the same locks and are named too: `auto-stop`,
-`auto-delete`, `scheduled backup`, `webhook deploy`.
+`auto-delete`, `scheduled backup`, `webhook deploy`, `dashboard deploy`.
+
+Production deploys and snapshots also report their current step, so a
+long snapshot is distinguishable from a hung deploy:
+
+```
+Another operation on production 'erp' (dashboard deploy: pre-update snapshot (filestore 1200/12340 files, 3100 MiB) for 1m40s; running for 2m15s) is in progress.
+```
 
 ---
 

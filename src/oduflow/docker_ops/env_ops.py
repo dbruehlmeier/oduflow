@@ -14,7 +14,7 @@ import stat
 import subprocess
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -4510,6 +4510,7 @@ def pull_environment(
     restart: bool = False,
     strict: bool = False,
     presynced: tuple[str, list[str]] | None = None,
+    before_apply: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Sync code into an environment and apply the right Odoo action.
 
@@ -4536,6 +4537,11 @@ def pull_environment(
       ``strict=True``, refuses with ``action="blocked"``).
     * **auto** — otherwise fall back to ``classify_changes`` in git mode or
       path-only ``shallow_classify`` in live-mount mode.
+
+    ``before_apply`` runs once, after the code is synced and the action is
+    decided, and only when something will be applied (an explicit action, or
+    an auto action other than ``none``). Production hangs its pre-update
+    snapshot here, so a deploy with nothing to apply never pays for it.
     """
     from oduflow.git_analysis import (
         _is_active_dep_file,
@@ -4765,6 +4771,17 @@ def pull_environment(
         to_upgrade = list(recommended.get("modules_to_upgrade", []))
         do_restart = recommended.get("action") == "restart"
         do_refresh = recommended.get("action") == "refresh"
+
+    if before_apply is not None and (
+        explicit
+        or to_install
+        or to_upgrade
+        or do_restart
+        or do_refresh
+        or dep_units
+        or extra_mount_switch_needed
+    ):
+        before_apply()
 
     # --- 3. Switch immutable mounts, then execute ---
     # Do this only after strict guardrails have accepted the requested action.

@@ -110,9 +110,11 @@ _DEPLOYS_CAP = 100
 # alive and never touched.
 TOMBSTONE_FILENAME = "deleted.json"
 
-# Hooks fired at the start of update_production (before the pull). The backup
-# subsystem registers a pre-update snapshot here; failures are logged and
-# never block the deploy. Signature: hook(settings, team, name) -> None.
+# Hooks fired by update_production once the pull found something to apply,
+# with the checkout rewound to the pre-deploy commits (see
+# _run_pre_update_hooks). The backup subsystem registers a pre-update snapshot
+# here; failures are logged and never block the deploy.
+# Signature: hook(settings, team, name) -> None.
 pre_update_hooks: list[Callable[[Settings, TeamSettings, str], None]] = []
 
 # odoo.conf [options] keys a per-production override may not touch:
@@ -2315,6 +2317,48 @@ def _reset_code(repo_path: str, old_head: str, worktree_heads: dict[str, str]) -
             logger.warning("Could not reset worktree %s: %s", wt_path, exc)
 
 
+def _run_pre_update_hooks(
+    settings: Settings,
+    team: TeamSettings,
+    name: str,
+    repo_path: str,
+    old_head: str,
+    old_worktrees: dict[str, str],
+) -> None:
+    """Run :data:`pre_update_hooks` against the pre-deploy code.
+
+    Called from inside the pull, after the checkouts moved and the classifier
+    found something to apply (issue #309: a deploy with nothing to apply must
+    not pay for a snapshot that can take many minutes). The checkouts are
+    rewound to the pre-deploy commits for the hooks' duration and moved
+    forward again afterwards: the snapshot records the commit its database
+    ran against, and the running server must not serve new code against the
+    old schema for that long (a recycled worker imports from disk).
+    """
+    from oduflow.git_ops import rev_parse
+
+    if not pre_update_hooks:
+        return
+    new_head = rev_parse(repo_path)
+    new_worktrees = _worktree_heads(team, name)
+    moved = new_head != old_head or new_worktrees != old_worktrees
+    if moved:
+        _reset_code(repo_path, old_head, old_worktrees)
+    try:
+        for hook in list(pre_update_hooks):
+            try:
+                hook(settings, team, name)
+            except Exception as exc:
+                logger.warning(
+                    "pre-update hook %s failed (deploy continues): %s",
+                    getattr(hook, "__name__", hook),
+                    exc,
+                )
+    finally:
+        if moved:
+            _reset_code(repo_path, new_head, new_worktrees)
+
+
 def _worktrees_for_commit(
     team: TeamSettings, name: str, target: str
 ) -> dict[str, str] | None:
@@ -2348,6 +2392,12 @@ def update_production(
       any changed file Odoo loads requires at least a container restart).
       A ``none`` outcome (Markdown-only changes) is left alone: there is
       nothing for the server to pick up;
+    - the pre-update hooks (snapshot) run only when the pull found something
+      to apply (or an explicit action was requested), with the code still at
+      the pre-deploy commits — see :func:`_run_pre_update_hooks`;
+    - each step is reported under the production's lock key
+      (:func:`locking.report_progress`), so a caller rejected by the lock and
+      the dashboard can tell a long snapshot from a hung deploy;
     - the deploy is verified (module exit codes + in-container health
       poll); on failure the checkout (and extra worktrees) are reset to
       the pre-update commits, the conf is re-applied and the container
@@ -2360,9 +2410,39 @@ def update_production(
     from oduflow.wal_monitor import assert_writable
 
     assert_writable(settings)
+    from oduflow.locking import clear_progress, prod_lock_key
+
+    progress_key = prod_lock_key(team.team_id, name)
+    try:
+        return _update_production(
+            settings,
+            team,
+            name,
+            progress_key,
+            install=install,
+            upgrade=upgrade,
+            restart=restart,
+            trigger=trigger,
+        )
+    finally:
+        clear_progress(progress_key)
+
+
+def _update_production(
+    settings: Settings,
+    team: TeamSettings,
+    name: str,
+    progress_key: str,
+    *,
+    install: list[str] | None,
+    upgrade: list[str] | None,
+    restart: bool,
+    trigger: str,
+) -> dict[str, Any]:
     from oduflow import production_registry
     from oduflow.docker_ops.env_ops import pull_environment
     from oduflow.git_ops import rev_parse
+    from oduflow.locking import report_progress
 
     production_registry.get_production(team, name)  # NotFoundError if absent
     client = get_client()
@@ -2395,17 +2475,13 @@ def update_production(
         "changed_files_count": 0,
     }
 
-    try:
-        for hook in list(pre_update_hooks):
-            try:
-                hook(settings, team, name)
-            except Exception as exc:
-                logger.warning(
-                    "pre-update hook %s failed (deploy continues): %s",
-                    getattr(hook, "__name__", hook),
-                    exc,
-                )
+    def _before_apply() -> None:
+        # The snapshot reports its own progress under the same key.
+        _run_pre_update_hooks(settings, team, name, repo_path, old_head, old_worktrees)
+        report_progress(progress_key, "applying changes")
 
+    try:
+        report_progress(progress_key, "fetching code")
         # Shared module checks use shared_db_container. Scope that dependency
         # to production without changing the settings used by concurrent dev
         # requests or the production-specific configuration/health helpers.
@@ -2420,6 +2496,7 @@ def update_production(
                 install=install,
                 upgrade=upgrade,
                 restart=restart,
+                before_apply=_before_apply,
             )
         except Exception as exc:
             # A preflight SQL error can happen after Git advanced. Route it
@@ -2458,6 +2535,7 @@ def update_production(
                 "without --dev=xml)."
             )
 
+        report_progress(progress_key, "verifying health")
         ok = deploy["exit_code"] == 0 and wait_production_healthy(
             client, settings, team, name, timeout=180
         )
@@ -2490,6 +2568,7 @@ def update_production(
             new_head[:10],
             old_head[:10],
         )
+        report_progress(progress_key, "rolling back code")
         rollback_error = ""
         try:
             _reset_code(repo_path, old_head, old_worktrees)
@@ -2684,6 +2763,14 @@ def _runtime_status(container: Any, record: dict[str, Any]) -> str:
     return "running" if container.status == "running" else "stopped"
 
 
+def _current_progress(team: TeamSettings, name: str) -> dict[str, Any] | None:
+    """What the holder of the production's lock reported doing right now
+    (deploy step, snapshot progress), or None."""
+    from oduflow.locking import current_progress, prod_lock_key
+
+    return current_progress(prod_lock_key(team.team_id, name))
+
+
 def list_productions(settings: Settings, team: TeamSettings) -> list[dict[str, Any]]:
     """Registry records merged with runtime facts (container status, HEAD)."""
     from oduflow import production_registry
@@ -2708,6 +2795,7 @@ def list_productions(settings: Settings, team: TeamSettings) -> list[dict[str, A
                 "extra_domains": record.get("extra_domains") or [],
                 "url": prod_url(settings, team, record),
                 "status": _runtime_status(container, record),
+                "progress": _current_progress(team, name),
                 "repo_url": record.get("repo_url", ""),
                 "branch": record.get("branch", ""),
                 "odoo_image": record.get("odoo_image", ""),
@@ -2765,6 +2853,7 @@ def get_production_info(
         "extra_domains": record.get("extra_domains") or [],
         "url": prod_url(settings, team, record),
         "status": _runtime_status(container, record),
+        "progress": _current_progress(team, name),
         "healthy": healthy,
         "repo_url": record.get("repo_url", ""),
         "branch": record.get("branch", ""),

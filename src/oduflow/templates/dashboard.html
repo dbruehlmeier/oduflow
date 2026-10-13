@@ -9408,6 +9408,40 @@ function prodBadgeClass(status) {
   return 'badge-exited';  // unhealthy / broken
 }
 
+// What the holder of a production's lock is doing right now (deploy step,
+// snapshot progress) — so a long snapshot does not read as a hung deploy.
+var _prodProgressTicker = null;
+
+function prodProgressBadge(p) {
+  var pr = p.progress;
+  if (!pr) return '';
+  var since = Date.now() - (pr.phase_seconds || 0) * 1000;
+  return '<span class="badge badge-busy"><span class="spinner" aria-hidden="true"></span>' +
+    esc(pr.phase) + '&hellip; <span data-prod-since="' + since + '">' +
+    _fmtElapsed(Date.now() - since) + '</span></span>';
+}
+
+function prodProgressMeta(p) {
+  var pr = p.progress;
+  if (!pr) return '';
+  var parts = [];
+  if (pr.detail) parts.push(esc(pr.detail));
+  parts.push('started ' + esc(_fmtElapsed((pr.seconds || 0) * 1000)) + ' ago');
+  return '<span>Now: <strong>' + esc(pr.phase) + '</strong> — ' + parts.join(', ') + '</span>';
+}
+
+function _tickProdProgress() {
+  var els = document.querySelectorAll('[data-prod-since]');
+  if (!els.length) {
+    clearInterval(_prodProgressTicker);
+    _prodProgressTicker = null;
+    return;
+  }
+  els.forEach(function(el) {
+    el.textContent = _fmtElapsed(Date.now() - Number(el.getAttribute('data-prod-since')));
+  });
+}
+
 async function loadProductions() {
   loadWalStatus();
   try {
@@ -9467,6 +9501,7 @@ function renderProductions() {
             return '<a class="prod-domain prod-mono" href="' + escAttr(scheme + '://' + d) + '" target="_blank" rel="noopener">' + esc(d) + '</a>';
           }).join('') +
           '<span class="badge ' + prodBadgeClass(p.status) + '">' + esc(p.status) + '</span>' +
+          prodProgressBadge(p) +
           (p.auto_update ? '<span class="badge badge-neutral" title="Deploys automatically on GitHub push">auto</span>' : '') +
           (allowCopy ? '' : '<span class="badge badge-neutral" title="Agents cannot publish new copies of this production into dev over MCP; the dashboard still can">copy off</span>') +
         '</div>' +
@@ -9503,6 +9538,7 @@ function renderProductions() {
         '<span>Image: <strong class="prod-mono">' + esc(p.odoo_image) + '</strong></span>' +
         '<span>Server: <strong>' + esc(p.server_mode || 'workers') + '</strong></span>' +
         '<span>DB: <strong class="prod-mono">' + esc(p.db_name) + '</strong></span>' +
+        prodProgressMeta(p) +
         lastHtml +
         snapHtml +
       '</div>' +
@@ -9512,6 +9548,9 @@ function renderProductions() {
   Object.keys(_prodOpen).forEach(function(name) {
     if (_prodOpen[name]) _loadProdSection(name, _prodOpen[name]);
   });
+  if (!_prodProgressTicker && cachedProds.some(function(p) { return p.progress; })) {
+    _prodProgressTicker = setInterval(_tickProdProgress, 1000);
+  }
 }
 
 async function showProdLogs(name) {

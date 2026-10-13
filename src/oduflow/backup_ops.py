@@ -55,6 +55,7 @@ from oduflow.errors import (
     NotFoundError,
     PrerequisiteNotMetError,
 )
+from oduflow.locking import prod_lock_key, report_progress
 from oduflow.naming import (
     PRODUCTION_TEMPLATE_PREFIX,
     get_filestore_paths,
@@ -171,6 +172,12 @@ def snapshot_production(
     db_key = f"{prefix}/db/{snapshot_id}.pgdump"
     started = _now_utc().isoformat()
 
+    # The caller holds the production's lock: report under its key, so a
+    # rejected caller and the dashboard see the snapshot advancing.
+    progress_key = prod_lock_key(team.team_id, name)
+    phase = "pre-update snapshot" if trigger == "pre-update" else "snapshot"
+    report_progress(progress_key, phase, "database dump")
+
     # 1. Database: stream pg_dump straight into a multipart upload — no
     # temp disk. -Fc is internally compressed and MVCC-consistent.
     pg = client.containers.get(settings.prod_db_container)
@@ -195,11 +202,26 @@ def snapshot_production(
     # 2. Filestore: chunkstore revision (incremental, deduplicated).
     if os.path.isdir(filestore_dir):
         fs_started = time.monotonic()
+        last_report = 0.0
+
+        def _filestore_progress(done: int, total: int, done_bytes: int) -> None:
+            nonlocal last_report
+            now = time.monotonic()
+            if now - last_report < 1.0:
+                return
+            last_report = now
+            report_progress(
+                progress_key,
+                phase,
+                f"filestore {done}/{total} files, {done_bytes / 2**20:.0f} MiB",
+            )
+
         fs_result = chunkstore.backup(
             filestore_dir,
             filestore_storage(settings, team),
             name,
             upload_threads=backup.upload_threads,
+            progress=_filestore_progress,
         )
         filestore_info = {
             "revision": fs_result.revision,
