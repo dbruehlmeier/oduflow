@@ -1,5 +1,64 @@
 # Changelog
 
+## v1.87.0
+
+### Features
+
+- **White-label branding with a custom license** — operators can install a
+  signed custom license that carries a brand name and the domains it is valid
+  for. While it is in effect (valid, at most 30 days past expiry, and every
+  team hostname inside its domains), the dashboard, sign-in page, server
+  settings console and MCP server show the brand instead of Oduflow. Vendor
+  surfaces are removed, and the logo and icon come from `<config>/branding/`.
+  The version stays visible as plain text. Otherwise the product looks like
+  stock Oduflow, and nothing is ever disabled. New CLI:
+  `oduflow license status|install|refresh|subscribe`. During the grace period
+  a paid renewal is installed automatically once a day. Technical names
+  (`oduflow.toml`, containers, databases, URL paths, cookies) keep saying
+  `oduflow` by design. See `docs/licensing.md` and decision record
+  [0078](https://github.com/oduflow/oduflow/blob/main/specs/0078-custom-white-label-license.md).
+  (#295)
+- **No product name left on white-label installs** — the remaining texts are
+  rebranded or made neutral. This covers agent instructions (the feedback
+  section is omitted), "System not initialized" errors, image build log
+  markers (`[build]`), the OpenCode provider warning, the agent guides viewer,
+  dashboard error responses, the served `/import-odoo.sh`, the settings
+  console (it says "Restart server" and hides the Docs link) and outbound
+  User-Agents. `/api/version` and `/api/feedback/link` answer 404 under white
+  label. (#310)
+- **Coding agent's MCP server renamed to `development`** — the agent's scoped
+  MCP server now has the same name on every install, and replaces the legacy
+  `oduflow` entry in existing checkouts. Under white label, the agent's commit
+  identity follows the brand. Coder image `oduflow-coder:0.3.3`. (#295)
+- **Deploy progress and queued deploys are visible** — long operations now
+  report their current step (deploy phases, snapshot file progress) under
+  their lock. `BusyError` quotes that step and names the production instead
+  of a raw lock key. The dashboard shows the step next to the status, and
+  `list_productions` / `get_production_info` return it. A deploy waiting for
+  the production's lock is shown as *queued*, with the waiting time and the
+  current holder. The Update toast says whether the deploy started or was
+  queued, and a second click while one is queued is refused. (#312, #313)
+
+### Bug Fixes
+
+- **Deploys snapshot only when there is something to apply** —
+  `update_production` used to take a full DB + filestore snapshot before
+  pulling, even when no new commits had arrived. The production stayed locked
+  the whole time. The snapshot is now taken only after the code is synced and
+  the classifier found work. Before the snapshot, the checkouts are rewound to
+  the pre-deploy commits, so the snapshot matches the schema its DB ran
+  against. Markdown-only pushes no longer cost a snapshot. (#312)
+- **Faster first filestore backups** — the chunkstore chunker re-hashed its
+  whole buffer on every write. On a first backup this cost about 3 s per
+  file, whatever its size. The rolling hash now resumes where it stopped, so
+  every byte is hashed once. Chunk boundaries are byte-identical, so existing
+  stores keep deduplicating. (#312)
+- **Deploys that give up are recorded** — a queued dashboard deploy (waits up
+  to 5 min) or webhook deploy (up to 30 min) that times out on the lock used
+  to vanish with only a log line. It now writes a `skipped` entry with the
+  reason to the deploy history. That entry is never a rollback target.
+  (#313)
+
 ## v1.86.0
 
 ### Features
