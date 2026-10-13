@@ -475,7 +475,14 @@ the work continues server-side. Wait for it to finish and retry; restarting or
 recreating the environment interrupts real work instead of clearing anything.
 
 Background operations take the same locks and are named too: `auto-stop`,
-`auto-delete`, `scheduled backup`, `webhook deploy`.
+`auto-delete`, `scheduled backup`, `webhook deploy`, `dashboard deploy`.
+
+Production deploys and snapshots also report their current step, so a
+long snapshot is distinguishable from a hung deploy:
+
+```
+Another operation on production 'erp' (dashboard deploy: pre-update snapshot (filestore 1200/12340 files, 3100 MiB) for 1m40s; running for 2m15s) is in progress.
+```
 
 ---
 

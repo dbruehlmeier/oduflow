@@ -31,7 +31,7 @@ import time
 from bisect import bisect_right
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from oduflow.chunkstore.chunker import Chunker
 from oduflow.chunkstore.format import (
@@ -398,6 +398,7 @@ def backup(
     *,
     prev_revision: int | None = None,
     upload_threads: int = 16,
+    progress: Callable[[int, int, int], None] | None = None,
 ) -> BackupResult:
     """Create a new revision of *source_dir* under *snapshot_id*.
 
@@ -406,7 +407,9 @@ def backup(
     scheduler thread). *upload_threads* bounds concurrent chunk uploads
     (1 = sequential); it also sets the in-flight plaintext budget
     (``max(64 MiB, threads × avg chunk size)``), which is the memory this
-    call adds to the server process.
+    call adds to the server process. *progress*, when given, is called with
+    ``(files_done, files_total, bytes_done)`` before each file; it must be
+    cheap (throttle on the caller's side).
     """
     if not os.path.isdir(source_dir):
         raise FileNotFoundError(f"source_dir does not exist: {source_dir}")
@@ -470,10 +473,13 @@ def backup(
     scan_started = time.monotonic()
     tree = _scan_tree(source_dir)
     scan_seconds = time.monotonic() - scan_started
+    files_total = sum(1 for _rel, _st, kind in tree if kind == "file")
 
     try:
         for rel, st, kind in tree:
             full = os.path.join(source_dir, rel)
+            if progress is not None and kind == "file":
+                progress(file_count, files_total, total_bytes)
             if kind == "dir":
                 entries.append(
                     {

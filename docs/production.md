@@ -399,9 +399,17 @@ config re-applied and the container restarted — **the code rolls back
 automatically**. The database is *never* rolled back automatically: if a
 module upgrade left it inconsistent, restore a snapshot explicitly
 (`restore_production`). A snapshot is taken automatically before every deploy
-when backups are configured. A deploy with nothing new on the branch (and no
-explicit `install` / `upgrade` / `restart`) returns "Already up to date"
-without taking one.
+when backups are configured — but only once the pull has found something to
+apply: a deploy with nothing new on the branch, or with Markdown-only changes
+(and no explicit `install` / `upgrade` / `restart`), skips it. The snapshot is
+taken with the checkout still on the pre-deploy commit, so it records the code
+its database ran against.
+
+While a deploy runs, its current step (fetching code, pre-update snapshot with
+file progress, applying changes, verifying health, rolling back code) is shown
+next to the production's status on the dashboard, returned as `progress` by
+`list_productions` / `get_production_info`, and quoted in the `BusyError` a
+concurrent call on the same production receives.
 
 Every deploy lands in the production's history (`production_deploys`):
 commits, action, modules, status (`success` / `rolled_back` /

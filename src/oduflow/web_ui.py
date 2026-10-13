@@ -6192,7 +6192,7 @@ def _build_routes(
 
         def _run() -> None:
             key = _prod_lock_key(team, name)
-            if not locks.acquire_env_blocking(key, 300):
+            if not locks.acquire_env_blocking(key, 300, operation="dashboard deploy"):
                 logger.warning("UI deploy of '%s' timed out on lock", name)
                 return
             try:

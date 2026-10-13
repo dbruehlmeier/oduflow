@@ -355,6 +355,21 @@ class TestParallelUploads:
 
 
 class TestBackupRestore:
+    def test_progress_reports_every_file(self, small_config_storage, tmp_path):
+        spec = {"a.bin": b"a" * 100, "b/c.bin": b"c" * 300, "d.txt": b""}
+        src = tmp_path / "src"
+        _make_tree(str(src), spec)
+        calls: list[tuple[int, int, int]] = []
+
+        chunkstore.backup(
+            str(src),
+            small_config_storage,
+            "erp",
+            progress=lambda *args: calls.append(args),
+        )
+
+        assert calls == [(0, 3, 0), (1, 3, 100), (2, 3, 400)]
+
     def test_roundtrip_mixed_tree(self, small_config_storage, tmp_path):
         rng = random.Random(7)
         spec = {
