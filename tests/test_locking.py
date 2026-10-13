@@ -18,6 +18,7 @@ from oduflow.locking import (
     _format_age,
     clear_progress,
     current_progress,
+    current_waiters,
     keyed_mutex,
     prod_backups_lock_key,
     report_progress,
@@ -102,6 +103,32 @@ class TestProgressDiagnostics:
         assert activity["detail"] == "filestore 1/2 files"
         clear_progress(key)
         assert current_progress(key) is None
+
+    def test_blocking_waiter_is_listed_until_it_gives_up(self):
+        locks = LockManager()
+        key = prod_lock_key("1", "erp")
+        locks.acquire_env(key, operation="scheduled backup")
+        seen: list[list[dict[str, object]]] = []
+        waiter = threading.Thread(
+            target=lambda: locks.acquire_env_blocking(
+                key, 0.3, operation="dashboard deploy"
+            )
+        )
+        waiter.start()
+        time.sleep(0.1)
+        seen.append(current_waiters(key))
+        waiter.join()
+        locks.release_env(key)
+
+        assert [w["operation"] for w in seen[0]] == ["dashboard deploy"]
+        assert current_waiters(key) == []
+
+    def test_blocking_waiter_is_forgotten_once_it_gets_the_lock(self):
+        locks = LockManager()
+        key = prod_lock_key("1", "erp")
+        assert locks.acquire_env_blocking(key, 0.1, operation="webhook deploy")
+        assert current_waiters(key) == []
+        locks.release_env(key)
 
     def test_release_forgets_the_activity(self):
         locks = LockManager()

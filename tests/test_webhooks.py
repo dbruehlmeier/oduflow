@@ -314,6 +314,12 @@ class TestDeployInBackground:
         locks.release_env.assert_not_called()
         assert webhooks._pending == set()
         assert "gave up waiting" in caplog.text
+        # The dropped deploy leaves a trace in the deploy history.
+        from oduflow.docker_ops import production_ops
+
+        [entry] = production_ops.read_deploys(team, "erp")
+        assert entry["status"] == "skipped"
+        assert entry["trigger"] == "webhook"
 
     def test_the_lock_key_is_team_scoped(self, settings, team):
         locks = MagicMock()

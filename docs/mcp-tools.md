@@ -2863,7 +2863,7 @@ Lock: production.
 ### `production_deploys`
 
 Deploy history, newest last: commits, actions, modules, status
-(`success` / `rolled_back` / `rollback_failed`) and errors.
+(`success` / `rolled_back` / `rollback_failed` / `skipped`) and errors.
 
 **Parameters**
 

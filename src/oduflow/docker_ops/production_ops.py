@@ -2771,6 +2771,44 @@ def _current_progress(team: TeamSettings, name: str) -> dict[str, Any] | None:
     return current_progress(prod_lock_key(team.team_id, name))
 
 
+def _queued(team: TeamSettings, name: str) -> list[dict[str, Any]]:
+    """Operations waiting for the production's lock (queued deploys)."""
+    from oduflow.locking import current_waiters, prod_lock_key
+
+    return current_waiters(prod_lock_key(team.team_id, name))
+
+
+def record_skipped_deploy(
+    team: TeamSettings, name: str, *, trigger: str, queued_at: float, reason: str
+) -> None:
+    """Record a queued deploy that gave up waiting for the production's lock.
+
+    Without it the deploy just vanishes: the caller was told it started, and
+    nothing ran. No commits are recorded — nothing moved, and an empty
+    ``from_commit`` keeps the entry out of rollback-target selection.
+    """
+    append_deploy(
+        team,
+        name,
+        {
+            "ts_start": datetime.datetime.fromtimestamp(
+                queued_at, datetime.timezone.utc
+            ).isoformat(),
+            "ts_end": _now_iso(),
+            "trigger": trigger,
+            "from_commit": "",
+            "to_commit": "",
+            "action": "none",
+            "modules_installed": [],
+            "modules_upgraded": [],
+            "exit_code": 0,
+            "status": "skipped",
+            "error": reason,
+            "changed_files_count": 0,
+        },
+    )
+
+
 def list_productions(settings: Settings, team: TeamSettings) -> list[dict[str, Any]]:
     """Registry records merged with runtime facts (container status, HEAD)."""
     from oduflow import production_registry
@@ -2796,6 +2834,7 @@ def list_productions(settings: Settings, team: TeamSettings) -> list[dict[str, A
                 "url": prod_url(settings, team, record),
                 "status": _runtime_status(container, record),
                 "progress": _current_progress(team, name),
+                "queued": _queued(team, name),
                 "repo_url": record.get("repo_url", ""),
                 "branch": record.get("branch", ""),
                 "odoo_image": record.get("odoo_image", ""),
@@ -2854,6 +2893,7 @@ def get_production_info(
         "url": prod_url(settings, team, record),
         "status": _runtime_status(container, record),
         "progress": _current_progress(team, name),
+        "queued": _queued(team, name),
         "healthy": healthy,
         "repo_url": record.get("repo_url", ""),
         "branch": record.get("branch", ""),

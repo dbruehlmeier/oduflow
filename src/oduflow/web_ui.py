@@ -92,6 +92,7 @@ from oduflow.licensing import (
 from oduflow.locking import (
     LockManager,
     credentials_lock_key,
+    current_waiters,
     image_cleanup_lock_key,
     prod_backups_lock_key,
     prod_lock_key,
@@ -162,6 +163,9 @@ _PUBLIC_PREFIXES = ("/static/", ui_scope.PAGE_PREFIX)
 _SESSION_SALT = "oduflow.ui-auth.v1"
 _SHARE_SALT = "oduflow.env-share.v1"
 _SESSION_MAX_AGE = 7 * 24 * 3600  # 7 days
+# How long a dashboard deploy queues behind another operation on the
+# production before it gives up (and says so in the deploy history).
+_UI_DEPLOY_WAIT_SECONDS = 300
 _SECRET_FILENAME = ".ui_session_secret"
 
 # Cached per data dir (process-wide; the server runs against a single one).
@@ -6077,6 +6081,11 @@ def _build_routes(
             settings = get_settings()
             team = _get_ui_team(request)
             prods = production_ops.list_productions(settings, team)
+            for prod in prods:
+                # Who holds the lock a queued deploy waits for — named even
+                # when the holder reports no progress of its own.
+                holder = locks.describe_env_holder(_prod_lock_key(team, prod["name"]))
+                prod["busy"] = holder.strip().removeprefix("(").removesuffix(")")
             webhook_secret = production_registry.get_webhook_secret(team)
             return JSONResponse(
                 {
@@ -6288,10 +6297,37 @@ def _build_routes(
         except FlowError as e:
             return _error_response(e)
 
+        key = _prod_lock_key(team, name)
+        operation = "dashboard deploy"
+        if any(w["operation"] == operation for w in current_waiters(key)):
+            # The queued one pulls the branch tip when it runs anyway.
+            return _error_response(
+                BusyError(
+                    f"A dashboard deploy of '{name}' is already queued; it "
+                    "starts as soon as the production is free."
+                )
+            )
+        # Non-empty while another operation holds the lock: this deploy queues.
+        busy = locks.describe_env_holder(key)
+        queued_at = time.time()
+
         def _run() -> None:
-            key = _prod_lock_key(team, name)
-            if not locks.acquire_env_blocking(key, 300, operation="dashboard deploy"):
-                logger.warning("UI deploy of '%s' timed out on lock", name)
+            if not locks.acquire_env_blocking(
+                key, _UI_DEPLOY_WAIT_SECONDS, operation=operation
+            ):
+                holder = locks.describe_env_holder(key)
+                logger.warning("UI deploy of '%s' timed out on lock%s", name, holder)
+                production_ops.record_skipped_deploy(
+                    team,
+                    name,
+                    trigger="ui",
+                    queued_at=queued_at,
+                    reason=(
+                        "Not started: the production stayed busy for "
+                        f"{_UI_DEPLOY_WAIT_SECONDS // 60} min{holder}. "
+                        "Deploy again once it is free."
+                    ),
+                )
                 return
             try:
                 production_ops.update_production(settings, team, name, trigger="ui")
@@ -6303,7 +6339,10 @@ def _build_routes(
         threading.Thread(
             target=_run, name=f"oduflow-ui-deploy-{name}", daemon=True
         ).start()
-        return JSONResponse({"ok": True, "started": True}, status_code=202)
+        return JSONResponse(
+            {"ok": True, "started": True, "queued": bool(busy), "busy": busy.strip()},
+            status_code=202,
+        )
 
     def api_production_rollback(request: Request) -> JSONResponse:
         settings = get_settings()
