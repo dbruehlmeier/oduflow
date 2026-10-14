@@ -8,7 +8,6 @@ from oduflow.extra_addons import (
     resolve_extra_addons_path,
     resolve_main_addons_path,
 )
-from oduflow.naming import odoo_major_from_image
 
 
 def _read_option(conf_path, option):
@@ -128,59 +127,77 @@ class TestGenerateOdooConf:
         assert parser.get("options", "http_port") == "8069"
 
 
-class TestOdooMajorFromImage:
-    @pytest.mark.parametrize(
-        ("image", "major"),
-        [
-            ("odoo:19.0", 19),
-            ("odoo:18", 18),
-            ("registry:5000/acme/odoo:19.0", 19),
-            ("acme/odoo:19.0-custom", 19),
-            ("odoo:latest", None),
-            ("odoo@sha256:98fabc0123", None),
-            ("acme/odoo:20260910", None),
-            ("odoo:19.0@sha256:98fabc0123", 19),
-            ("oduist/customer_odoo", None),
-            ("registry:5000/odoo", None),
-            ("", None),
-        ],
-    )
-    def test_parse(self, image, major):
-        assert odoo_major_from_image(image) == major
+class TestWithoutDemoTranslation:
+    """On Odoo 19+ without_demo becomes the with_demo value Odoo reads from it."""
 
-
-class TestWithoutDemoNormalization:
-    def _generate(self, tmp_path, value, odoo_image):
+    def _generate(self, tmp_path, options, odoo_image, overrides=None):
         base = tmp_path / "base.conf"
         base.write_text(
-            f"[options]\naddons_path = /mnt/extra-addons\nwithout_demo = {value}\n"
+            "[options]\naddons_path = /mnt/extra-addons\n"
+            + "".join(f"{key} = {value}\n" for key, value in options)
         )
         out = tmp_path / "odoo.conf"
-        generate_odoo_conf(str(base), str(out), [], odoo_image=odoo_image)
-        return _read_option(out, "without_demo")
+        generate_odoo_conf(
+            str(base), str(out), [], overrides=overrides, odoo_image=odoo_image
+        )
+        parser = configparser.RawConfigParser()
+        parser.optionxform = str
+        parser.read(out)
+        return dict(parser.items("options"))
 
-    def test_all_rewritten_to_true_on_19(self, tmp_path):
-        assert self._generate(tmp_path, "all", "odoo:19.0") == "True"
+    @pytest.mark.parametrize(
+        ("value", "with_demo"),
+        [
+            ("True", "False"),
+            ("1", "False"),
+            ("all", "False"),
+            ("sale,crm", "False"),
+            # Odoo 19 reads an empty value as "demo off", not as False.
+            ("", "False"),
+            ("False", "True"),
+            ("off", "True"),
+            ("None", "True"),
+        ],
+    )
+    def test_translated_on_19(self, tmp_path, value, with_demo):
+        options = self._generate(tmp_path, [("without_demo", value)], "odoo:19.0")
+        assert "without_demo" not in options
+        assert options["with_demo"] == with_demo
 
-    def test_module_list_rewritten_to_true_on_19(self, tmp_path):
-        assert self._generate(tmp_path, "sale,crm", "odoo:19.0") == "True"
+    def test_key_matched_case_insensitively(self, tmp_path):
+        options = self._generate(tmp_path, [("Without_Demo", "all")], "odoo:19.0")
+        assert not any(k.lower() == "without_demo" for k in options)
+        assert options["with_demo"] == "False"
 
-    def test_empty_rewritten_to_false_on_19(self, tmp_path):
-        # Pre-19 an empty value means "install demo"; keep that intent.
-        assert self._generate(tmp_path, "", "odoo:19.0") == "False"
+    def test_override_replaces_base_value(self, tmp_path):
+        options = self._generate(
+            tmp_path,
+            [("Without_Demo", "all")],
+            "odoo:19.0",
+            overrides={"without_demo": "False"},
+        )
+        assert not any(k.lower() == "without_demo" for k in options)
+        assert options["with_demo"] == "True"
 
-    def test_boolean_value_kept_on_19(self, tmp_path):
-        assert self._generate(tmp_path, "False", "odoo:19.0") == "False"
+    def test_explicit_with_demo_wins(self, tmp_path):
+        options = self._generate(
+            tmp_path, [("without_demo", "all"), ("with_demo", "True")], "odoo:19.0"
+        )
+        assert "without_demo" not in options
+        assert options["with_demo"] == "True"
 
-    def test_all_kept_pre_19(self, tmp_path):
-        assert self._generate(tmp_path, "all", "odoo:18.0") == "all"
+    def test_kept_pre_19(self, tmp_path):
+        options = self._generate(tmp_path, [("without_demo", "all")], "odoo:18.0")
+        assert options["without_demo"] == "all"
+        assert "with_demo" not in options
 
-    def test_all_kept_when_version_unknown(self, tmp_path):
-        assert self._generate(tmp_path, "all", "acme/custom:latest") == "all"
+    def test_kept_when_version_unknown(self, tmp_path):
+        options = self._generate(
+            tmp_path, [("without_demo", "all")], "acme/custom:latest"
+        )
+        assert options["without_demo"] == "all"
 
     def test_absent_option_stays_absent_on_19(self, tmp_path):
-        base = tmp_path / "base.conf"
-        base.write_text("[options]\naddons_path = /mnt/extra-addons\n")
-        out = tmp_path / "odoo.conf"
-        generate_odoo_conf(str(base), str(out), [], odoo_image="odoo:19.0")
-        assert _read_option(out, "without_demo") is None
+        options = self._generate(tmp_path, [], "odoo:19.0")
+        assert "without_demo" not in options
+        assert "with_demo" not in options

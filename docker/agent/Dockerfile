@@ -57,9 +57,9 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && ln -s "$(command -v fdfind)" /usr/local/bin/fd
 
-# GitHub CLI (gh; MIT): PR/issue/API workflows from the console. Not in
-# Debian bookworm's default repos, so add GitHub's official apt repo first
-# (curl + ca-certificates come from the layer above).
+# GitHub CLI (gh; MIT): PR/issue/API workflows from the console. Debian
+# bookworm ships an old gh (2.23), so install a current one from GitHub's
+# official apt repo (curl + ca-certificates come from the layer above).
 RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
         -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
     && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \

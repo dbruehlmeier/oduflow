@@ -43,7 +43,6 @@ from oduflow.naming import (
     get_team_network_name,
     get_template_db_name,
     normalize_env_vars,
-    odoo_major_from_image,
     validate_template_name,
 )
 from oduflow.settings import Settings, TeamSettings
@@ -2870,6 +2869,8 @@ def init_template(
     modules: str = "base",
     force: bool = False,
 ) -> dict[str, str]:
+    from oduflow.odoo_version import major_from_image_reference
+
     template_sql_path = team.get_template_sql_path(template_name)
     template_filestore_path = team.get_template_filestore_path(template_name)
 
@@ -2963,12 +2964,14 @@ def init_template(
         volumes=volumes,
         # Odoo 19 made --without-demo a boolean; "=all" (the pre-19 module
         # list) still disables demo there but logs a deprecation warning,
-        # while bare/boolean forms don't exist before 19.
+        # while bare/boolean forms don't exist before 19. The flag stays
+        # explicit on 19+ too, so the instance odoo.conf cannot turn demo
+        # data on in a template.
         command=(
             f"odoo -d {build_db} -i {modules} --stop-after-init "
             + (
                 "--without-demo=True"
-                if (odoo_major_from_image(odoo_image) or 0) >= 19
+                if (major_from_image_reference(odoo_image) or 0) >= 19
                 else "--without-demo=all"
             )
         ),
