@@ -329,7 +329,9 @@ def classify_changes(
             csv_data.append(f)
             if module not in modules_to_install:
                 modules_to_upgrade.add(module)
-            _trace("  file=%s ext=.csv module=%s -> data/security CSV, UPGRADE", f, module)
+            _trace(
+                "  file=%s ext=.csv module=%s -> data/security CSV, UPGRADE", f, module
+            )
             continue
 
         if ext == ".js":
