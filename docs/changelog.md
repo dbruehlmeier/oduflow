@@ -1,5 +1,62 @@
 # Changelog
 
+## v1.88.0
+
+### Features
+
+- **Import OCA repositories in bulk** — the **Extra Addons** tab has a new
+  **Import OCA** dialog. It lists the public OCA catalogue with search, sorting
+  by stars or name and an archived filter, reads each selected repository's
+  branches, and adds the selection as `oca-<name>` extra repos. As with
+  **Add Repo**, nothing is downloaded by default: the **Common versions** you
+  enter (for example `18.0, 19.0`) are downloaded right away, and a version a
+  repository lacks must be unchecked before importing. The import runs on the
+  server, up to three repositories at a time, so closing the dialog, reloading
+  the page or a proxy timeout neither stops it nor loses its progress. Failures
+  are reported per repository, and **Retry failed** resends only those.
+  Repositories the team already has are recognised by origin in any URL form,
+  and colliding import names get a numeric suffix. The catalogue is cached for
+  15 minutes and falls back to the last good copy when GitHub is unavailable;
+  no token is needed. (#317)
+- **GitHub CLI in the coder image** — the coding-agent image ships a current
+  `gh` from GitHub's apt repository, so agents can work with pull requests and
+  issues out of the box. Coder image `oduflow-coder:0.3.4`. (#227)
+
+### Bug Fixes
+
+- **Odoo 20 environments are reachable** — Odoo 20 listens on `127.0.0.1` when
+  `http_interface` is unset, which neither Traefik nor a published port can
+  reach. Every generated `odoo.conf` (dev and production) now pins
+  `http_interface = 0.0.0.0` and drops the legacy `xmlrpc_interface` alias that
+  would override it. A startup migration rewrites the conf in existing
+  containers, which pick it up on their next restart, start or
+  `pull_and_apply`. `set_production_odoo_conf` and stack manifests refuse the
+  listen settings instead of storing a value that is silently replaced. (#315)
+- **Changed CSV data files upgrade their module** — a commit that only touched
+  a module's CSV data (for example `security/ir.model.access.csv`) was
+  classified as a plain refresh, so the environment silently kept stale access
+  rules. Odoo loads CSV data only on install or upgrade, so such a change now
+  upgrades the owning module; a CSV outside any module still only refreshes.
+  (#316)
+- **`without_demo` is honoured on Odoo 19+** — Odoo 19 reads `with_demo`
+  instead. Generated confs translate `without_demo` into the matching
+  `with_demo` value the way Odoo 19 itself does (only an explicit false enables
+  demo data; an explicit `with_demo` wins), and template initialisation passes
+  `--without-demo=True` on 19+. (#227)
+- **White label: two remaining gaps** — the agent guides viewer rebrands the
+  file-name title it shows for a guide without a heading, and
+  `get_agent_instructions` documents `submit_agent_feedback` only when the tool
+  was published at startup, so a license that changes while the server runs no
+  longer points agents at a missing tool. (#311)
+
+### Security
+
+- **The repository can no longer tune the production server** — the repo's
+  `.oduflow/odoo.prod.conf` is no longer part of the production conf chain
+  (team `odoo.prod.conf` > bundled), because anyone who can push to the
+  deployed branch must not change server settings. A repo file is logged as
+  ignored and no longer triggers a restart on deploy. (#315)
+
 ## v1.87.0
 
 ### Features
