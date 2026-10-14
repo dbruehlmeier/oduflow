@@ -198,6 +198,9 @@ supported because the cluster is not published on a host port.
 | Method | Endpoint | Description |
 |---|---|---|
 | `GET` | `/api/extra-repos` | List extra-addon repositories |
+| `GET` | `/api/extra-repos/oca` | Public OCA catalogue (cached for 15 minutes) in `repos`: names, descriptions, stars, archive flags, unique import names, clone URLs, `existing_as` (the team repository with the same origin, if any) and `name_taken`; `stale` is true when an expired copy is served because GitHub is unavailable; `job` is the team's latest import (see below) |
+| `GET` | `/api/extra-repos/oca/import` | The team's latest OCA import job, or `null`: `status` (`running`/`finished`) and per-repository `items` with `branches`, `status` (`queued`, `adding`, `done`, `error`, `skipped`) and `error` |
+| `POST` | `/api/extra-repos/oca/import` | Start a server-side OCA import (202); body: `repos`, a list of `{"name": "<catalogue name>", "branches": [...]}` — `branches` are downloaded now, an empty list downloads each branch on first use. Clone URLs and import names come from the catalogue. 409 while the team's previous import is running |
 | `POST` | `/api/extra-repos/add` | Add one; body: `name`, `repo_url`, optional `git_user`, optional `branches` (list of names to download now; empty = download each branch on first use) |
 | `POST` | `/api/extra-repos/ls-remote` | List a remote's branches before adding; body: `repo_url`, optional `git_user` |
 | `POST` | `/api/extra-repos/{name}/pull` | Fetch remote changes |

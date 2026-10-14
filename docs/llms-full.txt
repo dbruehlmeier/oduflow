@@ -4169,6 +4169,42 @@ so the next update does not bring the branch back.
 A stalled HTTPS download is aborted after two minutes without progress; a slow
 but progressing one may run up to an hour.
 
+### Importing several OCA repositories
+
+In the dashboard, open **Extra Addons → Import OCA**. Search the OCA catalogue
+by name or description and sort by stars or name. Archived repositories are
+hidden unless **Show archived** is enabled.
+
+Like **Add Repo**, importing downloads no code by default: each branch
+downloads when an environment first uses it. To have branches ready, enter
+**Common versions**, for example `18.0, 19.0`. Each repository you select
+starts from the current Common versions, and changing the field updates every
+selected repository. Oduflow reads the branch list of each selected repository
+without downloading anything; adjust its branch checkboxes as needed. Versions
+a repository does not have are shown as unavailable: uncheck them or choose
+another version before importing.
+
+Click **Import N repositories** to start the import on the server. It adds up
+to three repositories at a time, and each repository shows its own result. You
+can close the dialog or reload the page: the import continues, and reopening the
+dialog shows its progress. A team runs one import at a time. **Retry failed**
+starts a new import of only the failed repositories, with the same branches.
+
+Imported names use an `oca-` prefix, such as `oca-server-tools`. If two OCA
+repositories would get the same name (for example `foo-bar` and `foo.bar`, or
+very long names that are shortened), the second one gets a numeric suffix, such
+as `oca-foo-bar-2`. Repositories the team already has are recognised by their
+origin in any URL form (HTTPS, SSH, with or without `.git`) and cannot be
+selected; neither can an import name that another repository already uses.
+Import makes repositories available to the team; choose them separately when
+configuring an environment.
+
+The public catalogue is cached for 15 minutes. If GitHub cannot be reached or
+limits requests, the dialog shows the error, or the last loaded catalogue with a
+notice when one is available; no GitHub token is required. Import progress is
+kept in server memory: after a server restart, repositories that were added
+appear as already added, and the rest can be imported again.
+
 ## Using Extra Addons in Environments
 
 When creating an environment, specify which extra repos to mount:
@@ -4805,6 +4841,9 @@ supported because the cluster is not published on a host port.
 | Method | Endpoint | Description |
 |---|---|---|
 | `GET` | `/api/extra-repos` | List extra-addon repositories |
+| `GET` | `/api/extra-repos/oca` | Public OCA catalogue (cached for 15 minutes) in `repos`: names, descriptions, stars, archive flags, unique import names, clone URLs, `existing_as` (the team repository with the same origin, if any) and `name_taken`; `stale` is true when an expired copy is served because GitHub is unavailable; `job` is the team's latest import (see below) |
+| `GET` | `/api/extra-repos/oca/import` | The team's latest OCA import job, or `null`: `status` (`running`/`finished`) and per-repository `items` with `branches`, `status` (`queued`, `adding`, `done`, `error`, `skipped`) and `error` |
+| `POST` | `/api/extra-repos/oca/import` | Start a server-side OCA import (202); body: `repos`, a list of `{"name": "<catalogue name>", "branches": [...]}` — `branches` are downloaded now, an empty list downloads each branch on first use. Clone URLs and import names come from the catalogue. 409 while the team's previous import is running |
 | `POST` | `/api/extra-repos/add` | Add one; body: `name`, `repo_url`, optional `git_user`, optional `branches` (list of names to download now; empty = download each branch on first use) |
 | `POST` | `/api/extra-repos/ls-remote` | List a remote's branches before adding; body: `repo_url`, optional `git_user` |
 | `POST` | `/api/extra-repos/{name}/pull` | Fetch remote changes |

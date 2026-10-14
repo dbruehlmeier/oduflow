@@ -637,6 +637,20 @@
   }
   .modal-sm { max-width: 460px; }
   .modal-md { max-width: 520px; }
+  #oca-import-modal .modal { max-height: 92vh; }
+  .oca-toolbar { display: flex; gap: 12px; flex-wrap: wrap; align-items: end; }
+  .oca-toolbar .form-group { flex: 1 1 180px; margin-bottom: 8px; }
+  #oca-repos { overflow-y: auto; max-height: 45vh; border-block: 1px solid var(--border); margin-top: 12px; }
+  .oca-row { padding: 12px 4px; border-bottom: 1px solid var(--border); }
+  .oca-heading { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+  .oca-heading .check-item { flex: 1; font-family: var(--font-mono); }
+  .oca-description { color: var(--text-dim); font-size: var(--text-xs); margin: 4px 0; overflow-wrap: anywhere; }
+  .oca-status { font-size: var(--text-xs); overflow-wrap: anywhere; }
+  .oca-status.error { color: var(--red); }
+  .oca-branches { display: flex; gap: 4px 16px; flex-wrap: wrap; max-height: 130px; overflow-y: auto; margin-top: 8px; }
+  .oca-branches .check-item { font-family: var(--font-mono); }
+  .oca-footer { padding: 12px 20px 16px; border-top: 1px solid var(--border); }
+  .oca-footer .form-actions { margin-top: 10px; flex-wrap: wrap; }
   .modal-routes { max-width: 680px; max-height: 90vh; }
   #template-settings-modal .modal { width: min(760px, calc(100vw - 32px)); max-height: 90vh; }
   #template-metadata-editor {
@@ -1536,6 +1550,7 @@
   <div class="tab-toolbar">
     <button class="btn btn-sync" title="Fetch the latest changes for every repository with a remote" onclick="doPullAllExtraRepos(this)">Update all</button>
     <button class="btn-create" onclick="openAddExtraRepoModal()">+ Add Repo</button>
+    <button class="btn" onclick="openOcaImportModal()">Import OCA</button>
   </div>
   <div id="extra-repos-list"></div>
 </div>
@@ -2668,6 +2683,51 @@
     </div>
   </div>
 </div><!--/IF-STOCK-->
+<div class="modal-overlay" id="oca-import-modal" onclick="closeOcaImportModal(event)">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="oca-title">
+    <div class="modal-header">
+      <h2 id="oca-title">Import OCA repositories</h2>
+      <button class="modal-close" aria-label="Close OCA import" onclick="closeOcaImportModal()">&times;</button>
+    </div>
+    <div class="modal-body">
+      <div class="oca-toolbar">
+        <div class="form-group">
+          <label for="oca-search">Search repositories</label>
+          <input id="oca-search" type="search" placeholder="Name or description" oninput="renderOcaRepos()">
+        </div>
+        <div class="form-group">
+          <label for="oca-sort">Sort by</label>
+          <select id="oca-sort" onchange="renderOcaRepos()">
+            <option value="stars">Stars (most first)</option>
+            <option value="name">Name (A–Z)</option>
+          </select>
+        </div>
+      </div>
+      <div class="form-group">
+        <label for="oca-versions">Common versions</label>
+        <input id="oca-versions" placeholder="e.g. 18.0, 19.0" onchange="applyOcaVersions()">
+        <div class="hint">Comma-separated branches to download right away, applied when you select a repository and to selected repositories when changed. Leave empty to download nothing now: each branch downloads when an environment first uses it.</div>
+      </div>
+      <div class="oca-toolbar">
+        <label class="check-item"><input id="oca-selected-only" type="checkbox" onchange="renderOcaRepos()">Selected only</label>
+        <label class="check-item"><input id="oca-archived" type="checkbox" onchange="renderOcaRepos()">Show archived</label>
+        <button class="btn" id="oca-reload" onclick="loadOcaCatalog()">Reload catalogue</button>
+      </div>
+      <div id="oca-error" class="form-error" role="alert"></div>
+      <div id="oca-stale" class="hint" role="status" hidden>GitHub is unavailable right now. Showing the last loaded catalogue.</div>
+      <div id="oca-repos" aria-label="OCA repositories"></div>
+    </div>
+    <div class="oca-footer">
+      <div id="oca-summary" role="status" aria-live="polite"></div>
+      <div class="hint">The server adds up to 3 repositories at once. You can close this dialog or reload the page; the import continues.</div>
+      <div class="form-actions">
+        <button class="btn" onclick="closeOcaImportModal()">Close</button>
+        <button class="btn" id="oca-retry" onclick="startOcaImport(true)" hidden>Retry failed</button>
+        <button class="btn-create" id="oca-submit" onclick="startOcaImport(false)" disabled>Import repositories</button>
+      </div>
+    </div>
+  </div>
+</div>
 <div class="modal-overlay" id="add-extra-repo-modal" onclick="closeAddExtraRepoModal(event)">
   <div class="modal modal-md">
     <div class="modal-header">
@@ -7644,6 +7704,411 @@ async function activateLicense() {
 const API_EXTRA_REPOS = '/api/extra-repos';
 let cachedExtraRepos = [];
 
+// The import runs on the server; this page only renders the catalogue and
+// polls the team's latest import job, so a reload or a closed dialog loses
+// nothing.
+var ocaRows = [];
+var ocaByName = new Map();
+var ocaVisibleCount = 0;
+var ocaLoading = false;
+var ocaStarting = false;
+var ocaStale = false;
+var ocaJob = null;
+var ocaJobItems = new Map();
+var ocaPollTimer = 0;
+var ocaBranchQueue = [];
+var ocaBranchActive = 0;
+
+function ocaVersions() {
+  return Array.from(new Set(document.getElementById('oca-versions').value.split(/[\s,]+/).filter(Boolean)));
+}
+
+function ocaRunning() {
+  return !!ocaJob && ocaJob.status === 'running';
+}
+
+// Successful imports show up as existing_as once the catalogue is reloaded,
+// so after that only a finished job's failures still need its state.
+function applyOcaJob(job, reconciled) {
+  ocaJob = job || null;
+  ocaJobItems = new Map();
+  (ocaJob ? ocaJob.items : []).forEach(function(item) {
+    if (ocaJob.status === 'running' || !reconciled || item.status === 'error') ocaJobItems.set(item.name, item);
+  });
+}
+
+function ocaRowState(row) {
+  var item = ocaJobItems.get(row.name);
+  return item ? item.status : '';
+}
+
+function ocaRowLocked(row) {
+  return !!(row.existing_as || row.name_taken) || ['queued', 'adding', 'done'].includes(ocaRowState(row));
+}
+
+function ocaPending() {
+  return ocaRows.filter(function(row) { return row.selected && !ocaRowLocked(row); });
+}
+
+function ocaFailedItems() {
+  if (!ocaJob || ocaRunning()) return [];
+  return ocaJob.items.filter(function(item) {
+    var row = ocaByName.get(item.name);
+    return item.status === 'error' && row && !row.existing_as && !row.name_taken;
+  });
+}
+
+function setOcaError(message) {
+  var error = document.getElementById('oca-error');
+  error.textContent = message;
+  error.style.display = message ? 'block' : 'none';
+}
+
+function openOcaImportModal() {
+  showModal('oca-import-modal');
+  document.getElementById('oca-search').focus();
+  if (ocaRows.length) renderOcaRepos();
+  // Reload every time: the team's repositories may have changed meanwhile.
+  loadOcaCatalog();
+}
+
+function closeOcaImportModal(event) {
+  if (event && event.target !== event.currentTarget) return;
+  hideModal('oca-import-modal');
+}
+
+async function loadOcaCatalog() {
+  if (ocaLoading) return;
+  ocaLoading = true;
+  setOcaError('');
+  if (ocaRows.length) updateOcaSummary(); else renderOcaRepos();
+  try {
+    var data = await readResult(await fetch(API_EXTRA_REPOS + '/oca'));
+    if (!data.ok) throw new Error(data.error || 'Failed to load OCA catalogue');
+    var old = ocaByName;
+    ocaRows = data.repos.map(function(repo, idx) {
+      var row = Object.assign(old.get(repo.name) || {
+        selected: false, desired: [], branches: null, branchState: '', branchError: ''
+      }, repo);
+      row.idx = idx;
+      if (row.existing_as || row.name_taken) row.selected = false;
+      return row;
+    });
+    ocaByName = new Map(ocaRows.map(function(row) { return [row.name, row]; }));
+    ocaStale = !!data.stale;
+    applyOcaJob(data.job, true);
+    scheduleOcaPoll();
+  } catch (e) {
+    setOcaError(e.message);
+  } finally {
+    ocaLoading = false;
+    renderOcaRepos();
+  }
+}
+
+function scheduleOcaPoll() {
+  clearTimeout(ocaPollTimer);
+  if (ocaRunning()) ocaPollTimer = setTimeout(pollOcaJob, 1500);
+}
+
+async function fetchOcaJob() {
+  var data = await readResult(await fetch(API_EXTRA_REPOS + '/oca/import'));
+  if (!data.ok) throw new Error(data.error || 'Failed to read import progress');
+  return data.job;
+}
+
+async function pollOcaJob() {
+  clearTimeout(ocaPollTimer);
+  var job;
+  try {
+    job = await fetchOcaJob();
+  } catch (e) {
+    // A proxy restart or network blip must not end the progress display.
+    scheduleOcaPoll();
+    return;
+  }
+  await followOcaJob(job);
+}
+
+async function followOcaJob(job) {
+  applyOcaJob(job, false);
+  updateOcaRows();
+  if (ocaRunning()) { scheduleOcaPoll(); return; }
+  // Finished: reload so new repositories appear as existing here and in the tab.
+  loadExtraRepos();
+  await loadOcaCatalog();
+}
+
+function ocaMissingBranches(row) {
+  return !row.branches ? [] : row.desired.filter(function(b) { return !row.branches.includes(b); });
+}
+
+function ocaReady(row) {
+  return !ocaRowLocked(row) && row.branchState === 'loaded' && row.branches.length > 0 &&
+    !ocaMissingBranches(row).length;
+}
+
+function applyOcaVersions() {
+  var versions = ocaVersions();
+  ocaRows.forEach(function(row) {
+    if (row.selected && !ocaRowLocked(row)) {
+      row.desired = versions.slice();
+      updateOcaRow(row);
+    }
+  });
+  updateOcaSummary();
+}
+
+function queueOcaBranches(row) {
+  if (row.branchState === 'queued' || row.branchState === 'loading' || row.branchState === 'loaded') return;
+  row.branchState = 'queued';
+  row.branchError = '';
+  ocaBranchQueue.push(row);
+  pumpOcaBranches();
+}
+
+function pumpOcaBranches() {
+  while (ocaBranchActive < 3 && ocaBranchQueue.length) {
+    var row = ocaBranchQueue.shift();
+    if (!row.selected) { row.branchState = ''; continue; }
+    ocaBranchActive++;
+    fetchOcaBranches(row);
+  }
+}
+
+async function fetchOcaBranches(row) {
+  row.branchState = 'loading';
+  updateOcaRow(row);
+  try {
+    var data = await readResult(await fetch(API_EXTRA_REPOS + '/ls-remote', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({repo_url: row.repo_url})
+    }));
+    if (!data.ok) throw new Error(data.error || 'Failed to list branches');
+    row.branches = (data.branches || []).slice().sort(function(a, b) { return b.localeCompare(a, undefined, {numeric: true}); });
+    row.branchState = 'loaded';
+  } catch (e) {
+    row.branchState = 'error';
+    row.branchError = e.message;
+  } finally {
+    ocaBranchActive--;
+    pumpOcaBranches();
+    updateOcaRow(row);
+    updateOcaSummary();
+  }
+}
+
+function ocaRowStatus(row) {
+  var item = ocaJobItems.get(row.name);
+  var state = item ? item.status : '';
+  if (state === 'queued') return ['Queued', false];
+  if (state === 'adding') return ['Adding…', false];
+  if (state === 'done') return ['Imported as ' + row.extra_name, false];
+  if (row.existing_as) return ['Already added as ' + row.existing_as, false];
+  if (row.name_taken) return ['Name already in use: ' + row.extra_name, true];
+  if (state === 'error') return ['Import failed: ' + item.error, true];
+  if (state === 'skipped') return [item.error, false];
+  if (!row.selected) return ['', false];
+  if (row.branchState === 'error') return [row.branchError, true];
+  if (row.branchState !== 'loaded') return ['Loading branches…', false];
+  if (!row.branches.length) return ['No branches found', true];
+  var missing = ocaMissingBranches(row);
+  if (missing.length) return ['Unavailable: ' + missing.join(', '), true];
+  return row.desired.length ? ['Downloads now: ' + row.desired.join(', '), false] :
+    ['Downloads nothing now; each branch downloads on first use', false];
+}
+
+function ocaRowHtml(row) {
+  var id = row.idx;
+  return '<div class="oca-heading"><label class="check-item"><input type="checkbox" id="oca-select-' + id + '" data-row="' + id + '" data-action="select">' + esc(row.name) + '</label>' +
+    '<span class="hint">' + Number(row.stars) + ' stars' + (row.archived ? ' · Archived' : '') + '</span></div>' +
+    '<div class="oca-description">' + esc(row.description) + '</div>' +
+    '<div class="oca-description">Import as <code>' + esc(row.extra_name) + '</code></div>' +
+    '<div class="oca-status"></div><div class="oca-branch-area"></div>';
+}
+
+function ocaBranchesHtml(row, missing) {
+  var id = row.idx;
+  if (row.branchState === 'error') {
+    return '<button class="btn" id="oca-retry-branches-' + id + '" data-row="' + id + '" data-action="reload-branches">Retry loading branches</button>';
+  }
+  if (row.branchState !== 'loaded' || !row.branches.length) return '';
+  return '<div class="oca-branches">' +
+    row.branches.concat(missing).map(function(branch, index) {
+      return '<label class="check-item"><input type="checkbox" id="oca-branch-' + id + '-' + index + '" data-row="' + id + '" data-action="branch" value="' + escHtmlAttr(branch) + '">' +
+        esc(branch) + (missing.includes(branch) ? ' (unavailable)' : '') + '</label>';
+    }).join('') + '</div>';
+}
+
+// Patch the row's existing nodes in place. Async events (branch lists, import
+// progress) must never replace a control the user may be clicking right now.
+function updateOcaRow(row) {
+  var el = row && row.el;
+  if (!el) return;
+  var locked = ocaRowLocked(row);
+  var state = ocaRowState(row);
+  var select = el.querySelector('[data-action="select"]');
+  select.checked = row.selected || state === 'queued' || state === 'adding' || state === 'done';
+  select.disabled = locked;
+  var status = ocaRowStatus(row);
+  var statusEl = el.querySelector('.oca-status');
+  statusEl.textContent = status[0];
+  statusEl.classList.toggle('error', status[1]);
+  var area = el.querySelector('.oca-branch-area');
+  var missing = ocaMissingBranches(row);
+  var shown = row.selected && !row.existing_as && !row.name_taken;
+  var key = JSON.stringify([shown, row.branchState, row.branches, missing]);
+  if (area.dataset.key !== key) {
+    var focus = area.contains(document.activeElement) ? document.activeElement.id : '';
+    area.dataset.key = key;
+    area.innerHTML = shown ? ocaBranchesHtml(row, missing) : '';
+    if (focus) (document.getElementById(focus) || select).focus({preventScroll: true});
+  }
+  area.querySelectorAll('input').forEach(function(input) {
+    input.checked = row.desired.includes(input.value);
+    input.disabled = locked;
+  });
+  var retry = area.querySelector('[data-action="reload-branches"]');
+  if (retry) retry.disabled = locked;
+}
+
+function updateOcaRows() {
+  ocaRows.forEach(updateOcaRow);
+  updateOcaSummary();
+}
+
+// Rebuilds the list; only for search, sort, filters and catalogue loads.
+function renderOcaRepos() {
+  var query = document.getElementById('oca-search').value.trim().toLowerCase();
+  var selectedOnly = document.getElementById('oca-selected-only').checked;
+  var archived = document.getElementById('oca-archived').checked;
+  var sort = document.getElementById('oca-sort').value;
+  var visible = ocaRows.filter(function(row) {
+    return (!selectedOnly || row.selected) && (archived || !row.archived || row.selected) &&
+      (row.name + ' ' + row.description).toLowerCase().includes(query);
+  }).sort(function(a, b) { return (sort === 'stars' ? b.stars - a.stars : 0) || a.name.localeCompare(b.name); });
+  var list = document.getElementById('oca-repos');
+  var focus = list.contains(document.activeElement) ? document.activeElement.id : '';
+  ocaRows.forEach(function(row) { row.el = null; });
+  list.innerHTML = visible.length ? '' :
+    '<div class="empty">' + (ocaLoading ? 'Loading OCA catalogue…' : 'No matching repositories.') + '</div>';
+  visible.forEach(function(row) {
+    var el = document.createElement('div');
+    el.className = 'oca-row';
+    el.innerHTML = ocaRowHtml(row);
+    list.appendChild(el);
+    row.el = el;
+    updateOcaRow(row);
+  });
+  if (focus) { var target = document.getElementById(focus); if (target) target.focus({preventScroll: true}); }
+  ocaVisibleCount = visible.length;
+  updateOcaSummary();
+}
+
+function updateOcaSummary() {
+  var running = ocaRunning();
+  var pending = ocaPending();
+  var failed = ocaFailedItems();
+  var items = ocaJob ? ocaJob.items : [];
+  function count(status) { return items.filter(function(item) { return item.status === status; }).length; }
+  var submit = document.getElementById('oca-submit');
+  submit.disabled = running || ocaLoading || ocaStarting || !pending.length || !pending.every(ocaReady);
+  submit.textContent = running || ocaStarting ? 'Importing…' : 'Import ' + pending.length + ' repositories';
+  var retry = document.getElementById('oca-retry');
+  retry.hidden = running || !failed.length;
+  retry.disabled = ocaLoading || ocaStarting;
+  retry.textContent = 'Retry ' + failed.length + ' failed';
+  document.getElementById('oca-reload').disabled = ocaLoading;
+  document.getElementById('oca-stale').hidden = !ocaStale;
+  var parts = [ocaVisibleCount + ' of ' + ocaRows.length + ' repositories', pending.length + ' selected'];
+  if (items.length) {
+    parts.push((running ? 'Importing: ' : 'Last import: ') + count('done') + ' imported, ' + count('error') + ' failed' +
+      (count('skipped') ? ', ' + count('skipped') + ' skipped' : '') +
+      (running ? ', ' + (count('queued') + count('adding')) + ' remaining' : ''));
+  }
+  document.getElementById('oca-summary').textContent = parts.join(' · ');
+}
+
+document.getElementById('oca-repos').addEventListener('change', function(event) {
+  var input = event.target;
+  var row = ocaRows[Number(input.dataset.row)];
+  if (!row || ocaRowLocked(row)) return;
+  if (input.dataset.action === 'select') {
+    row.selected = input.checked;
+    if (row.selected) {
+      // Selecting always starts from the current Common versions.
+      row.desired = ocaVersions();
+      queueOcaBranches(row);
+    }
+  } else if (input.dataset.action === 'branch') {
+    row.desired = row.desired.filter(function(b) { return b !== input.value; });
+    if (input.checked) row.desired.push(input.value);
+  }
+  updateOcaRow(row);
+  updateOcaSummary();
+});
+
+document.getElementById('oca-repos').addEventListener('click', function(event) {
+  if (event.target.dataset.action !== 'reload-branches') return;
+  var row = ocaRows[Number(event.target.dataset.row)];
+  if (!row || ocaRowLocked(row)) return;
+  queueOcaBranches(row);
+  updateOcaRow(row);
+});
+
+async function startOcaImport(retryOnly) {
+  if (ocaRunning() || ocaLoading || ocaStarting) return;
+  var selections;
+  if (retryOnly) {
+    selections = ocaFailedItems().map(function(item) {
+      return {name: item.name, branches: item.branches};
+    });
+  } else {
+    var pending = ocaPending();
+    if (!pending.length || !pending.every(ocaReady)) return;
+    // Listed branches download now; an empty list downloads each on first use.
+    selections = pending.map(function(row) {
+      return {name: row.name, branches: row.desired.slice()};
+    });
+  }
+  if (!selections.length) return;
+  ocaStarting = true;
+  setOcaError('');
+  updateOcaSummary();
+  var previous = ocaJob ? ocaJob.id : '';
+  var response = null;
+  var data;
+  try {
+    response = await fetch(API_EXTRA_REPOS + '/oca/import', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({repos: selections})
+    });
+    data = await readResult(response);
+  } catch (e) {
+    data = {ok: false, error: 'Connection error: ' + e.message};
+  } finally {
+    ocaStarting = false;
+  }
+  if (data.ok) {
+    applyOcaJob(data.job, false);
+    scheduleOcaPoll();
+  } else {
+    setOcaError(data.error || 'Failed to start the import');
+  }
+  updateOcaRows();
+  if (data.ok || (response && !isAmbiguousGatewayStatus(response.status))) return;
+  // A lost response does not mean the import did not start: ask the server.
+  try {
+    var job = await fetchOcaJob();
+    if (job && job.id !== previous) {
+      setOcaError('');
+      await followOcaJob(job);
+    }
+  } catch (e) {
+    // Keep the original error; the next dialog open shows the server state.
+  }
+}
+
 async function loadExtraRepos() {
   try {
     var r = await fetch(API_EXTRA_REPOS);
@@ -9162,6 +9627,7 @@ var MODAL_CLOSERS = {
   'version-modal': closeVersionModal,
   'add-extra-repo-modal': closeAddExtraRepoModal,
   'extra-branches-modal': closeExtraBranchesModal,
+  'oca-import-modal': closeOcaImportModal,
   'add-credential-modal': closeAddCredentialModal,
   'secret-modal': closeSecretModal,
   'import-from-odoo-modal': closeImportFromOdooModal,

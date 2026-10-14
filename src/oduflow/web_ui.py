@@ -4359,6 +4359,71 @@ def _build_routes(
                 {"ok": False, "error": "Internal server error."}, status_code=500
             )
 
+    async def api_oca_catalog(request: Request) -> JSONResponse:
+        from oduflow import oca_import
+        from oduflow.extra_addons import list_extra_repos
+        from oduflow.oca_catalog import annotate_existing, list_oca_repositories
+
+        team = _get_ui_team(request)
+        # Snapshot the job first: a clone finishing during this request then
+        # either is still "running" here (the page keeps polling) or is already
+        # visible in the repository list read below.
+        job = oca_import.get_job(team)
+        try:
+            catalogue, existing = await asyncio.gather(
+                _offload(list_oca_repositories), _offload(list_extra_repos, team)
+            )
+            return JSONResponse(
+                {
+                    "ok": True,
+                    "repos": annotate_existing(catalogue["repos"], existing),
+                    "stale": catalogue["stale"],
+                    "job": job,
+                }
+            )
+        except FlowError as e:
+            return _error_response(e)
+        except Exception:
+            logger.exception("Unexpected error in api_oca_catalog")
+            return JSONResponse(
+                {"ok": False, "error": "Internal server error."}, status_code=500
+            )
+
+    async def api_oca_import_status(request: Request) -> JSONResponse:
+        from oduflow import oca_import
+
+        return JSONResponse(
+            {"ok": True, "job": oca_import.get_job(_get_ui_team(request))}
+        )
+
+    async def api_oca_import_start(request: Request) -> JSONResponse:
+        """Start a server-side batch clone; the dashboard polls its status."""
+        from oduflow import oca_import
+
+        team = _get_ui_team(request)
+        try:
+            body = await request.json()
+            job = await _offload(
+                oca_import.start_import,
+                team,
+                body.get("repos") if isinstance(body, dict) else None,
+                lambda e: (
+                    _public_flow_error(e, context="OCA import")
+                    if isinstance(e, FlowError)
+                    else _public_error_text(e)
+                ),
+            )
+            return JSONResponse({"ok": True, "job": job}, status_code=202)
+        except FlowError as e:
+            return _error_response(e)
+        except ValueError as e:
+            return _error_text_response(e)
+        except Exception:
+            logger.exception("Unexpected error in api_oca_import_start")
+            return JSONResponse(
+                {"ok": False, "error": "Internal server error."}, status_code=500
+            )
+
     async def api_extra_repo_add(request: Request) -> JSONResponse:
         # No lock: extra_addons serialises every mutator per repo (see the MCP
         # extra-repo tools).
@@ -7156,6 +7221,9 @@ def _build_routes(
         Route("/api/volumes/create", api_volume_create, methods=["POST"]),
         Route("/api/volumes/{name}/delete", api_volume_delete, methods=["POST"]),
         Route("/api/extra-repos", api_extra_repos, methods=["GET"]),
+        Route("/api/extra-repos/oca", api_oca_catalog, methods=["GET"]),
+        Route("/api/extra-repos/oca/import", api_oca_import_status, methods=["GET"]),
+        Route("/api/extra-repos/oca/import", api_oca_import_start, methods=["POST"]),
         Route("/api/extra-repos/add", api_extra_repo_add, methods=["POST"]),
         Route("/api/extra-repos/ls-remote", api_extra_repo_ls_remote, methods=["POST"]),
         Route("/api/extra-repos/{name}/pull", api_extra_repo_pull, methods=["POST"]),
