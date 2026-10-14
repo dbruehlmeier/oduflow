@@ -122,6 +122,29 @@ class TestCLIInitDestroy:
 
 
 class TestCLIUpgrade:
+    @pytest.fixture(autouse=True)
+    def _no_postgres_preflight(self, monkeypatch):
+        # The PostgreSQL preflight inspects Docker; these tests cover files.
+        monkeypatch.setattr("oduflow.postgres_migration.preflight", lambda _: None)
+
+    def test_upgrade_refuses_before_reconciling_when_postgres_would_block(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        server, settings, deployed_guide = self._settings_with_changed_guide(
+            tmp_path, monkeypatch
+        )
+
+        from oduflow.errors import PrerequisiteNotMetError
+
+        def refuse(_settings):
+            raise PrerequisiteNotMetError("Delete these before upgrading PostgreSQL")
+
+        monkeypatch.setattr("oduflow.postgres_migration.preflight", refuse)
+
+        assert server._run_upgrade(settings, force=True) is False
+        assert "Delete these before upgrading" in capsys.readouterr().err
+        assert deployed_guide.read_text(encoding="utf-8") == "bundled v1\n"
+
     @staticmethod
     def _settings_with_changed_guide(tmp_path, monkeypatch):
         from oduflow import server
@@ -2589,10 +2612,12 @@ class TestHttpFailClosed:
             patch("fastmcp.server.http.create_streamable_http_app"),
             patch("oduflow.web_ui.mount_web_ui"),
             patch("oduflow.reaper.start_reaper"),
-            patch("uvicorn.run") as mock_uvicorn,
+            patch("uvicorn.Config") as mock_uvicorn,
+            patch("uvicorn.Server") as mock_server,
         ):
             server._start_http()
             mock_uvicorn.assert_called_once()
+            mock_server.return_value.run.assert_called_once()
 
     def test_start_http_refuses_empty_team_map(self):
         from oduflow import server
@@ -2628,7 +2653,8 @@ class TestHttpFailClosed:
             patch("fastmcp.server.http.create_streamable_http_app"),
             patch("oduflow.web_ui.mount_web_ui"),
             patch("oduflow.reaper.start_reaper"),
-            patch("uvicorn.run") as mock_uvicorn,
+            patch("uvicorn.Config") as mock_uvicorn,
+            patch("uvicorn.Server"),
         ):
             server._start_http()
             _, kwargs = mock_uvicorn.call_args
@@ -2659,7 +2685,8 @@ class TestHttpFailClosed:
                 "_traefik_forwarded_allow_ips",
                 return_value=["127.0.0.1", "172.18.0.0/16"],
             ),
-            patch("uvicorn.run") as mock_uvicorn,
+            patch("uvicorn.Config") as mock_uvicorn,
+            patch("uvicorn.Server"),
         ):
             server._start_http()
             _, kwargs = mock_uvicorn.call_args

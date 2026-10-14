@@ -143,6 +143,11 @@ def _migrate_team_pg_tablespaces(settings: Settings) -> None:
         for m in pg.attrs.get("Mounts", [])
     )
     if not has_mount:
+        from dataclasses import replace
+
+        # This historical step may run before the PG16 reset. Adding a mount
+        # must keep the image that can read the existing data volume.
+        current_image = pg.attrs.get("Config", {}).get("Image", settings.postgres_image)
         logger.info(
             "Recreating %s with the tablespaces mount (data volume persists)",
             settings.shared_db_container,
@@ -153,7 +158,9 @@ def _migrate_team_pg_tablespaces(settings: Settings) -> None:
             settings.managed_label: "true",
             settings.system_label: "true",
         }
-        system_ops._ensure_pg_container(client, settings, system_labels)
+        system_ops._ensure_pg_container(
+            client, replace(settings, postgres_image=current_image), system_labels
+        )
     system_ops._wait_pg_ready(client, settings)
 
     rows = system_ops._exec_sql(
@@ -415,6 +422,88 @@ def _migrate_backfill_service_presets(settings: Settings) -> None:
                 backfill_service_preset(settings, team, name, container)
 
 
+def _migrate_secret_value_types(settings: Settings) -> None:
+    """Persist the type of team secrets stored before value_type existed.
+
+    secret_store already reads an untyped record holding a JSON object or
+    array as JSON (so its keys can be updated) and anything else as text;
+    secret_store.backfill_value_types records that type on disk. Best effort
+    per team, like migration 0006: an unreadable store is logged for the
+    operator and fails at its point of use anyway, and a team skipped here —
+    or a legacy store restored later — is still typed correctly on read.
+    """
+    from oduflow import secret_store
+
+    for team in settings.teams.values():
+        try:
+            promoted = secret_store.backfill_value_types(team)
+        except (OSError, PrerequisiteNotMetError) as exc:
+            logger.warning("Could not type secrets for team %s: %s", team.team_id, exc)
+            continue
+        if promoted:
+            logger.info(
+                "Typed team %s secret(s) as JSON: %s. Replacing their value "
+                "now requires valid JSON unless value_type 'text' is passed.",
+                team.team_id,
+                ", ".join(promoted),
+            )
+
+
+def _migrate_postgres16(settings: Settings) -> None:
+    """Retired: v1.85.0 replaced PG15 clusters here, once and unconditionally.
+
+    PostgreSQL upgrades now run on every start when an explicit
+    [database].image is newer than a cluster (postgres_migration.upgrade),
+    which also resumes a replacement this step left unfinished.
+    """
+
+
+def _migrate_regenerate_odoo_confs(settings: Settings) -> None:
+    """Rewrite ``/etc/odoo/odoo.conf`` in existing Odoo containers.
+
+    The conf is a copy made at create/update time, so a container created
+    before http_interface was pinned keeps a conf without it — on Odoo 20 that
+    binds 127.0.0.1, which neither Traefik nor a published port can reach.
+    Productions also stop applying a repo ``.oduflow/odoo.prod.conf``. Writes
+    the current conf without restarting anything: the next restart, start or
+    pull_and_apply picks it up. Best-effort per container: a failure is
+    logged and skipped (the next Update/Recreate regenerates the conf anyway).
+    """
+    from oduflow.docker_ops.client import get_client
+    from oduflow.docker_ops.env_ops import _reapply_odoo_conf
+    from oduflow.naming import get_resource_name
+
+    client = get_client()
+    for team_id, team in settings.teams.items():
+        containers = client.containers.list(
+            all=True,
+            filters={
+                "label": [
+                    f"{settings.managed_label}=true",
+                    f"{settings.team_label}={team_id}",
+                ]
+            },
+        )
+        for container in containers:
+            # Odoo containers only: a dev environment's (branch label, -odoo
+            # name) or a production's; services and infra have no odoo.conf.
+            env_name = container.labels.get(settings.branch_label, "")
+            is_env_odoo = bool(env_name) and container.name == get_resource_name(
+                env_name, "odoo", settings.prefix, team_id
+            )
+            if not is_env_odoo and container.labels.get("oduflow.prod") != "true":
+                continue
+            try:
+                _reapply_odoo_conf(settings, team, env_name, container)
+                logger.info("Regenerated odoo.conf in %s", container.name)
+            except Exception as exc:
+                logger.warning(
+                    "Could not regenerate odoo.conf in %s: %s",
+                    container.name,
+                    exc,
+                )
+
+
 # Append-only registry, executed in list order. Ids are recorded in
 # migrations.json once applied; reordering or renaming entries would re-run
 # or skip steps on existing installs.
@@ -482,6 +571,28 @@ MIGRATIONS: list[Migration] = [
             "predates presets, so restore/update/edit read one source of truth"
         ),
         apply=_migrate_backfill_service_presets,
+    ),
+    Migration(
+        id="0009-postgresql16",
+        description="Retired PG15 replacement (now run on demand at startup)",
+        apply=_migrate_postgres16,
+    ),
+    Migration(
+        id="0010-secret-value-types",
+        description=(
+            "Type team secrets saved before value_type existed: JSON objects "
+            "and arrays as json (enables key updates), everything else as text"
+        ),
+        apply=_migrate_secret_value_types,
+    ),
+    Migration(
+        id="0011-regenerate-odoo-confs",
+        description=(
+            "Rewrite odoo.conf in existing Odoo containers: pin "
+            "http_interface = 0.0.0.0 (Odoo 20 binds loopback otherwise) and "
+            "drop repo odoo.prod.conf from productions; applied on next restart"
+        ),
+        apply=_migrate_regenerate_odoo_confs,
     ),
 ]
 

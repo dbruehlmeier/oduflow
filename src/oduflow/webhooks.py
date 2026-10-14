@@ -24,6 +24,7 @@ import hmac
 import json
 import logging
 import threading
+import time
 from typing import Any
 from urllib.parse import urlparse
 
@@ -129,15 +130,29 @@ def _deploy_in_background(
 
     key = prod_lock_key(team.team_id, name)
     pending_key = f"{team.team_id}/{name}"
+    queued_at = time.time()
     try:
         if not locks.acquire_env_blocking(
             key, _LOCK_TIMEOUT_SECONDS, operation="webhook deploy"
         ):
+            holder = locks.describe_env_holder(key)
             logger.warning(
                 "Webhook deploy of production '%s' gave up waiting for its "
-                "lock (%.0f min)",
+                "lock (%.0f min)%s",
                 name,
                 _LOCK_TIMEOUT_SECONDS / 60,
+                holder,
+            )
+            production_ops.record_skipped_deploy(
+                team,
+                name,
+                trigger="webhook",
+                queued_at=queued_at,
+                reason=(
+                    "Not started: the production stayed busy for "
+                    f"{_LOCK_TIMEOUT_SECONDS // 60} min{holder}. The next "
+                    "push (or a manual deploy) picks these commits up."
+                ),
             )
             return
         # Holding the lock: this run is no longer "pending" — a new push

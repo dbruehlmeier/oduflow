@@ -24,6 +24,7 @@ from typing import Any
 import docker
 from docker import DockerClient
 from oduflow import pg_hba, service_database_credentials
+from oduflow.docker_ops import image_cleanup
 from oduflow.docker_ops.client import chown_recursive, get_client, get_odoo_uid_gid
 from oduflow.docker_ops.stats import default_env_limits
 from oduflow.errors import (
@@ -33,6 +34,7 @@ from oduflow.errors import (
     PrerequisiteNotMetError,
 )
 from oduflow.fsutil import atomic_write_private_json, atomic_write_private_text
+from oduflow.module_versions import odoo_series
 from oduflow.naming import (
     PROD_ENV_PREFIX,
     get_db_name,
@@ -393,13 +395,6 @@ def _stage_filestore_source(
     raise NotFoundError(f"Filestore source not found: {source}")
 
 
-def _odoo_major_from_module_version(module_version: str) -> str:
-    parts = module_version.split(".")
-    if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
-        return f"{parts[0]}.{parts[1]}"
-    return ""
-
-
 def _read_template_manifest_from_db(
     client: DockerClient, settings: Settings, template_db: str
 ) -> dict[str, object]:
@@ -411,7 +406,7 @@ def _read_template_manifest_from_db(
         "WHERE name='base' AND state='installed' LIMIT 1;",
         db=template_db,
     ).strip()
-    major_version = _odoo_major_from_module_version(version)
+    major_version = odoo_series(version)
     pg_version = _exec_sql(client, settings, "SHOW server_version;", db=template_db)
     modules_raw = _exec_sql(
         client,
@@ -800,10 +795,12 @@ def _wait_pg_ready(
     deadline = time.monotonic() + timeout
     for _ in range(timeout):
         try:
+            # Over TCP: on a fresh volume the official entrypoint first runs a
+            # temporary socket-only server for its setup, then stops it.
             ready = _exec_exit_code(
                 client,
                 container,
-                ["pg_isready", "-U", settings.db_user],
+                ["pg_isready", "-h", "127.0.0.1", "-U", settings.db_user],
                 timeout=exec_timeout,
             )
             if ready == 0:
@@ -1225,6 +1222,40 @@ def pg_clone_strategy_clause(client: DockerClient, settings: Settings) -> str:
     return " STRATEGY FILE_COPY" if version >= 150000 else ""
 
 
+def require_postgres_for_odoo(
+    client: DockerClient,
+    settings: Settings,
+    odoo_image: str,
+    *,
+    container_name: str | None = None,
+) -> None:
+    """Refuse an Odoo 20+ image on a PostgreSQL 15 cluster.
+
+    Odoo 20 needs PostgreSQL 16 or newer. Clusters stay on their major until
+    the operator raises ``[database].image``, so an older cluster is a normal
+    state that must fail before anything is created, not when Odoo starts.
+    Images without a version in their reference are not checked.
+    """
+    from oduflow.odoo_version import major_from_image_reference
+
+    odoo_major = major_from_image_reference(odoo_image)
+    if odoo_major is None or odoo_major < 20:
+        return
+    version = int(
+        _exec_sql(
+            client, settings, "SHOW server_version_num;", container_name=container_name
+        )
+    )
+    if version < 160000:
+        raise PrerequisiteNotMetError(
+            f"Odoo {odoo_major} needs PostgreSQL 16 or newer, but "
+            f"{container_name or settings.shared_db_container} runs PostgreSQL "
+            f"{version // 10000}. Set [database].image to 'postgres:16' or newer "
+            "and restart Oduflow to upgrade the clusters; see Upgrading "
+            "PostgreSQL in the installation guide."
+        )
+
+
 def _create_pg_role(
     client: DockerClient,
     settings: Settings,
@@ -1485,6 +1516,7 @@ def _convert_custom_dump_to_sql_with_helper(
             container_path,
         ]
 
+    image_cleanup.note_image_requested(_PG_RESTORE_HELPER_IMAGE)
     with contextlib.suppress(Exception):
         client.images.pull(_PG_RESTORE_HELPER_IMAGE)
 
@@ -1975,7 +2007,7 @@ def _ensure_prod_pg_container(
     os.makedirs(walg.bin_host_dir(settings), exist_ok=True)
     os.makedirs(walg.conf_host_dir(settings), exist_ok=True)
     client.containers.run(
-        settings.production_pg_image,
+        settings.postgres_image,
         name=settings.prod_db_container,
         detach=True,
         network=settings.shared_network,
@@ -2566,6 +2598,7 @@ def reload_template(
     container_dump_path: str | None = None,
     *,
     persist_dump: bool = True,
+    strict: bool = False,
 ) -> dict[str, Any]:
     """Rebuild the template database from its dump.
 
@@ -2574,6 +2607,10 @@ def reload_template(
     layer. The caller owns that file; only dumps copied in here are cleaned up.
     ``persist_dump=False`` lets a caller install its staged file atomically after
     this restore succeeds instead of making a second full-size copy here.
+    ``strict=True`` makes archive restores stop at the first error and omit
+    ACLs, which may name roles missing from a new cluster. Plain SQL keeps the
+    tolerant psql behaviour: dumps from newer clients contain settings older
+    servers reject (e.g. ``SET transaction_timeout``), which are harmless.
     """
     client = get_client()
     tpl_db = get_template_db_name(template_name, team.team_id)
@@ -2632,6 +2669,7 @@ def reload_template(
         # at restore time for archive formats. The psql path for plain-SQL/
         # external dumps is left untouched.)
         restore_tool = "psql" if use_psql else "pg_restore"
+        archive_options = ["--no-acl", "--exit-on-error"] if strict else []
         if is_gzipped:
             if use_psql:
                 pipeline = f"gunzip -c {container_dump_path} | psql -U {settings.db_user} -d {tpl_db}"
@@ -2640,6 +2678,8 @@ def reload_template(
                     f"gunzip -c {container_dump_path} | "
                     f"pg_restore --no-owner -U {settings.db_user} -d {tpl_db}"
                 )
+                if strict:
+                    pipeline += " " + " ".join(archive_options)
             restore_cmd = ["bash", "-c", f"set -o pipefail; {pipeline}"]
         else:
             if use_psql:
@@ -2660,6 +2700,7 @@ def reload_template(
                 restore_cmd = [
                     "pg_restore",
                     "--no-owner",
+                    *archive_options,
                     "-U",
                     settings.db_user,
                     "-d",
@@ -2863,14 +2904,6 @@ def init_template(
             f"Existing data found: {', '.join(parts)}. Use --force to overwrite."
         )
 
-    if force:
-        if existing_dump:
-            os.remove(template_sql_path)
-            logger.info("Removed existing %s", template_sql_path)
-        if existing_filestore:
-            shutil.rmtree(template_filestore_path)
-            logger.info("Removed existing %s", template_filestore_path)
-
     client = get_client()
     logger.info(
         "Generating template dump from clean Odoo",
@@ -2894,6 +2927,16 @@ def init_template(
     _ensure_pg_container(client, settings, system_labels)
 
     _wait_pg_ready(client, settings)
+    # Before the existing template is removed.
+    require_postgres_for_odoo(client, settings, odoo_image)
+
+    if force:
+        if existing_dump:
+            os.remove(template_sql_path)
+            logger.info("Removed existing %s", template_sql_path)
+        if existing_filestore:
+            shutil.rmtree(template_filestore_path)
+            logger.info("Removed existing %s", template_filestore_path)
 
     build_db = "oduflow_template_build"
     temp_container_name = "flow-template-builder"
@@ -4627,9 +4670,10 @@ def _wire_imported_addons(
 
         # Already registered (e.g. a re-run, or the user added it manually):
         # reference it only if the requested branch is genuinely available.
+        # A registered repo downloads branches on demand, so fetch it if absent.
         if os.path.isdir(repo_path):
             try:
-                extra_addons._resolve_branch_revision(repo_path, name, branch)
+                extra_addons.ensure_branch_revision(team, name, branch)
             except Exception as exc:
                 if not best_effort:
                     raise
@@ -4643,10 +4687,27 @@ def _wire_imported_addons(
         local_fallback_reason = ""
         if kind == "remote" and origin_url:
             try:
-                extra_addons.clone_extra_repo(team, name, origin_url)
+                # Download only the branch this template needs, not every
+                # version branch of the remote.
+                extra_addons.register_extra_repo(
+                    team, name, origin_url, branches=[branch]
+                )
+                extra_addons._resolve_branch_revision(repo_path, name, branch)
+            except NotFoundError as exc:
+                # The remote is reachable but lacks the branch, so the repo can
+                # never serve it. Strict mode rejects this instead of settling
+                # for uploaded files that cannot receive remote updates.
+                shutil.rmtree(repo_path, ignore_errors=True)
+                if not best_effort:
+                    raise
+                if not os.path.isdir(src_dir):
+                    record_warning(name, "skipped", str(exc))
+                    continue
+                local_fallback_reason = str(exc)
             except Exception as exc:
-                # A failed clone may leave a partial bare repo. It belongs to
-                # this import attempt, so remove it before a retry or fallback.
+                # The download itself failed (network, auth, timeout). The bare
+                # repo belongs to this import attempt, so remove it before a
+                # retry or fallback.
                 shutil.rmtree(repo_path, ignore_errors=True)
                 if not os.path.isdir(src_dir):
                     if best_effort:
@@ -4655,27 +4716,12 @@ def _wire_imported_addons(
                     raise
                 local_fallback_reason = str(exc)
                 logger.warning(
-                    "Clone of extra repo '%s' failed; using uploaded files",
+                    "Download of extra repo '%s' failed; using uploaded files",
                     name,
                 )
             else:
-                try:
-                    extra_addons._resolve_branch_revision(repo_path, name, branch)
-                except Exception as exc:
-                    # Clone succeeded but the requested branch is missing on
-                    # the remote: the bare repo cannot serve this branch, so
-                    # discard the repo created by this import attempt.
-                    shutil.rmtree(repo_path, ignore_errors=True)
-                    if not best_effort:
-                        raise
-                    reason = str(exc)
-                    if not os.path.isdir(src_dir):
-                        record_warning(name, "skipped", reason)
-                        continue
-                    local_fallback_reason = reason
-                else:
-                    wired[name] = branch
-                    continue
+                wired[name] = branch
+                continue
         if not os.path.isdir(src_dir):
             error = PrerequisiteNotMetError(
                 f"Addon '{name}' has no uploaded files and no usable origin."
@@ -4838,7 +4884,10 @@ def finalize_imported_template(
 
 
 def cleanup_orphans(
-    settings: Settings, team: TeamSettings, dry_run: bool = True
+    settings: Settings,
+    team: TeamSettings,
+    dry_run: bool = True,
+    only: dict[str, list[str]] | None = None,
 ) -> dict[str, Any]:
     """Find and remove orphaned databases, workspaces, and port registry entries.
 
@@ -4855,6 +4904,9 @@ def cleanup_orphans(
 
     Returns a dict with keys: orphan_databases, orphan_workspaces, orphan_ports,
     and orphan_roles, each a list of removed (or would-be-removed) names.
+
+    ``only`` maps those keys to names the caller reviewed: when given, only
+    reviewed names that are still orphaned are removed.
     """
     from oduflow.port_registry import _load_registry, _save_registry
 
@@ -4958,6 +5010,14 @@ def cleanup_orphans(
         if not role.startswith(prod_role_prefix) and role not in live_roles
     ]
 
+    if only is not None:
+        orphan_dbs = [n for n in orphan_dbs if n in only.get("orphan_databases", [])]
+        orphan_workspaces = [
+            n for n in orphan_workspaces if n in only.get("orphan_workspaces", [])
+        ]
+        orphan_ports = [n for n in orphan_ports if n in only.get("orphan_ports", [])]
+        orphan_roles = [n for n in orphan_roles if n in only.get("orphan_roles", [])]
+
     if dry_run:
         logger.info(
             "Cleanup dry-run: %d orphan DBs, %d orphan workspaces, %d orphan ports, %d orphan roles",
@@ -4975,6 +5035,7 @@ def cleanup_orphans(
         }
 
     # --- Actually remove ---
+    errors: list[str] = []
     removed_dbs: list[str] = []
     for db_name in orphan_dbs:
         try:
@@ -4985,6 +5046,7 @@ def cleanup_orphans(
             logger.info("Dropped orphan database %s", db_name)
         except Exception as exc:
             logger.warning("Failed to drop orphan database %s: %s", db_name, exc)
+            errors.append(f"Database {db_name}: removal failed. Check server logs.")
 
     removed_workspaces: list[str] = []
     for entry in orphan_workspaces:
@@ -5002,6 +5064,7 @@ def cleanup_orphans(
             logger.info("Removed orphan workspace %s", entry_path)
         except Exception as exc:
             logger.warning("Failed to remove orphan workspace %s: %s", entry_path, exc)
+            errors.append(f"Workspace {entry}: removal failed. Check server logs.")
 
     removed_ports: list[str] = []
     for branch in orphan_ports:
@@ -5018,6 +5081,7 @@ def cleanup_orphans(
             removed_roles.append(role)
         except Exception as exc:
             logger.warning("Failed to drop orphan PG role %s: %s", role, exc)
+            errors.append(f"PostgreSQL role {role}: removal failed. Check server logs.")
 
     return {
         "dry_run": False,
@@ -5025,6 +5089,7 @@ def cleanup_orphans(
         "orphan_workspaces": removed_workspaces,
         "orphan_ports": removed_ports,
         "orphan_roles": removed_roles,
+        "errors": errors,
     }
 
 

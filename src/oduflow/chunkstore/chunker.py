@@ -17,10 +17,13 @@ Algorithm (clean-room, from the published design):
 - chunks are never smaller than ``min_size`` (the first window) nor larger
   than ``max_size`` (forced cut).
 
-Pure Python: throughput is modest (a few MB/s), which is fine for the
-intended workload — Odoo filestores are content-addressed (files never
-mutate, they only appear/disappear), so after the initial backup only the
-day's new files are ever chunked.
+Pure Python: throughput is modest (~10 MB/s on one core), which is fine
+for the intended workload — Odoo filestores are content-addressed (files
+never mutate, they only appear/disappear), so after the initial backup only
+the day's new files are ever chunked. The scan is resumable: the rolling
+hash and its position survive between ``update`` calls, so every byte is
+hashed once however the stream is split (a filestore feeds it one small
+file at a time).
 """
 
 from __future__ import annotations
@@ -91,18 +94,21 @@ class Chunker:
         self._out_table = [_rotl(v, min_size) for v in self._table]
         self._buffer = bytearray()
         self._pending: list[bytes] = []
+        # Resumable scan state: _hash is the hash of the window ending at
+        # buffer offset _scan_pos, and no boundary fired up to there
+        # (_scan_pos == 0: the current chunk's first window is not hashed yet).
+        self._scan_pos = 0
+        self._hash = 0
 
     # -- internal ----------------------------------------------------------
 
-    def _window_hash(self, view: memoryview) -> int:
-        h = 0
-        table = self._table
-        for b in view:
-            h = _rotl(h, 1) ^ table[b]
-        return h
-
     def _scan(self, *, final: bool) -> None:
-        """Cut as many chunks out of the buffer as the data allows."""
+        """Cut as many chunks out of the buffer as the data allows.
+
+        Resumes where the previous call stopped instead of re-hashing the
+        buffer from its start — otherwise a stream fed in small pieces
+        (one small file per call) costs O(calls x max_size).
+        """
         buf = self._buffer
         min_size = self.min_size
         max_size = self.max_size
@@ -114,53 +120,61 @@ class Chunker:
             n = len(buf)
             if n < min_size:
                 break
-            view = memoryview(buf)
-            h = self._window_hash(view[:min_size])
+            pos, h = self._scan_pos, self._hash
             cut = 0
-            if (h & mask) == 0:
-                cut = min_size
-            else:
-                # Roll one byte at a time: drop buf[i], add buf[i+min_size].
-                upper = min(n, max_size)
-                i = 0
-                limit = upper - min_size
-                while i < limit:
-                    h = (
-                        (((h << 1) | (h >> 63)) & _MASK64)
-                        ^ out_table[view[i]]
-                        ^ table[view[i + min_size]]
-                    )
-                    i += 1
+            # Every view (slices included) is released by its with-block, not
+            # by refcounting: a live export makes the del/extend of the
+            # buffer raise BufferError.
+            with memoryview(buf) as view:
+                if pos == 0:
+                    # First window of a new chunk.
+                    with view[:min_size] as first:
+                        for b in first:
+                            h = (((h << 1) | (h >> 63)) & _MASK64) ^ table[b]
+                    pos = min_size
                     if (h & mask) == 0:
-                        cut = i + min_size
-                        break
-                else:
-                    if upper == max_size and n >= max_size:
-                        cut = max_size
-            view.release()
+                        cut = min_size
+                if not cut:
+                    # Roll one byte at a time: drop buf[pos-min_size], add buf[pos].
+                    upper = min(n, max_size)
+                    with (
+                        view[pos - min_size : upper - min_size] as outgoing,
+                        view[pos:upper] as incoming,
+                    ):
+                        for out_b, in_b in zip(outgoing, incoming):
+                            h = (
+                                (((h << 1) | (h >> 63)) & _MASK64)
+                                ^ out_table[out_b]
+                                ^ table[in_b]
+                            )
+                            pos += 1
+                            if (h & mask) == 0:
+                                cut = pos
+                                break
+                        else:
+                            if upper == max_size:
+                                cut = max_size
             if cut:
                 self._pending.append(bytes(buf[:cut]))
                 del buf[:cut]
+                self._scan_pos = self._hash = 0
                 continue
-            # No boundary found in the available data.
-            if final and buf:
+            # No boundary in the available data: resume here next time.
+            self._scan_pos, self._hash = pos, h
+            break
+        if final:
+            if buf:
+                # End of stream: the tail is the last (possibly short) chunk.
                 self._pending.append(bytes(buf))
                 buf.clear()
-            break
-        if final and buf:
-            # Shorter than min_size at end of stream.
-            self._pending.append(bytes(buf))
-            buf.clear()
+            self._scan_pos = self._hash = 0
 
     # -- public ------------------------------------------------------------
 
     def update(self, data: bytes) -> Iterator[bytes]:
         """Feed data; yield any chunks completed by it."""
         self._buffer.extend(data)
-        # Only scan when there's enough data for at least one cut attempt —
-        # avoids re-hashing the window on every tiny update.
-        if len(self._buffer) >= self.min_size * 2 or len(self._buffer) >= self.max_size:
-            self._scan(final=False)
+        self._scan(final=False)
         while self._pending:
             yield self._pending.pop(0)
 

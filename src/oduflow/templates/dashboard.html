@@ -5,10 +5,10 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="preload" href="/static/source-sans-3-latin.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="preload" href="/static/source-code-pro-latin.woff2" as="font" type="font/woff2" crossorigin>
-<link rel="icon" href="/favicon.ico" sizes="16x16 32x32">
-<link rel="icon" href="/static/icon.png" type="image/png" sizes="32x32">
-<link rel="apple-touch-icon" href="/static/apple-icon.png">
-<title>Oduflow</title>
+<link rel="icon" href="/favicon.ico?v=__ASSET_VERSION__" sizes="16x16 32x32">
+<link rel="icon" href="/static/icon.png?v=__ASSET_VERSION__" type="image/png" sizes="32x32">
+<link rel="apple-touch-icon" href="/static/apple-icon.png?v=__ASSET_VERSION__">
+<title>__BRAND_NAME__</title>
 <script>
   // Resolve the active theme before first paint to avoid a flash of the wrong theme.
   // Stored mode is 'light' | 'dark' (absent = follow the OS). The effective theme is
@@ -138,8 +138,9 @@
   }
   .brand-lockup { display: flex; align-items: center; gap: 10px; }
   .brand-lockup img { height: 28px; }
-  /* Logo is a white glyph on transparent — darken it to ink on the light field */
-  :root[data-theme="light"] .brand-lockup img { filter: brightness(0); }
+  /* Logo is a white glyph on transparent — darken it to ink on the light field.
+     A white-label logo from the config dir keeps its own colors. */
+  :root[data-theme="light"] .brand-lockup img:not(.custom-logo) { filter: brightness(0); }
   .brand-copy { display: flex; flex-direction: column; gap: 1px; }
   header h1 { font-size: var(--text-xl); font-weight: 600; line-height: 1.05; }
   /* Machine artifact, so mono per The Console Voice Rule — and small enough to
@@ -157,7 +158,9 @@
     padding: 0;
     cursor: pointer;
   }
-  .brand-version:hover { color: var(--accent); border-bottom-color: var(--accent); }
+  button.brand-version:hover { color: var(--accent); border-bottom-color: var(--accent); }
+  /* White label: the version is plain text, there is no release dialog. */
+  span.brand-version { border-bottom: none; cursor: default; }
   /* Release check dialog */
   .version-rows { display: flex; flex-direction: column; gap: 6px; margin-bottom: 14px; }
   .version-row { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
@@ -393,6 +396,32 @@
     margin-bottom: 10px;
   }
   .env-meta strong { color: var(--text); font-weight: 500; font-family: var(--font-mono); font-size: var(--text-xs); }
+  /* Extra addon repos: a long list folds to two lines. The controls (filter +
+     Show all) appear only when the list really overflows (see measureExtras).
+     The clamp sits on .extras-list, while the items live in an inner
+     .extras-items wrapper that is never clamped: its height always reflects
+     the full list, which is what measureExtras reads and what the
+     ResizeObserver watches. */
+  .env-extras { font-size: var(--text-xs); color: var(--text-dim); margin-bottom: 10px; }
+  .extras-list { line-height: 1.6; overflow: hidden; }
+  .env-extras.is-clamped .extras-list { max-height: calc(2 * 1.6em); }
+  .extras-label { margin-right: 8px; }
+  .extra-item {
+    display: inline-block; vertical-align: top; max-width: 100%; margin-right: 14px;
+    color: var(--text); font-weight: 500; font-family: var(--font-mono); overflow-wrap: anywhere;
+  }
+  .extra-item[hidden] { display: none; }
+  .extra-branch { color: var(--text-dim); font-weight: 400; }
+  .extras-controls { display: none; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
+  .env-extras.has-overflow .extras-controls { display: flex; }
+  .extras-filter {
+    width: 220px; max-width: 100%; padding: 3px 8px;
+    background: var(--bg); color: var(--text); border: 1px solid var(--border);
+    border-radius: var(--radius-sm); font-family: var(--font-mono); font-size: var(--text-xs);
+  }
+  .extras-filter:focus { border-color: var(--accent); }
+  .extras-match { font-variant-numeric: tabular-nums; }
+  .extras-match.is-none { color: var(--text); font-weight: 500; }
   .repo-links { display: inline-flex; align-items: center; gap: 2px; }
   .repo-link {
     display: inline-flex;
@@ -510,6 +539,7 @@
   .btn-sync:hover, .btn-sync:focus-visible { border-color: var(--accent); color: var(--accent); background: color-mix(in oklab, var(--accent) 10%, transparent); }
   .btn-logs:hover, .btn-logs:focus-visible { border-color: var(--accent); color: var(--accent); background: color-mix(in oklab, var(--accent) 10%, transparent); }
   .btn-connect:hover, .btn-connect:focus-visible { border-color: var(--cyan); color: var(--cyan); background: color-mix(in oklab, var(--cyan) 10%, transparent); }
+  .btn-chat:hover, .btn-chat:focus-visible { border-color: var(--accent); color: var(--accent); background: color-mix(in oklab, var(--accent) 10%, transparent); }
   .btn-protect:hover, .btn-protect:focus-visible { border-color: var(--yellow); color: var(--yellow); background: color-mix(in oklab, var(--yellow) 10%, transparent); }
   .btn-create {
     background: var(--surface);
@@ -564,7 +594,12 @@
     box-sizing: border-box;
   }
   .form-group textarea { resize: vertical; }
-  #secret-json-value { font-family: var(--font-mono); }
+  #secret-json-value, #secret-key { font-family: var(--font-mono); }
+  .secret-key-row { display: flex; flex-wrap: wrap; gap: 12px; }
+  .secret-key-row > .form-group { flex: 1 1 180px; min-width: 0; margin-bottom: 0; }
+  .secret-section-action { margin-top: 10px; }
+  #secret-replace-warning { color: var(--yellow); }
+  #secret-key-result { color: var(--green); overflow-wrap: anywhere; }
   .form-group input:not([type="checkbox"]):focus, .form-group textarea:focus, .text-input:focus { border-color: var(--accent); }
   .form-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 18px; }
   .modal-body .form-actions {
@@ -699,6 +734,8 @@
   .chat-tool-status[data-status="in_progress"] { color: var(--accent); }
   .chat-tool-payload { display: grid; gap: 8px; padding: 4px 4px 10px 18px; }
   .chat-tool-payload-section { min-width: 0; }
+  .chat-tool-output { display: grid; gap: 8px; min-width: 0; }
+  .chat-tool-image { display: block; max-width: 100%; max-height: 60vh; width: auto; height: auto; object-fit: contain; object-position: left top; border-radius: var(--radius-sm); }
   .chat-tool-payload-label { margin-bottom: 3px; color: var(--text-dim); font-size: var(--text-2xs); font-weight: 600; }
   .chat-tool-payload-value { max-height: 40vh; margin: 0; overflow: auto; padding: 8px 10px; border-radius: var(--radius-sm); background: var(--terminal-bg); color: var(--terminal-text); font-family: var(--font-mono); font-size: var(--text-xs); line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
   .chat-plan { padding: 2px 4px; font-size: var(--text-xs); }
@@ -920,6 +957,7 @@
   }
   .system-bar .sys-label { font-weight: 600; color: var(--text); margin-right: 4px; }
   .system-bar .sys-val { color: var(--text); font-weight: 500; }
+  #cleanup-output { max-height: 45vh; overflow-y: auto; margin-bottom: 16px; }
   /* Dock of minimized log/console windows — a taskbar in the system bar. */
   .min-dock { display: flex; align-items: center; gap: 8px; margin-left: auto; flex-wrap: wrap; }
   .min-chip {
@@ -1060,6 +1098,26 @@
   .svc-meta a { color: var(--accent); text-decoration: none; }
   .svc-meta a:hover { text-decoration: underline; }
   .svc-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  /* Extra repo branches: chips on the card, rows in the Branches dialog. */
+  .branch-chips { display: inline-flex; flex-wrap: wrap; gap: 4px; vertical-align: middle; }
+  .branch-chip {
+    font-family: var(--font-mono); font-size: var(--text-2xs); color: var(--text);
+    border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 0 6px;
+  }
+  .xb-toolbar { display: flex; gap: 8px; align-items: center; }
+  .xb-toolbar input { flex: 1 1 auto; min-width: 0; }
+  .xb-toolbar .btn { flex: 0 0 auto; white-space: nowrap; }
+  .xb-list { max-height: 320px; overflow-y: auto; border: 1px solid var(--border); border-radius: var(--radius-sm); }
+  .xb-row {
+    display: flex; align-items: center; gap: 8px; padding: 6px 10px;
+    border-bottom: 1px solid var(--border); font-size: var(--text-sm);
+  }
+  .xb-row:last-child { border-bottom: none; }
+  label.xb-row { cursor: pointer; }
+  .xb-name { font-family: var(--font-mono); font-size: var(--text-xs); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .xb-usage { color: var(--text-dim); font-size: var(--text-xs); flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .xb-row .btn { margin-left: auto; flex: 0 0 auto; }
+  .xb-empty { padding: 10px; color: var(--text-dim); font-size: var(--text-xs); }
   .license-badge {
     position: relative;
     isolation: isolate;
@@ -1089,6 +1147,9 @@
     overflow: hidden;
     text-overflow: ellipsis;
   }
+  .license-details { display: grid; grid-template-columns: auto 1fr; gap: 0.5rem 1rem; margin: 0 0 1rem; }
+  .license-details dt { font-weight: 600; }
+  .license-details dd { margin: 0; overflow-wrap: anywhere; }
   .license-owner {
     position: relative;
     z-index: 1;
@@ -1227,6 +1288,15 @@
   .form-group input.branch-input { width: 120px; flex: 0 0 auto; padding: 2px 6px; font-size: var(--text-xs); }
   /* Long repo URLs truncate instead of scrolling the row sideways. */
   .form-group .check-item > .hint { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* The flex rules above would otherwise override the UA's
+     [hidden] { display: none } for rows the name filter hides. */
+  .form-group .check-item[hidden] { display: none; }
+  /* The name filter and default-branch picker share the Select all / Clear
+     row and stay at the compact size of its buttons. */
+  .form-group .check-list-actions input.extra-filter,
+  .form-group .check-list-actions select.extra-default-branch {
+    flex: 1 1 0; min-width: 0; width: auto; padding: 3px 8px; font-size: var(--text-xs);
+  }
   .section-subtitle { font-size: var(--text-md); font-weight: 600; margin-bottom: 10px; color: var(--text-dim); }
   .section-toggle {
     background: none; border: none; padding: 0; cursor: pointer;
@@ -1237,6 +1307,10 @@
   .modal-note { font-size: var(--text-sm); color: var(--text-dim); margin-bottom: 16px; }
   .modal-note a { color: var(--accent); }
   .mono-input { font-family: var(--font-mono); font-size: var(--text-xs); }
+  /* .form-group textarea sets font-family: inherit and outweighs a lone class
+     selector, so a monospace form textarea needs the same specificity. The
+     size stays var(--text-sm) like its sibling fields in the panel. */
+  .form-group textarea.mono-input { font-family: var(--font-mono); font-size: var(--text-sm); }
   .copy-row { display: flex; gap: 8px; align-items: stretch; }
   .copy-row input { flex: 1 1 auto; min-width: 0; }
   .guide-viewer-head { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
@@ -1283,6 +1357,7 @@
   body.scoped .env-card .select-box { display: none !important; }
   /* Hide the host metrics but keep the bar: it docks minimized consoles. */
   body.scoped .system-bar > span { display: none; }
+  body.scoped #cleanup-open { display: none; }
   .scoped-chip {
     display: inline-flex;
     align-items: center;
@@ -1347,28 +1422,30 @@
   }
 </style>
 </head>
-<body data-scoped-env="__SCOPED_ENV__" data-team-base-domain="__TEAM_BASE_DOMAIN__">
+<body data-scoped-env="__SCOPED_ENV__" data-team-base-domain="__TEAM_BASE_DOMAIN__" data-brand-name="__BRAND_NAME__" data-white-label="__WHITE_LABEL__">
 
 <header>
   <div class="brand-lockup">
-    <img src="/logo.png" alt="Oduflow logo">
+    <img src="/logo.png?v=__ASSET_VERSION__" class="__LOGO_CLASS__" alt="__BRAND_NAME__ logo">
     <div class="brand-copy">
-      <h1>Oduflow
-        <button type="button"
+      <h1>__BRAND_NAME__
+        <!--IF-STOCK--><button type="button"
                 class="brand-version"
                 id="brand-version"
                 aria-haspopup="dialog"
                 title="Check for a newer release"
-                onclick="openVersionModal()">v__ODUFLOW_VERSION__</button>
+                onclick="openVersionModal()">v__ODUFLOW_VERSION__</button><!--/IF-STOCK-->
+        <!--IF-WHITE-LABEL--><span class="brand-version" id="brand-version">v__ODUFLOW_VERSION__</span><!--/IF-WHITE-LABEL-->
       </h1>
-      <div class="brand-byline">a product by <a href="https://oduist.com" target="_blank" rel="noopener">Oduist</a></div>
+      <!--IF-STOCK--><div class="brand-byline">a product by <a href="https://oduist.com" target="_blank" rel="noopener">Oduist</a></div><!--/IF-STOCK-->
     </div>
   </div>
   <span class="scoped-chip" id="scoped-chip" hidden></span>
-  <button id="license-badge" class="license-badge" style="display:none"></button>
+  <!--IF-STOCK--><button id="license-badge" class="license-badge" style="display:none"></button><!--/IF-STOCK-->
   <div class="actions">
-    <a class="docs-link" href="https://docs.oduflow.dev" target="_blank" rel="noopener" title="Open the Oduflow documentation">Docs &#8599;</a>
-    <button type="button" class="docs-link" onclick="openFeedbackModal()" title="Report a bug, request a feature, or send feedback on GitHub">Feedback &#8599;</button>
+    <!--IF-STOCK--><a class="docs-link" href="https://docs.oduflow.dev" target="_blank" rel="noopener" title="Open the Oduflow documentation">Docs &#8599;</a>
+    <button type="button" class="docs-link" onclick="openFeedbackModal()" title="Report a bug, request a feature, or send feedback on GitHub">Feedback &#8599;</button><!--/IF-STOCK-->
+    <a class="docs-link" href="/admin" title="Edit the server configuration (oduflow.toml)" __ADMIN_LINK_HIDDEN__>Server settings</a>
     <button id="theme-toggle" type="button" onclick="cycleTheme()" aria-label="Theme"></button>
     <label class="auto-label" for="refresh-interval">Auto-refresh
       <input type="number" id="refresh-interval" value="60" min="5" step="5"
@@ -1457,6 +1534,7 @@
 
 <div id="tab-extra-addons" class="tab-content">
   <div class="tab-toolbar">
+    <button class="btn btn-sync" title="Fetch the latest changes for every repository with a remote" onclick="doPullAllExtraRepos(this)">Update all</button>
     <button class="btn-create" onclick="openAddExtraRepoModal()">+ Add Repo</button>
   </div>
   <div id="extra-repos-list"></div>
@@ -1470,7 +1548,7 @@
   <div id="credentials-list"></div>
   <div id="ssh-key-section" style="margin-top:24px;">
     <h2 class="section-subtitle">SSH deploy key</h2>
-    <div class="hint">The team's SSH public key, generated and kept by Oduflow (only the public key is shown here). Add it to your git hosting as a repository deploy key (read access is enough) or to a machine-user account, then use SSH repository URLs such as <code>git@github.com:owner/repo.git</code>. Note: GitHub allows a deploy key on one repository only — use a machine user to cover several.</div>
+    <div class="hint">The team's SSH public key, generated and kept by __BRAND_NAME__ (only the public key is shown here). Add it to your git hosting as a repository deploy key (read access is enough) or to a machine-user account, then use SSH repository URLs such as <code>git@github.com:owner/repo.git</code>. Note: GitHub allows a deploy key on one repository only — use a machine user to cover several.</div>
     <div id="ssh-key-body"></div>
   </div>
   <div id="secrets-section" style="margin-top:24px;">
@@ -1516,11 +1594,16 @@
       <div class="form-group" id="cr-from-prod-group" style="display:none">
         <label>Source production</label>
         <div class="prod-mono" id="cr-from-prod-name"></div>
-        <div class="hint">A copy of this production's database and filestore, through the managed template <code id="cr-from-prod-template"></code> (published on first use, reused afterwards). Repository, image and extra addons come from the production. The database is sanitized on creation. Refresh the copy with the production's <em>Save as template</em> action.</div>
+        <div class="hint">A copy of this production's database and filestore, through the managed template <code id="cr-from-prod-template"></code> (published on first use, reused afterwards). Repository, image and extra addons below are filled in from the production. The database is sanitized on creation. Refresh the copy with the production's <em>Save as template</em> action.</div>
       </div>
       <div class="form-group">
         <label for="cr-branch">Branch name</label>
         <input type="text" id="cr-branch" placeholder="e.g. feature/my-branch">
+      </div>
+      <div class="form-group">
+        <label for="cr-base-branch">Base branch</label>
+        <input type="text" id="cr-base-branch" placeholder="e.g. main">
+        <div class="hint">Used only when the branch above does not exist in the repository yet: it is created from this branch and pushed, so the git credential needs write access. Leave empty to require an existing branch.</div>
       </div>
       <div class="form-group">
         <label for="cr-env-name">Environment name</label>
@@ -1555,12 +1638,18 @@
         <label>Extra Addons Repos</label>
         <div class="check-list-actions">
           <button class="btn btn-sm" type="button" id="cr-extra-select-all"
-                  onclick="setAllExtraRepos('.cr-extra-cb', true)">Select all</button>
+                  onclick="setAllExtraRepos('cr-extra', true)">Select all</button>
           <button class="btn btn-sm" type="button" id="cr-extra-clear"
-                  onclick="setAllExtraRepos('.cr-extra-cb', false)">Clear</button>
+                  onclick="setAllExtraRepos('cr-extra', false)">Clear</button>
+          <input type="search" class="extra-filter" id="cr-extra-filter" placeholder="Filter by name"
+                 aria-label="Filter extra repos by name" oninput="filterExtraRepos('cr-extra')">
+          <select class="extra-default-branch" id="cr-extra-default-branch"
+                  aria-label="Fill a branch into every repo that has it"
+                  onchange="applyDefaultExtraBranch('cr-extra')"></select>
         </div>
-        <div id="cr-extra-addons-checkboxes" class="check-list"></div>
-        <div class="hint">Select repos to mount in this environment</div>
+        <div id="cr-extra-addons-checkboxes" class="check-list" onchange="updateExtraRepoStatus('cr-extra')"></div>
+        <div class="hint" id="cr-extra-status" hidden></div>
+        <div class="hint">Select repos to mount in this environment; picking a branch fills it into every repo that has it.</div>
       </div>
       <div class="form-group">
         <label for="cr-auto-install">Auto-install modules</label>
@@ -1580,7 +1669,7 @@
     </div>
   </div>
 </div>
-<div class="modal-overlay" id="feedback-modal" onclick="closeFeedbackModal(event)">
+<!--IF-STOCK--><div class="modal-overlay" id="feedback-modal" onclick="closeFeedbackModal(event)">
   <div class="modal modal-md">
     <div class="modal-header">
       <h2>Send feedback</h2>
@@ -1619,7 +1708,7 @@
       </div>
     </div>
   </div>
-</div>
+</div><!--/IF-STOCK-->
 <div class="modal-overlay" id="logs-modal" onclick="closeLogsModal(event)">
   <div class="modal">
     <div class="modal-header">
@@ -2056,11 +2145,11 @@
       <div id="import-odoo-form">
         <div class="form-group">
           <label for="import-tpl-name">Template name</label>
-          <input type="text" id="import-tpl-name" placeholder="e.g. oduist-prod">
+          <input type="text" id="import-tpl-name" placeholder="e.g. acme-prod">
           <div class="hint">Restores an Odoo.sh daily backup (database + filestore) into a new template of this name.</div>
         </div>
         <div class="form-group">
-          <div class="hint" style="margin-top:0;">Enterprise and Themes are proprietary Odoo code. Before downloading them, review your rights and obligations: <a href="https://oduflow.dev/odoo-sh-import-notes" target="_blank" rel="noopener">oduflow.dev/odoo-sh-import-notes</a> (opens in a new tab).</div>
+          <div class="hint" style="margin-top:0;">Enterprise and Themes are proprietary Odoo code. Before downloading them, review your rights and obligations<!--IF-STOCK-->: <a href="https://oduflow.dev/odoo-sh-import-notes" target="_blank" rel="noopener">oduflow.dev/odoo-sh-import-notes</a> (opens in a new tab)<!--/IF-STOCK--> under your Odoo subscription.</div>
           <div class="check-row" style="margin-top:8px;">
             <input type="checkbox" id="import-ack" onchange="onImportAckChange()" aria-controls="import-addons-options">
             <label for="import-ack">I have read the import notes and accept responsibility for the addons I download.</label>
@@ -2136,12 +2225,18 @@
           <label>Extra addons repos</label>
           <div class="check-list-actions">
             <button class="btn btn-sm" type="button" id="tset-extra-select-all"
-                    onclick="setAllExtraRepos('.tset-extra-cb', true)">Select all</button>
+                    onclick="setAllExtraRepos('tset-extra', true)">Select all</button>
             <button class="btn btn-sm" type="button" id="tset-extra-clear"
-                    onclick="setAllExtraRepos('.tset-extra-cb', false)">Clear</button>
+                    onclick="setAllExtraRepos('tset-extra', false)">Clear</button>
+            <input type="search" class="extra-filter" id="tset-extra-filter" placeholder="Filter by name"
+                   aria-label="Filter extra repos by name" oninput="filterExtraRepos('tset-extra')">
+            <select class="extra-default-branch" id="tset-extra-default-branch"
+                    aria-label="Fill a branch into every repo that has it"
+                    onchange="applyDefaultExtraBranch('tset-extra')"></select>
           </div>
-          <div id="tset-extra-addons" class="check-list"></div>
-          <div class="hint">Checked repos are mounted into environments created from this template. Each one needs a branch.</div>
+          <div id="tset-extra-addons" class="check-list" onchange="updateExtraRepoStatus('tset-extra')"></div>
+          <div class="hint" id="tset-extra-status" hidden></div>
+          <div class="hint">Checked repos are mounted into environments created from this template. Each one needs a branch; picking a branch fills it into every repo that has it.</div>
         </div>
         <div class="form-group">
           <label for="tset-auto-install">Auto-install modules</label>
@@ -2232,7 +2327,56 @@
   <span>RAM: <span class="sys-val" id="sys-ram">—</span></span>
   <span>Load: <span class="sys-val" id="sys-load">—</span></span>
   <span id="health-chips"></span>
+  <button class="btn" id="cleanup-open" onclick="openCleanupModal()">Cleanup</button>
   <div class="min-dock" id="min-dock" role="group" aria-label="Minimized windows"></div>
+</div>
+
+<div class="modal-overlay" id="extra-branches-modal" onclick="closeExtraBranchesModal(event)">
+  <div class="modal modal-md" role="dialog" aria-modal="true" aria-labelledby="xb-title">
+    <div class="modal-header">
+      <h2 id="xb-title">Branches</h2>
+      <button class="modal-close" aria-label="Close" onclick="closeExtraBranchesModal()">&times;</button>
+    </div>
+    <div class="modal-body">
+      <div class="form-error" id="xb-error"></div>
+      <div class="form-group">
+        <label for="xb-filter">Branches</label>
+        <div class="xb-toolbar">
+          <input type="text" id="xb-filter" placeholder="Filter, e.g. 17.0" autocomplete="off" oninput="renderExtraBranches()">
+          <button class="btn" id="xb-refresh" onclick="refreshExtraBranchesRemote()">Refresh list</button>
+        </div>
+        <span class="hint">Selected branches download now and are kept updated by Update. Others download when an environment first uses them. Removing a branch frees its disk space; branches in use cannot be removed.</span>
+      </div>
+      <div class="xb-list" id="xb-list"></div>
+      <div class="form-actions">
+        <button class="btn" onclick="closeExtraBranchesModal()">Close</button>
+        <button class="btn-create" id="xb-download" onclick="downloadExtraBranches()" disabled>Download selected</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="cleanup-modal" onclick="closeCleanupModal(event)">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="cleanup-title">
+    <div class="modal-header">
+      <h2 id="cleanup-title">Cleanup unused resources</h2>
+      <button class="modal-close" id="cleanup-close" aria-label="Close" onclick="closeCleanupModal()">&times;</button>
+    </div>
+    <div class="modal-body">
+      <p class="modal-note">Orphaned resources belong to this team. Docker images are shared across the server.</p>
+      <pre id="cleanup-output" tabindex="-1" aria-live="polite"></pre>
+      <div class="form-group check-row">
+        <input type="checkbox" id="cleanup-images" onchange="updateCleanupConfirm()" disabled>
+        <label for="cleanup-images">Remove unused Docker images</label>
+      </div>
+      <p class="modal-note">Images used by running or stopped containers, base images of other images, image build staging images and images requested by an operation in the last 6 hours are kept. Image sizes include shared layers; their sum is not the space that will be freed.</p>
+      <div class="form-actions">
+        <button class="btn" id="cleanup-cancel" onclick="closeCleanupModal()">Cancel</button>
+        <button class="btn" id="cleanup-scan" onclick="scanCleanup()">Scan again</button>
+        <button class="btn-create danger" id="cleanup-confirm" onclick="confirmCleanup()" disabled>Confirm</button>
+      </div>
+    </div>
+  </div>
 </div>
 
 <div class="modal-overlay" id="confirm-modal" onclick="cancelConfirm(event)">
@@ -2280,7 +2424,7 @@
       <button class="modal-close" onclick="closeSwitchBranch()">&times;</button>
     </div>
     <div class="modal-body">
-      <p class="modal-note">Reuse this environment for another branch instead of creating a new one. The database, filestore, hostname and URL are kept — only the code changes. The branch must already exist on origin; Oduflow then installs, upgrades or restarts as the difference between the two branches requires.</p>
+      <p class="modal-note">Reuse this environment for another branch instead of creating a new one. The database, filestore, hostname and URL are kept — only the code changes. The branch must already exist on origin; __BRAND_NAME__ then installs, upgrades or restarts as the difference between the two branches requires.</p>
       <div class="form-group">
         <label for="switch-branch-input">Target branch</label>
         <input id="switch-branch-input" class="mono-input" type="text" placeholder="feature/next-task"
@@ -2460,17 +2604,26 @@
     </div>
   </div>
 </div>
-<div class="modal-overlay" id="license-modal" onclick="closeLicenseModal(event)">
-  <div class="modal modal-sm">
+<!--IF-STOCK--><div class="modal-overlay" id="license-modal" onclick="closeLicenseModal(event)">
+  <div class="modal modal-sm" role="dialog" aria-modal="true" aria-labelledby="license-modal-title">
     <div class="modal-header">
-      <h2>Activate License</h2>
+      <h2 id="license-modal-title">License details</h2>
       <button class="modal-close" onclick="closeLicenseModal()">&times;</button>
     </div>
     <div class="modal-body">
+      <dl class="license-details" id="license-details"></dl>
+      <p class="modal-note" id="license-status-note"></p>
       <p class="modal-note">
-        Paste your license key below. Purchase a key at <a href="https://oduflow.dev/#pricing" target="_blank">oduflow.dev</a>
+        <a href="https://oduflow.dev/eula" target="_blank" rel="noopener noreferrer">Oduflow Commercial License Agreement</a><br>
+        <a href="https://github.com/oduflow/oduflow/blob/main/LICENSE" target="_blank" rel="noopener noreferrer">Source license: PolyForm Noncommercial 1.0.0</a>
       </p>
-      <div class="form-error" id="license-error"></div>
+      <button class="btn" id="lic-subscribe" onclick="openLicenseCheckout()" style="display:none">Subscribe annually</button>
+      <button class="btn" id="lic-refresh" onclick="refreshLicenseStatus()" style="display:none">Update license status</button>
+      <p class="modal-note" id="license-refresh-result" role="status"></p>
+      <p class="modal-note">
+        Paste your license key below. Purchase a key at <a href="https://oduflow.dev/pricing" target="_blank" rel="noopener noreferrer">oduflow.dev</a>
+      </p>
+      <div class="form-error" id="license-error" role="alert"></div>
       <div class="form-group">
         <label for="lic-key">License key</label>
         <textarea id="lic-key" rows="4" placeholder="Paste your license key here..." class="mono-input"></textarea>
@@ -2514,7 +2667,7 @@
       </div>
     </div>
   </div>
-</div>
+</div><!--/IF-STOCK-->
 <div class="modal-overlay" id="add-extra-repo-modal" onclick="closeAddExtraRepoModal(event)">
   <div class="modal modal-md">
     <div class="modal-header">
@@ -2540,12 +2693,12 @@
       <div class="form-group">
         <label>Branches</label>
         <button class="btn" id="extra-repo-load-branches" onclick="loadExtraRepoRemoteBranches()">Load branches</button>
-        <span class="hint" id="extra-repo-branches-hint">All branches are cloned by default. Load the list to pick a subset.</span>
+        <span class="hint" id="extra-repo-branches-hint">Nothing is downloaded now: each branch downloads when an environment first uses it. Load the list to download some right away.</span>
         <div id="extra-repo-branches" style="display:none; max-height: 180px; overflow-y: auto; margin-top: 8px;"></div>
       </div>
       <div class="form-actions">
         <button class="btn" onclick="closeAddExtraRepoModal()">Cancel</button>
-        <button class="btn-create" id="extra-repo-submit" onclick="submitAddExtraRepo()">Clone</button>
+        <button class="btn-create" id="extra-repo-submit" onclick="submitAddExtraRepo()">Add repository</button>
       </div>
     </div>
   </div>
@@ -2594,24 +2747,47 @@
       <div class="form-error" id="secret-error"></div>
       <div class="form-group">
         <label for="secret-name">Name</label>
-        <input type="text" id="secret-name" placeholder="openai-api-key" autocomplete="off">
+        <input type="text" id="secret-name" placeholder="openai-api-key" autocomplete="off" oninput="validateSecretValue()">
         <div class="hint">Lowercase letters, digits, dots, hyphens, underscores. Referenced from env vars as <code>KEY=secret:&lt;name&gt;</code>.</div>
       </div>
       <div class="form-group">
-        <label id="secret-value-label" for="secret-value">Value</label>
-        <input type="password" id="secret-value" autocomplete="new-password" oninput="secretDraftValue = this.value; validateSecretValue()">
-        <textarea id="secret-json-value" rows="8" hidden spellcheck="false" autocomplete="off" aria-describedby="secret-json-status" oninput="secretDraftValue = this.value; validateSecretValue()"></textarea>
-        <div class="hint" id="secret-json-status" role="status" aria-live="polite" hidden></div>
-        <div class="hint">Write-only: the stored value can be replaced here, but never read back.</div>
-      </div>
-      <div class="form-group">
         <div class="check-row">
-          <input type="checkbox" id="secret-hide-value" checked onchange="secretHidePref = this.checked; updateSecretValueMode()">
+          <input type="checkbox" id="secret-hide-value" checked onchange="updateSecretValueMode()">
           <label for="secret-hide-value">Hide value</label>
         </div>
         <div class="check-row" style="margin-top:6px;">
           <input type="checkbox" id="secret-is-json" onchange="updateSecretValueMode()">
           <label for="secret-is-json">JSON value</label>
+        </div>
+      </div>
+      <div class="form-group" id="secret-text-fields">
+        <label for="secret-value">Value</label>
+        <input type="password" id="secret-value" autocomplete="new-password" spellcheck="false" oninput="validateSecretValue()">
+        <div class="hint">Write-only: stored values are never shown here.</div>
+      </div>
+      <div id="secret-json-fields" hidden>
+        <div class="form-group">
+          <div class="secret-key-row">
+            <div class="form-group">
+              <label for="secret-key">Update Key</label>
+              <input type="text" id="secret-key" placeholder="environment.OPENROUTER_API_KEY" autocomplete="off" spellcheck="false" aria-describedby="secret-key-status" oninput="clearSecretKeyResult(); validateSecretValue()">
+            </div>
+            <div class="form-group">
+              <label for="secret-key-value">Value</label>
+              <input type="password" id="secret-key-value" autocomplete="new-password" spellcheck="false" aria-describedby="secret-key-value-hint" oninput="clearSecretKeyResult(); validateSecretValue()">
+              <div class="hint" id="secret-key-value-hint">Saved as text, without JSON quotes.</div>
+            </div>
+          </div>
+          <div class="hint" id="secret-key-status" role="status" aria-live="polite"></div>
+          <button class="btn-create secret-section-action" id="secret-update-submit" onclick="submitSecret('update')">Save key</button>
+          <div class="hint" id="secret-key-result" role="status" aria-live="polite" hidden></div>
+        </div>
+        <div class="form-group">
+          <label for="secret-json-value">Replace Data</label>
+          <textarea id="secret-json-value" rows="6" spellcheck="false" autocomplete="off" aria-describedby="secret-json-status secret-replace-warning" oninput="validateSecretValue()"></textarea>
+          <div class="hint" id="secret-json-status" role="status" aria-live="polite"></div>
+          <div class="hint" id="secret-replace-warning">Warning: saving here replaces all data in this secret. This field is always visible, even with Hide value enabled.</div>
+          <button class="btn btn-update secret-section-action" id="secret-replace-submit" onclick="submitSecret()">Replace data</button>
         </div>
       </div>
       <div class="form-actions">
@@ -2627,6 +2803,10 @@
 // server enforces the scope in oduflow/ui_scope.py; everything this flag does
 // on the page is presentation — hiding controls whose endpoints are denied.
 var SCOPED_ENV = document.body.getAttribute('data-scoped-env') || '';
+// White label (custom license): the brand replaces the product name and the
+// vendor surfaces (license, updates, docs, feedback) are not rendered at all.
+var BRAND_NAME = document.body.getAttribute('data-brand-name') || 'Oduflow';
+var WHITE_LABEL = document.body.getAttribute('data-white-label') === '1';
 // Ships with the page so the create-production modal knows the team zone
 // no matter which tab opened it; loadProductions refreshes it later.
 window._teamBaseDomain = document.body.getAttribute('data-team-base-domain') || '';
@@ -2667,7 +2847,7 @@ function scopedPagePath() {
 
 if (SCOPED_ENV) {
   document.body.classList.add('scoped');
-  document.title = 'Oduflow — ' + SCOPED_ENV;
+  document.title = BRAND_NAME + ' — ' + SCOPED_ENV;
   var _scopedChip = document.getElementById('scoped-chip');
   _scopedChip.textContent = 'Shared environment ';
   var _scopedName = document.createElement('strong');
@@ -3105,6 +3285,155 @@ async function refreshStorage(branch) {
   applyStats();
 }
 
+// Extra addon repos on an environment card. A long list folds to two lines and
+// gains a filter, so "is repo X in this environment?" is answered without
+// unfolding ninety names. The fold and filter state lives here, not in the
+// rendered HTML: the auto-refresh skip (_lastHtml) keeps working and a refresh
+// never wipes what is being typed.
+var _extrasOpen = Object.create(null);    // branch -> true while unfolded
+var _extrasFilter = Object.create(null);  // branch -> filter text
+var _extrasObserver = null;
+
+function extrasHtml(branch, extras, idx) {
+  var names = Object.keys(extras);
+  if (!names.length) return '';
+  // An item reads "name (branch)" and the whole label is searchable: a repo
+  // is looked up by name, but "which repos are still on 16.0?" is just as
+  // natural a question, and a filter that silently ignored the branch would
+  // answer it with a wrong "not included".
+  var items = names.map(function(name) {
+    var label = name + ' (' + extras[name] + ')';
+    return '<span class="extra-item" data-search="' + esc(label.toLowerCase()) + '">' + esc(name) +
+      ' <span class="extra-branch">(' + esc(extras[name]) + ')</span></span>';
+  }).join('');
+  return '<div class="env-extras" data-extras-for="' + esc(branch) + '">' +
+    '<div class="extras-list" id="extras-list-' + idx + '">' +
+      '<div class="extras-items"><span class="extras-label">Extra:</span>' + items + '</div>' +
+    '</div>' +
+    '<div class="extras-controls">' +
+      '<input type="text" class="extras-filter" placeholder="Filter repo or branch&hellip;" autocomplete="off" spellcheck="false" ' +
+        'aria-label="Filter extra addon repos of ' + esc(branch) + ' by name or branch" ' +
+        'oninput="extrasFilterInput(this)" onkeydown="extrasFilterKey(event, this)">' +
+      '<span class="extras-match" aria-live="polite"></span>' +
+      '<button type="button" class="btn btn-sm extras-toggle" aria-expanded="false" ' +
+        'aria-controls="extras-list-' + idx + '" onclick="toggleExtras(this)">Show all (' + names.length + ')</button>' +
+    '</div>' +
+  '</div>';
+}
+
+// Fold and filter state is keyed by branch, so drop the entries of branches
+// that are gone (cf. updateBulkBar): deleting an environment and recreating it
+// under the same name must not resurrect an old filter.
+function pruneExtrasState(live) {
+  var keep = Object.create(null);
+  live.forEach(function(branch) { keep[branch] = true; });
+  [_extrasOpen, _extrasFilter].forEach(function(store) {
+    Object.keys(store).forEach(function(branch) {
+      if (!keep[branch]) delete store[branch];
+    });
+  });
+}
+
+// Wire every extras block under root to its stored state. A ResizeObserver
+// re-measures on window resizes and when a hidden tab becomes visible (a
+// display:none list has no height to measure). It watches the unclamped
+// .extras-items wrapper, not the clamped .extras-list: the clamp pins that
+// box, so growth after the first measurement — a web font swapping in and
+// pushing two lines to three — would otherwise go unnoticed and leave the
+// third line clipped with no "Show all" to reveal it.
+function applyExtras(root) {
+  if (!_extrasObserver && typeof ResizeObserver !== 'undefined') {
+    _extrasObserver = new ResizeObserver(function(entries) {
+      entries.forEach(function(entry) {
+        var box = entry.target.closest('.env-extras');
+        if (box) measureExtras(box);
+      });
+    });
+  }
+  if (_extrasObserver) _extrasObserver.disconnect();
+  var live = [];
+  root.querySelectorAll('.env-extras').forEach(function(box) {
+    live.push(box.getAttribute('data-extras-for'));
+  });
+  pruneExtrasState(live);
+  root.querySelectorAll('.env-extras').forEach(function(box) {
+    applyExtrasState(box);
+    if (_extrasObserver) _extrasObserver.observe(box.querySelector('.extras-items'));
+  });
+}
+
+function _extrasQuery(branch) {
+  return (_extrasFilter[branch] || '').trim().toLowerCase();
+}
+
+function applyExtrasState(box) {
+  var branch = box.getAttribute('data-extras-for');
+  var input = box.querySelector('.extras-filter');
+  var toggle = box.querySelector('.extras-toggle');
+  var match = box.querySelector('.extras-match');
+  var items = box.querySelectorAll('.extra-item');
+  var query = _extrasQuery(branch);
+  var open = !!_extrasOpen[branch];
+  var text = _extrasFilter[branch] || '';
+  if (input.value !== text) input.value = text;
+
+  var shown = 0;
+  items.forEach(function(item) {
+    var hit = !query || item.getAttribute('data-search').indexOf(query) !== -1;
+    item.hidden = !hit;
+    if (hit) shown++;
+  });
+  box.querySelector('.extras-list').hidden = shown === 0;
+  // Matches are always shown in full: the fold must not hide the answer.
+  box.classList.toggle('is-clamped', !open && !query);
+
+  match.textContent = !query ? '' : shown ? shown + ' of ' + items.length : 'No match — not included';
+  match.classList.toggle('is-none', !!query && shown === 0);
+  // Folding has no visible effect while a filter is active.
+  toggle.hidden = !!query;
+  toggle.textContent = open ? 'Collapse' : 'Show all (' + items.length + ')';
+  toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+  measureExtras(box);
+}
+
+// Controls appear only when the full list is taller than the two-line fold.
+function measureExtras(box) {
+  // While filtering, the list height reflects the matches, not the full list;
+  // keep the controls so the filter can be cleared.
+  if (_extrasQuery(box.getAttribute('data-extras-for'))) {
+    box.classList.add('has-overflow');
+    return;
+  }
+  // The wrapper is never clamped, so its height is the full list's height.
+  var items = box.querySelector('.extras-items');
+  if (!items.getClientRects().length) return;  // hidden tab: keep the last verdict
+  var lineHeight = parseFloat(getComputedStyle(items).lineHeight) || 0;
+  box.classList.toggle('has-overflow', items.scrollHeight > 2 * lineHeight + 1);
+}
+
+function extrasFilterInput(input) {
+  var box = input.closest('.env-extras');
+  _extrasFilter[box.getAttribute('data-extras-for')] = input.value;
+  applyExtrasState(box);
+}
+
+function extrasFilterKey(e, input) {
+  // Escape clears a non-empty filter; on an empty one it falls through to the
+  // global handler (close menus / modals).
+  if (e.key !== 'Escape' || !input.value) return;
+  e.preventDefault();
+  e.stopPropagation();
+  input.value = '';
+  extrasFilterInput(input);
+}
+
+function toggleExtras(btn) {
+  var box = btn.closest('.env-extras');
+  var branch = box.getAttribute('data-extras-for');
+  _extrasOpen[branch] = !_extrasOpen[branch];
+  applyExtrasState(box);
+}
+
 function renderEnvironments(envs, force) {
   const el = document.getElementById('env-list');
   if (!envs || envs.length === 0) {
@@ -3171,13 +3500,9 @@ function renderEnvironments(envs, force) {
         '</div>'
       : '';
 
-    var extraHtml = '';
-    if (env.extra_addons && typeof env.extra_addons === 'object' && Object.keys(env.extra_addons).length > 0) {
-      var parts = Object.entries(env.extra_addons).map(function(e) {
-        return esc(e[0]) + ' <span style="color:var(--text-dim);">(' + esc(e[1]) + ')</span>';
-      });
-      extraHtml = '<div class="env-meta"><span>Extra: <strong>' + parts.join(', ') + '</strong></span></div>';
-    }
+    var extraHtml = (env.extra_addons && typeof env.extra_addons === 'object')
+      ? extrasHtml(env.branch, env.extra_addons, idx)
+      : '';
 
     // Agent actions are a hosting feature: hidden when the team's agent is
     // disabled, and pointless for live-mount environments (the developer has
@@ -3217,6 +3542,9 @@ function renderEnvironments(envs, force) {
         '<div class="env-actions">' +
           '<button class="btn btn-connect" title="Log in as a user without a password: mint a session and get the cookie + URL" onclick="openConnect(\'' + escAttr(env.branch) + '\')" ' + dis +
             (allStopped ? 'disabled' : '') + '>Connect As</button>' +
+          (showAgent
+            ? '<button class="btn btn-chat" title="Structured chat with the coding agent for this environment" onclick="openChat(\'' + escAttr(env.branch) + '\')">Agent Chat</button>'
+            : '') +
           '<button class="btn btn-sync" title="Pull code changes and apply: install, upgrade or restart as needed" onclick="doAction(\'' + escAttr(env.branch) + '\',\'sync\')" ' + dis +
             (allStopped ? 'disabled' : '') + '>Sync</button>' +
           '<button class="btn btn-logs" onclick="showLogs(\'' + escAttr(env.branch) + '\')">Logs</button>' +
@@ -3230,9 +3558,6 @@ function renderEnvironments(envs, force) {
             '<button class="btn btn-more" onclick="toggleMenu(event)" aria-haspopup="menu" aria-expanded="false">More &#9662;</button>' +
             '<div class="menu" role="menu">' +
               '<button role="menuitem" title="Environment variables of the Odoo container" onclick="showEnvInfo(\'' + escAttr(env.branch) + '\')">Info</button>' +
-              (showAgent
-                ? '<button role="menuitem" title="Structured chat with the coding agent for this environment" onclick="openChat(\'' + escAttr(env.branch) + '\')">Agent Chat</button>'
-                : '') +
               '<button role="menuitem" title="Shell inside the Odoo container" onclick="openConsole(\'' + escAttr(env.branch) + '\')" ' +
                 (allStopped ? 'disabled' : '') + '>Open console</button>' +
               '<button role="menuitem" title="psql session on the environment database" onclick="openSqlConsole(\'' + escAttr(env.branch) + '\')" ' +
@@ -3301,9 +3626,25 @@ function renderEnvironments(envs, force) {
     applyStats();
     return;
   }
+  // A refresh that lands while someone is typing in an extras filter must not
+  // steal the caret: remember it and put it back on the re-rendered input.
+  var ae = document.activeElement;
+  var refocus = (ae && ae.classList && ae.classList.contains('extras-filter') && el.contains(ae))
+    ? { branch: ae.closest('.env-extras').getAttribute('data-extras-for'),
+        start: ae.selectionStart, end: ae.selectionEnd }
+    : null;
   el._lastHtml = html;
   el.innerHTML = html;
   applyStats();
+  applyExtras(el);
+  if (refocus) {
+    el.querySelectorAll('.env-extras').forEach(function(box) {
+      if (box.getAttribute('data-extras-for') !== refocus.branch) return;
+      var input = box.querySelector('.extras-filter');
+      input.focus();
+      input.setSelectionRange(refocus.start, refocus.end);
+    });
+  }
 
   // A state change between renders gets one visible pulse in its signal
   // color: the moment "it came up" (or went down) should be felt, not hunted.
@@ -3905,6 +4246,126 @@ async function loadEnvironments(force) {
     }
   } catch (e) {
     showToast('Connection error: ' + e.message, true);
+  }
+}
+
+var cleanupPreview = null;
+var cleanupBusy = false;
+var cleanupGroups = [
+  ['orphan_databases', 'Databases'],
+  ['orphan_workspaces', 'Workspaces'],
+  ['orphan_ports', 'Port registry entries'],
+  ['orphan_roles', 'PostgreSQL roles']
+];
+
+function cleanupCount(result) {
+  return cleanupGroups.reduce(function(n, group) { return n + (result[group[0]] || []).length; }, 0);
+}
+
+function updateCleanupConfirm() {
+  var images = document.getElementById('cleanup-images');
+  images.disabled = cleanupBusy || !cleanupPreview || !cleanupPreview.images.length;
+  document.getElementById('cleanup-confirm').disabled = cleanupBusy || !cleanupPreview ||
+    !(cleanupCount(cleanupPreview) || (images.checked && cleanupPreview.images.length));
+}
+
+function setCleanupBusy(busy, applying) {
+  cleanupBusy = busy;
+  ['cleanup-close', 'cleanup-cancel', 'cleanup-scan'].forEach(function(id) {
+    document.getElementById(id).disabled = busy;
+  });
+  document.getElementById('cleanup-scan').textContent = busy && !applying ? 'Scanning…' : 'Scan again';
+  document.getElementById('cleanup-confirm').textContent = busy && applying ? 'Cleaning…' : 'Confirm';
+  document.getElementById('cleanup-output').setAttribute('aria-busy', String(busy));
+  updateCleanupConfirm();
+}
+
+function renderCleanup(result) {
+  var lines = [result.dry_run ? '[DRY RUN] Orphaned resources:' : '[CLEANUP] Removed resources:'];
+  cleanupGroups.forEach(function(group) {
+    var names = result[group[0]] || [];
+    if (!names.length) return;
+    lines.push('  ' + group[1] + ' (' + names.length + '):');
+    names.forEach(function(name) { lines.push('    - ' + name); });
+  });
+  var count = cleanupCount(result);
+  lines.push(count ? '\n' + count + ' resource(s) ' + (result.dry_run ? 'would be removed.' : 'removed.') :
+    (result.dry_run ? 'No orphaned resources found.' : 'No orphaned resources removed.'));
+  if (result.dry_run) {
+    lines.push('\nUnused Docker images (' + result.images.length + '):');
+    result.images.forEach(function(image) {
+      lines.push('  ' + (image.tags.length ? image.tags.join(', ') : '<untagged>') + ' — ' + fmtBytes(image.size_bytes));
+      lines.push('    ' + image.id);
+    });
+    if (!result.images.length) lines.push('  No unused images found.');
+    else lines.push('Select "Remove unused Docker images" to include these images.');
+  } else {
+    lines.push('\nDocker images removed (' + result.images.removed.length + '):');
+    result.images.removed.forEach(function(id) { lines.push('  ' + id); });
+    result.images.skipped.forEach(function(item) { lines.push('Skipped ' + item.id + ': ' + item.reason); });
+    result.images.errors.forEach(function(item) { lines.push('Error ' + item.id + ': ' + item.reason); });
+  }
+  (result.errors || []).forEach(function(error) { lines.push('Error: ' + error); });
+  document.getElementById('cleanup-output').textContent = lines.join('\n');
+}
+
+function openCleanupModal() {
+  if (SCOPED_ENV || cleanupBusy) return;
+  showModal('cleanup-modal');
+  document.getElementById('cleanup-output').focus();
+  scanCleanup();
+}
+
+function closeCleanupModal(event) {
+  if (cleanupBusy || (event && event.target !== event.currentTarget)) return;
+  hideModal('cleanup-modal');
+}
+
+async function scanCleanup() {
+  if (cleanupBusy) return;
+  cleanupPreview = null;
+  document.getElementById('cleanup-images').checked = false;
+  document.getElementById('cleanup-cancel').textContent = 'Cancel';
+  document.getElementById('cleanup-output').textContent = 'Scanning orphaned resources and unused Docker images…';
+  setCleanupBusy(true, false);
+  try {
+    var response = await fetch('/api/cleanup', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ force: false })
+    });
+    var data = await readResult(response);
+    if (!data.ok) throw new Error(data.error || 'Scan failed.');
+    cleanupPreview = data.result;
+    renderCleanup(data.result);
+  } catch (e) {
+    document.getElementById('cleanup-output').textContent = 'Error: ' + e.message;
+  } finally {
+    setCleanupBusy(false, false);
+  }
+}
+
+async function confirmCleanup() {
+  if (cleanupBusy || !cleanupPreview || document.getElementById('cleanup-confirm').disabled) return;
+  var imageIds = document.getElementById('cleanup-images').checked ? cleanupPreview.images.map(function(image) { return image.id; }) : [];
+  // Send the reviewed names: the server removes only these, and only if still orphaned.
+  var orphans = {};
+  cleanupGroups.forEach(function(group) { orphans[group[0]] = cleanupPreview[group[0]] || []; });
+  setCleanupBusy(true, true);
+  try {
+    var response = await fetch('/api/cleanup', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ force: true, orphans: orphans, image_ids: imageIds })
+    });
+    var data = await readResult(response);
+    if (!data.ok) throw new Error(data.error || 'Cleanup failed.');
+    renderCleanup(data.result);
+  } catch (e) {
+    document.getElementById('cleanup-output').textContent = 'Error: ' + e.message + '\nScan again to see remaining resources.';
+  } finally {
+    cleanupPreview = null;
+    setCleanupBusy(false, false);
+    document.getElementById('cleanup-cancel').textContent = 'Close';
+    loadEnvironments();
+    loadStats();
   }
 }
 
@@ -4824,17 +5285,116 @@ function _tsetBranchOptions(branches) {
 }
 
 // The create-environment modal and the template settings form both render the
-// extra addon repos as a plain checkbox list, so one pair of helpers drives
-// either of them. Ticking every repo still leaves each branch to be filled in:
-// a repo without a branch cannot be mounted, and only the user knows which one.
-function setAllExtraRepos(selector, checked) {
-  document.querySelectorAll(selector).forEach(function(cb) { cb.checked = checked; });
+// extra addon repos as a plain checkbox list, so one set of helpers drives
+// either of them, addressed by the id prefix shared by all of its controls.
+var EXTRA_REPO_PICKERS = {
+  'cr-extra': {list: 'cr-extra-addons-checkboxes', checkbox: '.cr-extra-cb'},
+  'tset-extra': {list: 'tset-extra-addons', checkbox: '.tset-extra-cb'}
+};
+
+function _extraRepoRows(prefix) {
+  var list = document.getElementById(EXTRA_REPO_PICKERS[prefix].list);
+  return list ? Array.prototype.slice.call(list.querySelectorAll('.check-item')) : [];
+}
+
+// Ticking every repo still leaves each branch to be filled in: a repo without
+// a branch cannot be mounted, and only the user knows which one. While the name
+// filter is active only the rows still on screen are affected, so the status
+// line reports whatever selection the filter is hiding.
+function setAllExtraRepos(prefix, checked) {
+  document.querySelectorAll(EXTRA_REPO_PICKERS[prefix].checkbox).forEach(function(cb) {
+    if (!cb.closest('.check-item').hidden) cb.checked = checked;
+  });
+  updateExtraRepoStatus(prefix);
 }
 
 function setExtraRepoActionsEnabled(prefix, enabled) {
-  ['-select-all', '-clear'].forEach(function(suffix) {
-    var button = document.getElementById(prefix + suffix);
-    if (button) button.disabled = !enabled;
+  ['-select-all', '-clear', '-filter', '-default-branch'].forEach(function(suffix) {
+    var control = document.getElementById(prefix + suffix);
+    if (control) control.disabled = !enabled;
+  });
+}
+
+// Branch names a repo can be mounted at, without remote prefixes.
+function extraRepoBranchNames(r) {
+  return _tsetBranchOptions(extraRepoBranchChoices(r));
+}
+
+// A hidden row is still submitted and still mounted, so a selection the filter
+// hides has to be stated as a count: otherwise Clear looks like it emptied a
+// list that in fact still carries repos.
+function updateExtraRepoStatus(prefix) {
+  var rows = _extraRepoRows(prefix);
+  var hiddenRows = rows.filter(function(row) { return row.hidden; });
+  var hiddenChecked = hiddenRows.filter(function(row) {
+    var cb = row.querySelector('input[type="checkbox"]');
+    return cb && cb.checked;
+  }).length;
+  var parts = [];
+  if (rows.length && hiddenRows.length === rows.length) {
+    parts.push('No repos match the filter.');
+  }
+  if (hiddenChecked) {
+    parts.push(hiddenChecked + (hiddenChecked === 1 ? ' selected repo is' : ' selected repos are') +
+      ' hidden by the filter and still mounted; Select all and Clear only touch visible rows.');
+  }
+  var status = document.getElementById(prefix + '-status');
+  status.textContent = parts.join(' ');
+  status.hidden = parts.length === 0;
+}
+
+// Matches the repo name and URL, i.e. the row's visible text.
+function filterExtraRepos(prefix) {
+  var query = document.getElementById(prefix + '-filter').value.trim().toLowerCase();
+  _extraRepoRows(prefix).forEach(function(row) {
+    row.hidden = !!query && row.textContent.toLowerCase().indexOf(query) === -1;
+  });
+  updateExtraRepoStatus(prefix);
+}
+
+// Drops the filter so every row is back on screen. Used whenever something
+// other than the filter decides which rows matter: a template's own picks, or
+// a validation error naming repos the user has to reach.
+function revealExtraRepos(prefix) {
+  document.getElementById(prefix + '-filter').value = '';
+  filterExtraRepos(prefix);
+}
+
+// Offers every branch any registered repo has, with how many repos carry it.
+// Called once the rows are rendered, so it also clears the previous filter.
+function initExtraRepoTools(prefix) {
+  var counts = Object.create(null);
+  (cachedExtraRepos || []).forEach(function(r) {
+    extraRepoBranchNames(r).forEach(function(b) { counts[b] = (counts[b] || 0) + 1; });
+  });
+  var html = '<option value="">Set branch…</option>';
+  Object.keys(counts).sort(function(a, b) {
+    return a.localeCompare(b, undefined, {numeric: true});
+  }).forEach(function(b) {
+    html += '<option value="' + escHtmlAttr(b) + '">' + esc(b) +
+      ' (' + counts[b] + (counts[b] === 1 ? ' repo' : ' repos') + ')</option>';
+  });
+  document.getElementById(prefix + '-default-branch').innerHTML = html;
+  revealExtraRepos(prefix);
+}
+
+// Fills the chosen branch into every repo that has it, filtered out or not.
+// Ticking stays manual: a branch existing in a repo does not mean the repo
+// should be mounted. The control then snaps back to its placeholder, so it
+// reads as a one-shot action and the same branch can be applied again after a
+// row was edited by hand (re-picking a kept selection fires no change event).
+function applyDefaultExtraBranch(prefix) {
+  var picker = document.getElementById(prefix + '-default-branch');
+  var branch = picker.value;
+  picker.value = '';
+  if (!branch) return;
+  var repos = Object.create(null);
+  (cachedExtraRepos || []).forEach(function(r) { repos[r.name] = r; });
+  _extraRepoRows(prefix).forEach(function(row) {
+    var repo = repos[row.querySelector('input[type="checkbox"]').value];
+    if (repo && extraRepoBranchNames(repo).indexOf(branch) !== -1) {
+      row.querySelector('.branch-input').value = branch;
+    }
   });
 }
 
@@ -4865,7 +5425,7 @@ function _tsetRenderExtraAddons(extras) {
   var known = Object.create(null);
   var rows = repos.map(function(r, i) {
     known[r.name] = true;
-    return _tsetExtraRow(r.name, r.repo_url, r.branches, extras, i, false);
+    return _tsetExtraRow(r.name, r.repo_url, extraRepoBranchChoices(r), extras, i, false);
   });
   Object.keys(extras).forEach(function(name, i) {
     if (!known[name]) rows.push(_tsetExtraRow(name, '', [], extras, 'x' + i, true));
@@ -4874,6 +5434,7 @@ function _tsetRenderExtraAddons(extras) {
     ? rows.join('')
     : '<span class="hint" style="margin-top:0;">No extra repos available</span>';
   setExtraRepoActionsEnabled('tset-extra', rows.length > 0);
+  initExtraRepoTools('tset-extra');
 }
 
 function _tsetRenderCredentials(current) {
@@ -4948,6 +5509,8 @@ function _tsetCollectForm() {
     else { extras[repoName] = branch; }
   });
   if (missingBranch.length) {
+    // The error names repos by name, so none of them may be filtered out.
+    revealExtraRepos('tset-extra');
     errEl.textContent = 'Branch is required for extra addon(s): ' + missingBranch.join(', ') + '.';
     errEl.style.display = 'block';
     return null;
@@ -5373,16 +5936,33 @@ function populateTemplateSelect() {
       if (tpl.auto_install_modules && !document.getElementById('cr-auto-install').value.trim()) {
         document.getElementById('cr-auto-install').value = tpl.auto_install_modules;
       }
+      setCreateBaseBranch(tpl.source_branch);
       var tplExtras = tpl.extra_addons || {};
       document.querySelectorAll('.cr-extra-cb').forEach(function(cb) {
         cb.checked = cb.value in tplExtras;
         var brInput = document.querySelector('.cr-extra-branch-input[data-repo="' + cb.value + '"]');
         if (brInput) brInput.value = tplExtras[cb.value] || '';
       });
+      // The template just decided the whole selection (replacing whatever a
+      // branch was filled into); a filter left over from the previous one must
+      // not keep its picks off screen.
+      revealExtraRepos('cr-extra');
     }
     fillCreateTemplateEnvVars(tpl);
   };
-  fillCreateTemplateEnvVars(cachedTemplates.find(function(t) { return t.template_name === sel.value; }));
+  // A production source hides the picker, so nothing from a template applies:
+  // the first template's env vars or branch would belong to unrelated data.
+  if (_createFromProduction) return;
+  var initial = cachedTemplates.find(function(t) { return t.template_name === sel.value; });
+  fillCreateTemplateEnvVars(initial);
+  if (initial) setCreateBaseBranch(initial.source_branch);
+}
+
+// A new branch starts from the code its database snapshot was taken from (a
+// template's source branch, a production's branch). Only a known branch
+// replaces the field, so a template without one keeps what the user typed.
+function setCreateBaseBranch(branch) {
+  if (branch) document.getElementById('cr-base-branch').value = branch;
 }
 
 function openCreateFromTemplate(templateName) {
@@ -5394,6 +5974,7 @@ function openCreateFromTemplate(templateName) {
   document.getElementById('cr-repo').value = tpl && tpl.repo_url ? tpl.repo_url : '';
   document.getElementById('cr-image').value = tpl && tpl.odoo_image ? tpl.odoo_image : '';
   document.getElementById('cr-auto-install').value = tpl && tpl.auto_install_modules ? tpl.auto_install_modules : '';
+  document.getElementById('cr-base-branch').value = tpl && tpl.source_branch ? tpl.source_branch : '';
   fillCreateTemplateEnvVars(tpl);
   var errEl = document.getElementById('create-error');
   errEl.style.display = 'none';
@@ -5403,7 +5984,10 @@ function openCreateFromTemplate(templateName) {
     populateTemplateSelect();
     var sel = document.getElementById('cr-template');
     sel.value = templateName;
-    fillCreateTemplateEnvVars(cachedTemplates.find(function(t) { return t.template_name === templateName; }) || tpl);
+    var fresh = cachedTemplates.find(function(t) { return t.template_name === templateName; }) || tpl;
+    fillCreateTemplateEnvVars(fresh);
+    // Assigned outright: populateTemplateSelect() filled the first template's.
+    document.getElementById('cr-base-branch').value = fresh && fresh.source_branch ? fresh.source_branch : '';
   });
   loadCredentials().then(function() {
     var sel = document.getElementById('cr-git-user');
@@ -5421,6 +6005,7 @@ function openCreateFromTemplate(templateName) {
     if (cachedExtraRepos.length === 0) {
       container.innerHTML = '<span class="hint" style="margin-top:0;">No extra repos available</span>';
       setExtraRepoActionsEnabled('cr-extra', false);
+      initExtraRepoTools('cr-extra');
       return;
     }
     var tplExtras = (tpl && tpl.extra_addons) ? tpl.extra_addons : {};
@@ -5437,6 +6022,7 @@ function openCreateFromTemplate(templateName) {
       '</label>';
     }).join('');
     setExtraRepoActionsEnabled('cr-extra', true);
+    initExtraRepoTools('cr-extra');
   });
   showModal('create-modal');
   document.getElementById('cr-branch').focus();
@@ -5459,11 +6045,18 @@ function setCreateSourceProduction(name) {
 
 function openCreateModal(fromProduction) {
   setCreateSourceProduction(fromProduction);
+  // A production supplies the code origin: show its repository, image, git
+  // credential, extra addons and branch so they can be checked (or changed)
+  // before the copy is made, the same way a template card pre-fills them.
+  var prod = fromProduction
+    ? cachedProds.find(function(p) { return p.name === fromProduction; })
+    : null;
   document.getElementById('cr-branch').value = '';
   document.getElementById('cr-env-name').value = '';
   document.getElementById('cr-hostname').value = '';
-  document.getElementById('cr-repo').value = '';
-  document.getElementById('cr-image').value = '';
+  document.getElementById('cr-repo').value = prod && prod.repo_url ? prod.repo_url : '';
+  document.getElementById('cr-image').value = prod && prod.odoo_image ? prod.odoo_image : '';
+  document.getElementById('cr-base-branch').value = prod && prod.branch ? prod.branch : '';
   document.getElementById('cr-auto-install').value = '';
   document.getElementById('cr-env-vars').value = '';
   document.getElementById('cr-env-vars-hint').textContent = CREATE_ENV_HINT;
@@ -5479,6 +6072,7 @@ function openCreateModal(fromProduction) {
     (cachedCredentials || []).forEach(function(c) {
       sel.innerHTML += '<option value="' + escAttr(c.username) + '">' + esc(c.username) + ' (' + esc(c.host) + ')</option>';
     });
+    if (prod && prod.git_user) sel.value = prod.git_user;
   });
   // The repo list arrives asynchronously; until it does there is nothing to
   // tick, and a stale state from the previous opening would be misleading.
@@ -5488,18 +6082,23 @@ function openCreateModal(fromProduction) {
     if (cachedExtraRepos.length === 0) {
       container.innerHTML = '<span class="hint" style="margin-top:0;">No extra repos available</span>';
       setExtraRepoActionsEnabled('cr-extra', false);
+      initExtraRepoTools('cr-extra');
       return;
     }
+    var prodExtras = (prod && prod.extra_addons) ? prod.extra_addons : {};
     container.innerHTML = cachedExtraRepos.map(function(r) {
+      var checked = (r.name in prodExtras) ? ' checked' : '';
       return '<label class="check-item">' +
-        '<input type="checkbox" class="cr-extra-cb" value="' + escAttr(r.name) + '">' +
+        '<input type="checkbox" class="cr-extra-cb" value="' + escAttr(r.name) + '"' + checked + '>' +
         esc(r.name) + ' <span class="hint" style="margin-top:0;">(' + esc(r.repo_url) + ')</span>' +
         '<input type="text" class="cr-extra-branch-input branch-input" data-repo="' + escAttr(r.name) + '"' +
-        ' placeholder="branch" value="" list="extra-branches-' + escAttr(r.name) + '">' +
+        ' placeholder="branch" value="' + escAttr(prodExtras[r.name] || '') + '"' +
+        ' list="extra-branches-' + escAttr(r.name) + '">' +
         extraRepoBranchDatalist(r) +
       '</label>';
     }).join('');
     setExtraRepoActionsEnabled('cr-extra', true);
+    initExtraRepoTools('cr-extra');
   });
   showModal('create-modal');
   document.getElementById('cr-branch').focus();
@@ -5575,6 +6174,7 @@ async function submitFeedback() {
 
 async function submitCreate() {
   var branch = document.getElementById('cr-branch').value.trim();
+  var baseBranch = document.getElementById('cr-base-branch').value.trim();
   var envName = document.getElementById('cr-env-name').value.trim();
   var hostname = document.getElementById('cr-hostname').value.trim();
   var repo = document.getElementById('cr-repo').value.trim();
@@ -5607,6 +6207,8 @@ async function submitCreate() {
       else { extraAddonsObj[repoName] = br; }
     });
     if (missingBranch.length) {
+      // The error names repos by name, so none of them may be filtered out.
+      revealExtraRepos('cr-extra');
       errEl.textContent = 'Branch is required for extra addon(s): ' + missingBranch.join(', ') + '.';
       errEl.style.display = 'block';
       btn.disabled = false;
@@ -5615,6 +6217,7 @@ async function submitCreate() {
     }
     var payload = {
       branch: branch,
+      base_branch: baseBranch,
       env_name: envName,
       hostname: hostname,
       repo_url: repo,
@@ -5636,9 +6239,13 @@ async function submitCreate() {
     var data = await readResult(r);
     if (r.ok && data.ok) {
       closeCreateModal();
+      var createdFrom = data.result && data.result.branch_created_from;
       showToast('Environment "' + (envName || branch) + '" created' +
         (data.from_production
           ? ' from production "' + data.from_production + '" (template "' + data.template_name + '")'
+          : '') +
+        (createdFrom
+          ? '; new branch "' + branch + '" pushed from "' + createdFrom + '"'
           : ''));
       await Promise.all([
         data.from_production ? loadTemplates() : Promise.resolve(),
@@ -6855,6 +7462,7 @@ function closeGuideViewer() {
 
 // --- License ---
 const API_LICENSE = '/api/license';
+let currentLicense = null;
 
 async function loadLicense() {
   try {
@@ -6862,9 +7470,11 @@ async function loadLicense() {
     var data = await readResult(r);
     if (!data.ok) return;
     var lic = data.license;
+    currentLicense = lic;
     var badge = document.getElementById('license-badge');
+    if (!badge) return;
     var label = document.createElement('span');
-    var isLicensed = lic.type !== 'unlicensed';
+    var isLicensed = lic.status === 'active';
     var shouldReveal = isLicensed && badge.dataset.licenseRevealed !== 'true';
     label.className = 'license-badge-text';
     if (isLicensed) {
@@ -6882,7 +7492,7 @@ async function loadLicense() {
       label.textContent = lic.label;
     }
     badge.replaceChildren(label);
-    badge.className = 'license-badge license-' + lic.type + (isLicensed ? ' license-active' : '') + (shouldReveal ? ' license-reveal' : '');
+    badge.className = 'license-badge license-' + (lic.status === 'expired' || lic.status === 'not_yet_valid' ? 'unlicensed' : lic.type) + (isLicensed ? ' license-active' : '') + (shouldReveal ? ' license-reveal' : '');
     if (shouldReveal) {
       badge.dataset.licenseRevealed = 'true';
     }
@@ -6908,19 +7518,86 @@ async function loadLicense() {
         }
       }
     } else {
-      badge.style.cursor = 'default';
-      badge.onclick = null;
-      badge.title = '';
+      badge.style.cursor = 'pointer';
+      badge.onclick = openLicenseModal;
+      badge.title = 'View license details and validity period';
     }
   } catch (e) {}
 }
 
 function openLicenseModal() {
+  renderLicenseDetails();
+  document.getElementById('license-refresh-result').textContent = '';
   document.getElementById('license-error').style.display = 'none';
   document.getElementById('lic-key').value = '';
   document.getElementById('lic-submit').disabled = false;
   document.getElementById('lic-submit').textContent = 'Activate';
   showModal('license-modal');
+}
+
+function renderLicenseDetails() {
+  var lic = currentLicense || {type: 'unlicensed', status: 'unlicensed'};
+  var details = document.getElementById('license-details');
+  details.replaceChildren();
+  function row(title, value) {
+    var dt = document.createElement('dt'); dt.textContent = title;
+    var dd = document.createElement('dd'); dd.textContent = value;
+    details.append(dt, dd);
+  }
+  row('Status', {active: 'Active', expired: 'Expired', unlicensed: 'No commercial license', not_yet_valid: 'Not yet valid'}[lic.status] || lic.status);
+  if (lic.name) row('Licensed to', lic.name);
+  if (lic.type === 'business') row('Use rights', 'Company internal use only');
+  if (lic.plan) row('Plan', lic.plan.charAt(0).toUpperCase() + lic.plan.slice(1));
+  if (lic.email) row('Email', lic.email);
+  if (lic.valid_from) row('Valid from', new Date(lic.valid_from).toLocaleString());
+  if (lic.expires) row('Paid through', new Date(lic.expires).toLocaleString());
+  else if (lic.perpetual) row('Term', 'Perpetual (legacy license)');
+  document.getElementById('lic-refresh').style.display = lic.can_refresh ? '' : 'none';
+  // Shown only after the license server said a new subscription is needed;
+  // how payments work is the license server's business.
+  document.getElementById('lic-subscribe').style.display = lic.subscription_required ? '' : 'none';
+  document.getElementById('license-status-note').textContent = lic.status === 'expired'
+    ? 'Your commercial license has expired. All features remain available. Update the status after payment to install the renewed license.'
+    : 'License status does not restrict product features. Subscription checks run only when you request them.';
+}
+
+async function refreshLicenseStatus() {
+  var button = document.getElementById('lic-refresh');
+  var result = document.getElementById('license-refresh-result');
+  button.disabled = true;
+  button.textContent = 'Checking subscription...';
+  result.textContent = '';
+  try {
+    var response = await fetch(API_LICENSE + '/refresh', {method: 'POST'});
+    var data = await readResult(response);
+    if (!data.ok) throw new Error(data.error || 'Unable to update the license');
+    await loadLicense();
+    if (currentLicense) currentLicense.subscription_required = !!data.subscription_required;
+    renderLicenseDetails();
+    result.textContent = data.renewed
+      ? 'License updated. The current commercial period is installed.'
+      : data.subscription_required
+        ? 'No active subscription. Subscribe to continue the commercial license.'
+        : 'No newer paid period is available. Check your payment or contact support.';
+  } catch (e) {
+    result.textContent = e.message || 'Unable to check the subscription. Please retry.';
+  } finally {
+    button.disabled = false;
+    button.textContent = 'Update license status';
+  }
+}
+
+async function openLicenseCheckout() {
+  var button = document.getElementById('lic-subscribe');
+  button.disabled = true;
+  try {
+    var response = await fetch(API_LICENSE + '/checkout', {method: 'POST'});
+    var data = await readResult(response);
+    if (!data.ok) throw new Error(data.error || 'Unable to open checkout');
+    window.location.assign(data.checkout_url);
+  } catch (e) {
+    document.getElementById('license-refresh-result').textContent = e.message;
+  } finally { button.disabled = false; }
 }
 
 function closeLicenseModal(event) {
@@ -6982,10 +7659,23 @@ async function loadExtraRepos() {
   }
 }
 
+// Branch suggestions: downloaded branches plus the remote branch list, since
+// an environment downloads a missing branch on first use.
+function extraRepoBranchChoices(r) {
+  var seen = Object.create(null);
+  return (r.branches || []).concat(r.available_branches || []).filter(function(b) {
+    if (seen[b]) return false;
+    seen[b] = true;
+    return true;
+  });
+}
+
 // Branch suggestions for a repo's branch input in the create wizard: repo
 // names are [a-zA-Z0-9_-] (validate_extra_repo_name), so they are id-safe.
+// Remote prefixes are stripped, so a row suggests the same names the branch
+// picker above the list offers — and the same names a mount accepts.
 function extraRepoBranchDatalist(r) {
-  var opts = (r.branches || []).map(function(b) {
+  var opts = extraRepoBranchNames(r).map(function(b) {
     return '<option value="' + escAttr(b) + '"></option>';
   }).join('');
   return '<datalist id="extra-branches-' + escAttr(r.name) + '">' + opts + '</datalist>';
@@ -6998,7 +7688,20 @@ function renderExtraRepos(repos) {
     return;
   }
   el.innerHTML = repos.map(function(r) {
-    var branches = (r.branches || []).slice(0, 10).map(function(b) { return esc(b); }).join(', ');
+    var downloaded = r.branches || [];
+    var branches = downloaded.length
+      ? '<span class="branch-chips">' + downloaded.slice(0, 12).map(function(b) {
+          return '<span class="branch-chip">' + esc(b) + '</span>';
+        }).join('') +
+        (downloaded.length > 12 ? '<span class="branch-chip">+' + (downloaded.length - 12) + ' more</span>' : '') +
+        '</span>'
+      : '';
+    var remoteCount = (r.available_branches || []).length;
+    var branchMeta = r.local
+      ? (branches ? '<div class="svc-meta"><span>Branches: ' + branches + '</span></div>' : '')
+      : '<div class="svc-meta"><span>Downloaded: ' + (branches || '<strong>none yet</strong>') + '</span>' +
+          (remoteCount ? '<span>On remote: <strong>' + remoteCount + ' branch(es)</strong></span>' : '') +
+        '</div>';
     return '<div class="svc-card">' +
       '<div class="svc-header">' +
         '<div class="left">' +
@@ -7008,6 +7711,7 @@ function renderExtraRepos(repos) {
         '</div>' +
         '<div class="svc-actions">' +
           '<button class="btn btn-sync" onclick="doPullExtraRepo(\'' + escAttr(r.name) + '\', this)">Update</button> ' +
+          (r.local ? '' : '<button class="btn" onclick="openExtraBranchesModal(\'' + escAttr(r.name) + '\')">Branches</button> ') +
           '<button class="btn btn-protect" title="' + (r.protected ? 'Allow deleting this repository again' : 'Disable deleting this repository') + '" ' +
             'onclick="doProtectExtraRepo(\'' + escAttr(r.name) + '\',' + (r.protected ? 'true' : 'false') + ')">' +
             (r.protected ? 'Unprotect' : 'Protect') + '</button> ' +
@@ -7018,7 +7722,7 @@ function renderExtraRepos(repos) {
       '<div class="svc-meta">' +
         '<span>URL: <strong>' + (r.local ? 'local (no remote)' : esc(r.repo_url)) + '</strong></span>' +
       '</div>' +
-      (branches ? '<div class="svc-meta"><span>Branches: <strong>' + branches + '</strong></span></div>' : '') +
+      branchMeta +
     '</div>';
   }).join('');
 }
@@ -7028,12 +7732,12 @@ function openAddExtraRepoModal() {
   document.getElementById('extra-repo-url').value = '';
   document.getElementById('add-extra-repo-error').style.display = 'none';
   document.getElementById('extra-repo-submit').disabled = false;
-  document.getElementById('extra-repo-submit').textContent = 'Clone';
+  document.getElementById('extra-repo-submit').textContent = 'Add repository';
   var brContainer = document.getElementById('extra-repo-branches');
   brContainer.style.display = 'none';
   brContainer.innerHTML = '';
   document.getElementById('extra-repo-branches-hint').textContent =
-    'All branches are cloned by default. Load the list to pick a subset.';
+    'Nothing is downloaded now: each branch downloads when an environment first uses it. Load the list to download some right away.';
   var brBtn = document.getElementById('extra-repo-load-branches');
   brBtn.disabled = false;
   brBtn.textContent = 'Load branches';
@@ -7056,8 +7760,8 @@ function closeAddExtraRepoModal(event) {
 function updateExtraRepoBranchesHint() {
   var checked = document.querySelectorAll('.extra-repo-branch-cb:checked').length;
   document.getElementById('extra-repo-branches-hint').textContent = checked
-    ? 'Only the ' + checked + ' selected branch(es) will be cloned and updated.'
-    : 'None selected — all branches will be cloned.';
+    ? 'The ' + checked + ' selected branch(es) download now; others on first use.'
+    : 'None selected — each branch downloads on first use.';
 }
 
 async function loadExtraRepoRemoteBranches() {
@@ -7125,7 +7829,7 @@ async function submitAddExtraRepo() {
   errEl.style.display = 'none';
   var btn = document.getElementById('extra-repo-submit');
   btn.disabled = true;
-  btn.textContent = 'Cloning...';
+  btn.textContent = 'Adding...';
   try {
     var r = await fetch(API_EXTRA_REPOS + '/add', {
       method: 'POST',
@@ -7135,10 +7839,10 @@ async function submitAddExtraRepo() {
     var data = await readResult(r);
     if (data.ok) {
       closeAddExtraRepoModal();
-      showToast('Extra repo "' + name + '" cloned');
+      showToast('Extra repo "' + name + '" added');
       await loadExtraRepos();
     } else {
-      errEl.textContent = data.error || 'Clone failed';
+      errEl.textContent = data.error || 'Failed to add repository';
       errEl.style.display = 'block';
     }
   } catch (e) {
@@ -7146,7 +7850,7 @@ async function submitAddExtraRepo() {
     errEl.style.display = 'block';
   } finally {
     btn.disabled = false;
-    btn.textContent = 'Clone';
+    btn.textContent = 'Add repository';
   }
 }
 
@@ -7170,34 +7874,111 @@ async function doPullExtraRepo(name, btn) {
   }
 }
 
-function showExtraRepoUpdateResult(name, result) {
-  if (result.up_to_date) {
-    showToast('Extra repo "' + name + '": already up to date');
-    return;
-  }
+// Prefix (e.g. a repo name) labels each section when several repos share one modal.
+function extraRepoChangesHtml(result, prefix) {
+  var pre = prefix ? esc(prefix) + ' — ' : '';
   var html = '';
   if (result.updated_branches && result.updated_branches.length) {
-    html += '<div class="sync-section"><div class="sync-section-title">Updated branches</div><div class="sync-modules">';
+    html += '<div class="sync-section"><div class="sync-section-title">' + pre + 'Updated branches</div><div class="sync-modules">';
     result.updated_branches.forEach(function(b) {
       html += '<span class="sync-module-tag">' + esc(b.branch) + ' — ' + b.new_commits + ' new commit(s)</span>';
     });
     html += '</div></div>';
   }
   if (result.new_branches && result.new_branches.length) {
-    html += '<div class="sync-section"><div class="sync-section-title">New branches</div><div class="sync-modules">';
+    html += '<div class="sync-section"><div class="sync-section-title">' + pre + 'New branches</div><div class="sync-modules">';
     result.new_branches.forEach(function(b) {
       html += '<span class="sync-module-tag">' + esc(b) + '</span>';
     });
     html += '</div></div>';
   }
   if (result.deleted_branches && result.deleted_branches.length) {
-    html += '<div class="sync-section"><div class="sync-section-title">Deleted branches</div><div class="sync-modules">';
+    html += '<div class="sync-section"><div class="sync-section-title">' + pre + 'Deleted branches</div><div class="sync-modules">';
     result.deleted_branches.forEach(function(b) {
       html += '<span class="sync-module-tag" style="opacity:0.6;text-decoration:line-through">' + esc(b) + '</span>';
     });
     html += '</div></div>';
   }
+  return html;
+}
+
+function showExtraRepoUpdateResult(name, result) {
+  if (result.up_to_date) {
+    showToast('Extra repo "' + name + '": already up to date');
+    return;
+  }
   document.getElementById('sync-result-title').textContent = 'Update — ' + name;
+  document.getElementById('sync-result-body').innerHTML = extraRepoChangesHtml(result);
+  showModal('sync-result-modal');
+}
+
+// Fetch every repo with a remote, one at a time: parallel fetches of large
+// repos (Enterprise) would compete for bandwidth and the proxy timeout.
+async function doPullAllExtraRepos(btn) {
+  btn.disabled = true;
+  btn.textContent = 'Updating...';
+  // The cache may be empty or stale (tab just opened, repo added from another
+  // session): refresh before deciding there is nothing to do.
+  await loadExtraRepos();
+  var names = (cachedExtraRepos || [])
+    .filter(function(r) { return !r.local; })
+    .map(function(r) { return r.name; });
+  if (names.length === 0) {
+    btn.disabled = false;
+    btn.textContent = 'Update all';
+    showToast('No extra repos with a remote to update');
+    return;
+  }
+  var changed = [], upToDate = [], failed = [];
+  // Freeze the per-repo buttons while the loop runs: a delete or a second
+  // fetch of the same repo mid-run is exactly the contention the sequential
+  // design exists to avoid.
+  var frozen = [];
+  document.querySelectorAll('#extra-repos-list button:not([disabled])').forEach(function(b) {
+    b.disabled = true;
+    frozen.push(b);
+  });
+  try {
+    for (var i = 0; i < names.length; i++) {
+      var name = names[i];
+      btn.textContent = 'Updating ' + (i + 1) + '/' + names.length + '...';
+      try {
+        var r = await fetch(API_EXTRA_REPOS + '/' + encodeURIComponent(name) + '/pull', {method:'POST'});
+        var data = await readResult(r);
+        if (!data.ok) failed.push({name: name, error: data.error || 'Update failed'});
+        else if (data.result.up_to_date) upToDate.push(name);
+        else changed.push({name: name, result: data.result});
+      } catch (e) {
+        failed.push({name: name, error: 'Connection error: ' + e.message});
+      }
+    }
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Update all';
+    frozen.forEach(function(b) { b.disabled = false; });
+  }
+  await loadExtraRepos();
+  if (changed.length === 0 && failed.length === 0) {
+    showToast('All extra repos are up to date');
+    return;
+  }
+  var summary = [];
+  if (changed.length) summary.push(changed.length + ' updated');
+  if (upToDate.length) summary.push(upToDate.length + ' already up to date');
+  if (failed.length) summary.push(failed.length + ' failed');
+  var html = '<div class="sync-message">' + summary.join(', ') + '.</div>';
+  if (failed.length) {
+    html += '<div class="sync-section"><div class="sync-section-title">Failed</div><ul class="sync-warnings">';
+    failed.forEach(function(f) { html += '<li>' + esc(f.name) + ': ' + esc(f.error) + '</li>'; });
+    html += '</ul></div>';
+  }
+  changed.forEach(function(c) { html += extraRepoChangesHtml(c.result, c.name); });
+  if (upToDate.length) {
+    html += '<div class="sync-section"><div class="sync-section-title">Already up to date</div><div class="sync-modules">';
+    upToDate.forEach(function(n) { html += '<span class="sync-module-tag">' + esc(n) + '</span>'; });
+    html += '</div></div>';
+  }
+  document.getElementById('sync-result-title').textContent = 'Update — all repos';
   document.getElementById('sync-result-body').innerHTML = html;
   showModal('sync-result-modal');
 }
@@ -7221,6 +8002,232 @@ async function doProtectExtraRepo(name, isProtected) {
     showToast('Connection error: ' + e.message, true);
   }
   await loadExtraRepos();
+}
+
+// --- Branches dialog: download more branches or remove downloaded ones ---
+// Branch names may hold quotes, so rows carry them in data-branch attributes
+// instead of inline JS-string arguments.
+var xbState = null;
+
+function _xbUrl(suffix) {
+  return API_EXTRA_REPOS + '/' + encodeURIComponent(xbState.name) + '/' + suffix;
+}
+
+function _xbError(msg) {
+  var errEl = document.getElementById('xb-error');
+  errEl.textContent = msg || '';
+  errEl.style.display = msg ? 'block' : 'none';
+}
+
+async function openExtraBranchesModal(name) {
+  xbState = {name: name, downloaded: [], available: [], availableKnown: false, protected: false,
+             usage: {}, selected: Object.create(null), loading: true};
+  document.getElementById('xb-title').textContent = 'Branches — ' + name;
+  document.getElementById('xb-filter').value = '';
+  _xbError('');
+  renderExtraBranches();
+  showModal('extra-branches-modal');
+  document.getElementById('xb-filter').focus();
+  await loadExtraBranches();
+}
+
+function closeExtraBranchesModal(event) {
+  if (event && event.target !== event.currentTarget) return;
+  hideModal('extra-branches-modal');
+  xbState = null;
+}
+
+async function loadExtraBranches() {
+  if (!xbState) return;
+  var state = xbState;
+  try {
+    var r = await fetch(_xbUrl('branches'));
+    var data = await readResult(r);
+    if (state !== xbState) return;
+    if (data.ok) {
+      state.downloaded = data.downloaded || [];
+      state.available = data.available || [];
+      state.availableKnown = !!data.available_known;
+      state.protected = !!data.protected;
+      state.usage = data.usage || {};
+      state.downloaded.forEach(function(b) { delete state.selected[b]; });
+    } else {
+      _xbError(data.error || 'Failed to load branches');
+    }
+  } catch (e) {
+    if (state === xbState) _xbError('Connection error: ' + e.message);
+  }
+  if (state !== xbState) return;
+  state.loading = false;
+  renderExtraBranches();
+  // Repos added before the remote list was stored have none yet; read it once
+  // instead of showing every downloaded branch as gone from the remote.
+  if (!state.availableKnown && !state.autoRefreshed) {
+    state.autoRefreshed = true;
+    await refreshExtraBranchesRemote();
+  }
+}
+
+function renderExtraBranches() {
+  var list = document.getElementById('xb-list');
+  var btn = document.getElementById('xb-download');
+  if (!xbState || xbState.loading) {
+    list.innerHTML = '<div class="xb-empty">Loading branches...</div>';
+    btn.disabled = true;
+    return;
+  }
+  var s = xbState;
+  var filter = document.getElementById('xb-filter').value.trim().toLowerCase();
+  var isDownloaded = Object.create(null);
+  s.downloaded.forEach(function(b) { isDownloaded[b] = true; });
+  var onRemote = Object.create(null);
+  s.available.forEach(function(b) { onRemote[b] = true; });
+  // Downloaded first, then the rest of the remote list.
+  var names = s.downloaded.slice().sort().concat(
+    s.available.filter(function(b) { return !isDownloaded[b]; }).sort()
+  ).filter(function(b) { return !filter || b.toLowerCase().indexOf(filter) !== -1; });
+
+  if (!names.length) {
+    list.innerHTML = '<div class="xb-empty">' +
+      (filter ? 'No branches match the filter.'
+        : s.availableKnown ? 'No branches on the remote. Refresh the list to check again.'
+        : 'The remote branch list has not been read yet. Refresh the list to read it.') +
+      '</div>';
+  } else {
+    list.innerHTML = names.map(function(b) {
+      if (isDownloaded[b]) {
+        var users = s.usage[b] || [];
+        return '<div class="xb-row">' +
+          '<span class="xb-name" title="' + escHtmlAttr(b) + '">' + esc(b) + '</span>' +
+          '<span class="badge badge-running">downloaded</span>' +
+          (onRemote[b] || !s.availableKnown ? '' : '<span class="badge badge-neutral" title="Deleted on the remote; the next Update drops it">not on remote</span>') +
+          '<span class="xb-usage" title="' + escHtmlAttr(users.join(', ')) + '">' +
+            (users.length ? 'Used by ' + esc(users.join(', ')) : 'Not in use') + '</span>' +
+          '<button class="btn btn-sm btn-delete" data-branch="' + escHtmlAttr(b) + '" ' +
+            'onclick="removeExtraBranch(this.dataset.branch, this)"' +
+            (users.length ? ' disabled title="In use by ' + escHtmlAttr(users.join(', ')) + '"'
+              : s.protected ? ' disabled title="The repository is protected; unprotect it to remove branches"' : '') +
+            '>Remove</button>' +
+        '</div>';
+      }
+      return '<label class="xb-row">' +
+        '<input type="checkbox" class="xb-cb" value="' + escHtmlAttr(b) + '"' +
+          (s.selected[b] ? ' checked' : '') + ' onchange="toggleExtraBranch(this)">' +
+        '<span class="xb-name" title="' + escHtmlAttr(b) + '">' + esc(b) + '</span>' +
+        '<span class="xb-usage">On remote</span>' +
+      '</label>';
+    }).join('');
+  }
+  var count = Object.keys(s.selected).length;
+  btn.disabled = !count || !!s.busy;
+  if (!s.busy) btn.textContent = count ? 'Download ' + count + ' selected' : 'Download selected';
+}
+
+function toggleExtraBranch(cb) {
+  if (!xbState) return;
+  if (cb.checked) xbState.selected[cb.value] = true;
+  else delete xbState.selected[cb.value];
+  renderExtraBranches();
+}
+
+async function refreshExtraBranchesRemote() {
+  if (!xbState) return;
+  var state = xbState;
+  var btn = document.getElementById('xb-refresh');
+  btn.disabled = true;
+  btn.textContent = 'Refreshing...';
+  _xbError('');
+  try {
+    var r = await fetch(_xbUrl('remote-branches'), {method: 'POST'});
+    var data = await readResult(r);
+    if (state !== xbState) return;
+    if (data.ok) {
+      state.available = data.available || [];
+      state.availableKnown = true;
+      // A selected branch gone from the remote has no row to uncheck it.
+      var onRemote = Object.create(null);
+      state.available.forEach(function(b) { onRemote[b] = true; });
+      Object.keys(state.selected).forEach(function(b) {
+        if (!onRemote[b]) delete state.selected[b];
+      });
+      renderExtraBranches();
+      await loadExtraRepos();
+    } else {
+      _xbError(data.error || 'Failed to refresh the remote branch list');
+    }
+  } catch (e) {
+    if (state === xbState) _xbError('Connection error: ' + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Refresh list';
+  }
+}
+
+async function downloadExtraBranches() {
+  if (!xbState) return;
+  var state = xbState;
+  var branches = Object.keys(state.selected);
+  if (!branches.length) return;
+  var btn = document.getElementById('xb-download');
+  state.busy = true;
+  btn.disabled = true;
+  btn.textContent = 'Downloading...';
+  _xbError('');
+  try {
+    var r = await fetch(_xbUrl('branches'), {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({branches: branches})
+    });
+    var data = await readResult(r);
+    if (data.ok) {
+      showToast(state.name + ': downloaded ' + branches.join(', '));
+      state.selected = Object.create(null);
+      await loadExtraRepos();
+    } else if (state === xbState) {
+      _xbError(data.error || 'Download failed');
+    }
+  } catch (e) {
+    if (state === xbState) _xbError('Connection error: ' + e.message);
+  } finally {
+    state.busy = false;
+  }
+  if (state === xbState) await loadExtraBranches();
+}
+
+async function removeExtraBranch(branch, btn) {
+  if (!xbState) return;
+  var state = xbState;
+  if (!(await confirmDialog({
+    title: 'Remove branch',
+    message: 'Remove the downloaded branch "' + branch + '" of "' + state.name + '"? ' +
+      'Its files and unused cached checkouts are deleted from disk. ' +
+      'An environment that uses it later downloads it again.',
+    confirmLabel: 'Remove branch',
+    danger: true
+  }))) return;
+  if (state !== xbState) return;
+  btn.disabled = true;
+  btn.textContent = 'Removing...';
+  _xbError('');
+  try {
+    var r = await fetch(_xbUrl('branches/remove'), {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({branch: branch})
+    });
+    var data = await readResult(r);
+    if (data.ok) {
+      var freed = data.result.freed_bytes;
+      showToast('Branch "' + branch + '" removed' + (freed > 0 ? ', ' + fmtBytes(freed) + ' freed' : ''));
+      await loadExtraRepos();
+    } else if (state === xbState) {
+      _xbError(data.error || 'Remove failed');
+    }
+  } catch (e) {
+    if (state === xbState) _xbError('Connection error: ' + e.message);
+  }
+  if (state === xbState) await loadExtraBranches();
 }
 
 async function doDeleteExtraRepo(name) {
@@ -7580,11 +8587,9 @@ async function checkVersion() {
 // --- Secrets (write-only named values for env vars) ---
 const API_SECRETS = '/api/secrets';
 var secretTypes = Object.create(null);
-var secretDraftValue = '';
-var secretSaving = false;
-// JSON mode has to unmask the value (a textarea cannot be a password field),
-// so the user's masking choice is kept here and restored when they leave it.
-var secretHidePref = true;
+var secretEditingName = '';
+// Empty when idle; otherwise identifies the action whose request is in flight.
+var secretSaving = '';
 
 async function loadSecrets() {
   try {
@@ -7616,7 +8621,7 @@ function renderSecrets(secrets) {
           '<span class="badge badge-preset">write-only</span>' +
         '</div>' +
         '<div class="svc-actions">' +
-          '<button class="btn btn-sm" onclick="openSecretModal(\'' + escAttr(s.name) + '\')">Replace value</button>' +
+          '<button class="btn btn-sm" onclick="openSecretModal(\'' + escAttr(s.name) + '\')">Edit secret</button>' +
           '<button class="btn btn-delete" onclick="doDeleteSecret(\'' + escAttr(s.name) + '\')">Delete</button>' +
         '</div>' +
       '</div>' +
@@ -7629,98 +8634,166 @@ function renderSecrets(secrets) {
   }).join('');
 }
 
+function canUpdateSecretKey() {
+  return !!secretEditingName && secretTypes[secretEditingName] === 'json' &&
+    document.getElementById('secret-is-json').checked;
+}
+
+function clearSecretKeyResult() {
+  var result = document.getElementById('secret-key-result');
+  result.textContent = '';
+  result.hidden = true;
+}
+
 function updateSecretValueMode() {
   var isJson = document.getElementById('secret-is-json').checked;
-  var hide = document.getElementById('secret-hide-value');
-  hide.checked = isJson ? false : secretHidePref;
-  hide.disabled = isJson;
-  var input = document.getElementById('secret-value');
-  var textarea = document.getElementById('secret-json-value');
-  input.type = hide.checked ? 'password' : 'text';
-  input.hidden = isJson;
-  textarea.hidden = !isJson;
-  input.value = isJson ? '' : secretDraftValue;
-  textarea.value = isJson ? secretDraftValue : '';
-  document.getElementById('secret-value-label').htmlFor = isJson ? textarea.id : input.id;
+  var masked = document.getElementById('secret-hide-value').checked;
+  document.getElementById('secret-value').type = masked ? 'password' : 'text';
+  document.getElementById('secret-key-value').type = masked ? 'password' : 'text';
+  document.getElementById('secret-text-fields').hidden = isJson;
+  document.getElementById('secret-json-fields').hidden = !isJson;
+  document.getElementById('secret-submit').hidden = isJson;
+  if (!isJson) clearSecretKeyResult();
+  // Drafts stay in their own fields: toggling JSON must not expose a masked
+  // text draft by copying it into the always-visible replacement textarea.
   validateSecretValue();
+}
+
+function secretKeyPath() {
+  // Trimmed: a pasted path with stray whitespace must not create a key whose
+  // name carries invisible spaces in a secret nobody can read back.
+  return document.getElementById('secret-key').value.trim();
+}
+
+function validateSecretKey() {
+  var canUpdate = canUpdateSecretKey();
+  var key = document.getElementById('secret-key');
+  var value = document.getElementById('secret-key-value');
+  var path = secretKeyPath();
+  var validPath = path.startsWith('/')
+    ? !/~(?:[^01]|$)/.test(path)
+    : !path.includes('/') && path.split('.').every(function(part) { return part.length > 0; });
+  var valid = canUpdate && validPath && value.value.length > 0;
+  var message = !canUpdate
+    ? secretTypes[secretEditingName] === 'text'
+      ? 'This secret is stored as text. Paste the full JSON into Replace Data below and choose Replace data to enable key updates.'
+      : 'Save this secret as JSON before updating an individual key.'
+    : key.value && !validPath
+      ? 'Use non-empty dot-separated keys or a path starting with /.'
+      : 'Use environment.OPENROUTER_API_KEY or /environment/OPENROUTER_API_KEY. Missing keys are created; the parent must exist. Use /key.with.dots for a literal dotted name.';
+  var status = document.getElementById('secret-key-status');
+  if (status.textContent !== message) status.textContent = message;
+  key.setAttribute('aria-invalid', String(canUpdate && !!key.value && !validPath));
+  key.disabled = value.disabled = !!secretSaving || !canUpdate;
+  var button = document.getElementById('secret-update-submit');
+  button.disabled = !!secretSaving || !valid;
+  button.textContent = secretSaving === 'update' ? 'Saving…' : 'Save key';
+  return valid;
 }
 
 function validateSecretValue() {
   var isJson = document.getElementById('secret-is-json').checked;
+  var textarea = document.getElementById('secret-json-value');
+  var value = isJson ? textarea.value : document.getElementById('secret-value').value;
   var status = document.getElementById('secret-json-status');
-  var valid = !!secretDraftValue;
-  status.hidden = !isJson;
+  var valid = !!value;
   var message = '';
   if (isJson) {
     try {
-      JSON.parse(secretDraftValue);
+      JSON.parse(value);
       message = 'Valid JSON';
     } catch (e) {
       valid = false;
       // Parser messages can include secret fragments; never display them.
-      message = secretDraftValue ? 'Invalid JSON. Check the syntax.' : 'Enter a JSON value.';
+      message = value ? 'Invalid JSON. Check the syntax.' : 'Enter a JSON value.';
     }
   }
-  // This runs on every keystroke, and the region is aria-live: rewriting it
-  // with identical text would make a screen reader repeat it per character.
   if (status.textContent !== message) status.textContent = message;
-  document.getElementById('secret-json-value').setAttribute('aria-invalid', String(isJson && !valid));
-  document.getElementById('secret-submit').disabled = secretSaving || !valid;
+  textarea.setAttribute('aria-invalid', String(isJson && !!value && !valid));
+  valid = valid && !!document.getElementById('secret-name').value.trim();
+  var saveButton = document.getElementById('secret-submit');
+  var replaceButton = document.getElementById('secret-replace-submit');
+  saveButton.disabled = replaceButton.disabled = !!secretSaving || !valid;
+  saveButton.textContent = secretSaving === 'replace' ? 'Saving…' : 'Save';
+  replaceButton.textContent = secretSaving === 'replace'
+    ? 'Saving…' : secretEditingName ? 'Replace data' : 'Save JSON';
+  replaceButton.className = (canUpdateSecretKey() ? 'btn btn-update' : 'btn-create') + ' secret-section-action';
+  document.getElementById('secret-update-submit').className =
+    (canUpdateSecretKey() ? 'btn-create' : 'btn') + ' secret-section-action';
+  ['secret-name', 'secret-hide-value', 'secret-is-json', 'secret-value', 'secret-json-value'].forEach(function(id) {
+    document.getElementById(id).disabled = !!secretSaving;
+  });
+  validateSecretKey();
   return valid;
 }
 
 function openSecretModal(name) {
-  document.getElementById('secret-modal-title').textContent = name ? 'Replace Secret Value' : 'Add Secret';
+  if (secretSaving) return;
+  clearSecretKeyResult();
+  secretEditingName = name || '';
+  document.getElementById('secret-modal-title').textContent = name ? 'Edit Secret' : 'Add Secret';
   var nameEl = document.getElementById('secret-name');
-  nameEl.value = name || '';
+  nameEl.value = secretEditingName;
   nameEl.readOnly = !!name;
-  secretDraftValue = '';
-  secretHidePref = true;
+  ['secret-value', 'secret-json-value', 'secret-key', 'secret-key-value'].forEach(function(id) {
+    document.getElementById(id).value = '';
+  });
   document.getElementById('secret-hide-value').checked = true;
   document.getElementById('secret-is-json').checked = secretTypes[name] === 'json';
   updateSecretValueMode();
   document.getElementById('secret-error').style.display = 'none';
   showModal('secret-modal');
-  (name ? document.getElementById(document.getElementById('secret-is-json').checked ? 'secret-json-value' : 'secret-value') : nameEl).focus();
+  (name ? document.getElementById(canUpdateSecretKey() ? 'secret-key' : 'secret-value') : nameEl).focus();
 }
 
 function closeSecretModal(event) {
-  if (event && event.target !== event.currentTarget) return;
-  secretDraftValue = '';
-  document.getElementById('secret-value').value = '';
-  document.getElementById('secret-json-value').value = '';
+  if (secretSaving || (event && event.target !== event.currentTarget)) return;
+  clearSecretKeyResult();
+  secretEditingName = '';
+  ['secret-value', 'secret-json-value', 'secret-key', 'secret-key-value'].forEach(function(id) {
+    document.getElementById(id).value = '';
+  });
   hideModal('secret-modal');
 }
 
-async function submitSecret() {
-  if (secretSaving || !validateSecretValue()) return;
+async function submitSecret(action) {
+  var updateKey = action === 'update';
+  if (secretSaving || !(updateKey ? validateSecretKey() : validateSecretValue())) return;
   var name = document.getElementById('secret-name').value.trim();
-  var value = secretDraftValue;
-  var valueType = document.getElementById('secret-is-json').checked ? 'json' : 'text';
+  var isJson = document.getElementById('secret-is-json').checked;
+  var keyEl = document.getElementById('secret-key');
+  if (updateKey) keyEl.value = secretKeyPath();
+  var body = updateKey
+    ? {path: keyEl.value, value: document.getElementById('secret-key-value').value}
+    : {value: document.getElementById(isJson ? 'secret-json-value' : 'secret-value').value, value_type: isJson ? 'json' : 'text'};
   var errEl = document.getElementById('secret-error');
-  if (!name || !value) {
-    errEl.textContent = 'Name and value are required.';
-    errEl.style.display = 'block';
-    return;
-  }
   errEl.style.display = 'none';
-  var btn = document.getElementById('secret-submit');
-  secretSaving = true;
-  btn.disabled = true;
+  clearSecretKeyResult();
+  secretSaving = updateKey ? 'update' : 'replace';
+  validateSecretValue();
   try {
-    var r = await fetch(API_SECRETS + '/' + encodeURIComponent(name) + '/set', {
+    var r = await fetch(API_SECRETS + '/' + encodeURIComponent(name) + (updateKey ? '/update-json' : '/set'), {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({value: value, value_type: valueType})
+      body: JSON.stringify(body)
     });
     var data = await readResult(r);
     if (data.ok) {
-      closeSecretModal();
-      var created = data.result && data.result.created;
-      showToast(created
-        ? 'Secret "' + name + '" saved — reference it as secret:' + name
-        : 'Secret "' + name + '" value replaced. Recreate services/environments that use it.');
       await loadSecrets();
+      secretSaving = '';
+      var created = data.result && data.result.created;
+      if (updateKey) {
+        document.getElementById('secret-key-value').value = '';
+        var result = document.getElementById('secret-key-result');
+        result.hidden = false;
+        result.textContent = (created ? 'Key created: ' : 'Key updated: ') + body.path +
+          '. Recreate services/environments that use this secret.';
+      } else {
+        closeSecretModal();
+        showToast(created
+          ? 'Secret "' + name + '" created — reference it as secret:' + name
+          : 'Secret "' + name + '" value replaced. Recreate services/environments that use it.');
+      }
     } else {
       errEl.textContent = data.error || 'Failed to save secret';
       errEl.style.display = 'block';
@@ -7729,7 +8802,7 @@ async function submitSecret() {
     errEl.textContent = 'Connection error: ' + e.message;
     errEl.style.display = 'block';
   } finally {
-    secretSaving = false;
+    secretSaving = '';
     validateSecretValue();
   }
 }
@@ -7802,7 +8875,7 @@ function ensureChatAssets() {
   // chat.js and acp-client.js are an interdependent pair of our own code; bump
   // this shared CHAT_V whenever either one changes (see AGENTS.md). One version
   // busts both at once, preventing a stale chat.js/acp-client.js mismatch.
-  var CHAT_V = '7';
+  var CHAT_V = '8';
   // marked.min.js and purify.min.js are vendored third-party assets (not part
   // of the CHAT_V pair — bump their filename if upgraded). DOMPurify must load
   // before chat.js: renderMarkdown sanitizes marked's raw-HTML output with it.
@@ -7859,7 +8932,7 @@ async function openConsole(branch) {
   term.loadAddon(fitAddon);
   term.open(container);
   fitAddon.fit();
-  term.write('\x1b[90m# oduflow console \u2014 ' + branch + '\x1b[0m\r\n');
+  term.write('\x1b[90m# ' + BRAND_NAME.toLowerCase() + ' console \u2014 ' + branch + '\x1b[0m\r\n');
 
   var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   var ws = new WebSocket(proto + '//' + location.host + '/api/environments/' + encodeURIComponent(branch) + '/terminal');
@@ -7931,7 +9004,7 @@ async function openSqlConsole(branch) {
   term.loadAddon(fitAddon);
   term.open(container);
   fitAddon.fit();
-  term.write('\x1b[90m# oduflow sql \u2014 ' + branch + '\x1b[0m\r\n');
+  term.write('\x1b[90m# ' + BRAND_NAME.toLowerCase() + ' sql \u2014 ' + branch + '\x1b[0m\r\n');
 
   var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   var ws = new WebSocket(proto + '//' + location.host + '/api/environments/' + encodeURIComponent(branch) + '/sql');
@@ -8000,7 +9073,7 @@ async function openAgentConsole(branch, agentType) {
   term.loadAddon(fitAddon);
   term.open(container);
   fitAddon.fit();
-  term.write('\x1b[90m# oduflow agent (' + label + ') — ' + branch + '\x1b[0m\r\n');
+  term.write('\x1b[90m# ' + BRAND_NAME.toLowerCase() + ' agent (' + label + ') — ' + branch + '\x1b[0m\r\n');
 
   var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   var ws = new WebSocket(proto + '//' + location.host + '/api/environments/' + encodeURIComponent(branch) + '/agent?type=' + encodeURIComponent(agentType));
@@ -8063,6 +9136,7 @@ window.addEventListener('resize', function() {
 });
 
 var MODAL_CLOSERS = {
+  'cleanup-modal': closeCleanupModal,
   // Created dynamically by openCreateProductionModal; promptDialog overlays
   // handle Escape themselves via their own overlay keydown listener.
   'create-prod-modal': function() {
@@ -8087,6 +9161,7 @@ var MODAL_CLOSERS = {
   'license-modal': closeLicenseModal,
   'version-modal': closeVersionModal,
   'add-extra-repo-modal': closeAddExtraRepoModal,
+  'extra-branches-modal': closeExtraBranchesModal,
   'add-credential-modal': closeAddCredentialModal,
   'secret-modal': closeSecretModal,
   'import-from-odoo-modal': closeImportFromOdooModal,
@@ -8218,11 +9293,13 @@ _prefersLight.addEventListener('change', function () {
 });
 updateThemeToggle(getThemeMode());
 
+/* <!--IF-STOCK--> */
 console.log(
   '%coduflow%c The Engineer\'s Console \u2014 https://docs.oduflow.dev',
   'background: oklch(0.6 0.2 260); color: #fff; padding: 2px 8px; border-radius: 4px; font-weight: 700;',
   'color: #9b9fa5; padding-left: 6px;'
 );
+/* <!--/IF-STOCK--> */
 
 // --- Production hosting ---------------------------------------------------
 
@@ -8331,6 +9408,58 @@ function prodBadgeClass(status) {
   return 'badge-exited';  // unhealthy / broken
 }
 
+// What the holder of a production's lock is doing right now (deploy step,
+// snapshot progress) — so a long snapshot does not read as a hung deploy.
+var _prodProgressTicker = null;
+
+function prodProgressBadge(p) {
+  var pr = p.progress;
+  if (!pr) return '';
+  var since = Date.now() - (pr.phase_seconds || 0) * 1000;
+  return '<span class="badge badge-busy"><span class="spinner" aria-hidden="true"></span>' +
+    esc(pr.phase) + '&hellip; <span data-prod-since="' + since + '">' +
+    _fmtElapsed(Date.now() - since) + '</span></span>';
+}
+
+function prodQueuedBadge(p) {
+  var q = p.queued || [];
+  if (!q.length) return '';
+  var since = Date.now() - (q[0].seconds || 0) * 1000;
+  return '<span class="badge badge-neutral">queued: ' + esc(q[0].operation || 'operation') +
+    (q.length > 1 ? ' +' + (q.length - 1) : '') + ' <span data-prod-since="' + since + '">' +
+    _fmtElapsed(Date.now() - since) + '</span></span>';
+}
+
+function prodQueuedMeta(p) {
+  var q = p.queued || [];
+  if (!q.length) return '';
+  // The holder's own progress is already in the badges; name it otherwise.
+  var behind = p.progress ? '' : (p.busy ? ' — busy: ' + esc(p.busy) : '');
+  return '<span>Queued: <strong>' + esc(q.map(function(w) { return w.operation || 'operation'; }).join(', ')) +
+    '</strong>, starts when the production is free' + behind + '</span>';
+}
+
+function prodProgressMeta(p) {
+  var pr = p.progress;
+  if (!pr) return '';
+  var parts = [];
+  if (pr.detail) parts.push(esc(pr.detail));
+  parts.push('started ' + esc(_fmtElapsed((pr.seconds || 0) * 1000)) + ' ago');
+  return '<span>Now: <strong>' + esc(pr.phase) + '</strong> — ' + parts.join(', ') + '</span>';
+}
+
+function _tickProdProgress() {
+  var els = document.querySelectorAll('[data-prod-since]');
+  if (!els.length) {
+    clearInterval(_prodProgressTicker);
+    _prodProgressTicker = null;
+    return;
+  }
+  els.forEach(function(el) {
+    el.textContent = _fmtElapsed(Date.now() - Number(el.getAttribute('data-prod-since')));
+  });
+}
+
 async function loadProductions() {
   loadWalStatus();
   try {
@@ -8390,6 +9519,8 @@ function renderProductions() {
             return '<a class="prod-domain prod-mono" href="' + escAttr(scheme + '://' + d) + '" target="_blank" rel="noopener">' + esc(d) + '</a>';
           }).join('') +
           '<span class="badge ' + prodBadgeClass(p.status) + '">' + esc(p.status) + '</span>' +
+          prodProgressBadge(p) +
+          prodQueuedBadge(p) +
           (p.auto_update ? '<span class="badge badge-neutral" title="Deploys automatically on GitHub push">auto</span>' : '') +
           (allowCopy ? '' : '<span class="badge badge-neutral" title="Agents cannot publish new copies of this production into dev over MCP; the dashboard still can">copy off</span>') +
         '</div>' +
@@ -8424,7 +9555,10 @@ function renderProductions() {
       '<div class="env-meta">' +
         '<span>Branch: <strong class="prod-mono">' + esc(p.branch) + ' @ ' + esc(p.commit_short || '?') + '</strong></span>' +
         '<span>Image: <strong class="prod-mono">' + esc(p.odoo_image) + '</strong></span>' +
+        '<span>Server: <strong>' + esc(p.server_mode || 'workers') + '</strong></span>' +
         '<span>DB: <strong class="prod-mono">' + esc(p.db_name) + '</strong></span>' +
+        prodProgressMeta(p) +
+        prodQueuedMeta(p) +
         lastHtml +
         snapHtml +
       '</div>' +
@@ -8434,6 +9568,9 @@ function renderProductions() {
   Object.keys(_prodOpen).forEach(function(name) {
     if (_prodOpen[name]) _loadProdSection(name, _prodOpen[name]);
   });
+  if (!_prodProgressTicker && cachedProds.some(function(p) { return p.progress || (p.queued || []).length; })) {
+    _prodProgressTicker = setInterval(_tickProdProgress, 1000);
+  }
 }
 
 async function showProdLogs(name) {
@@ -8469,8 +9606,11 @@ async function _loadProdSection(name, section) {
       var rows = (d2.deploys || []).slice().reverse().map(function(d) {
         return '<tr><td class="prod-mono">' + esc((d.ts_end || d.ts_start || '').slice(0, 19)) + '</td>' +
           '<td>' + esc(d.action || '') + '</td>' +
-          '<td class="prod-mono">' + esc((d.from_commit || '').slice(0, 10)) + ' → ' + esc((d.to_commit || '').slice(0, 10)) + '</td>' +
-          '<td><span class="badge ' + (d.status === 'success' ? 'badge-running' : 'badge-exited') + '">' + esc(d.status || '') + '</span></td>' +
+          '<td class="prod-mono">' + (d.from_commit || d.to_commit
+            ? esc((d.from_commit || '').slice(0, 10)) + ' → ' + esc((d.to_commit || '').slice(0, 10))
+            : '—') + '</td>' +
+          '<td><span class="badge ' + (d.status === 'success' ? 'badge-running' : 'badge-exited') + '">' + esc(d.status || '') + '</span>' +
+            (d.error ? '<div class="hint">' + esc(d.error) + '</div>' : '') + '</td>' +
           '<td>' + esc(d.trigger || '') + '</td></tr>';
       }).join('');
       el.innerHTML = rows
@@ -8504,11 +9644,32 @@ async function _loadProdSection(name, section) {
   }
 }
 
+// Server mode picker shared by the create modal and the settings panel. The
+// hint carries the trade-off; the choice itself is plain text, not color.
+// `id` must already be attribute-safe (callers pass escaped production names).
+function _prodServerModeSelect(id, current) {
+  var mode = current === 'gevent' ? 'gevent' : 'workers';
+  var opt = function(value, label) {
+    return '<option value="' + value + '"' + (mode === value ? ' selected' : '') + '>' + label + '</option>';
+  };
+  return '<select id="' + id + '">' +
+      opt('workers', 'Workers — sync, pages on port 8069') +
+      opt('gevent', 'Gevent — async, all traffic on port 8072') +
+    '</select>' +
+    '<div class="hint">Workers: multi-process, the live bus (/websocket) still goes to 8072. ' +
+    'Gevent: one async process serves everything — suits many long-lived or I/O-bound requests, ' +
+    'but one CPU-heavy request slows everyone. Crons run in both modes.</div>';
+}
+
 // Settings panel: oduflow-level options (applied via container recreation),
 // the MCP copy gate, and per-production odoo.conf overrides.
 function _prodSettingsHtml(p) {
   var n = escAttr(p.name);
   var extras = formatEnvLines(p.extra_addons || {});
+  var envVars = p.env_vars || {};
+  var envEditable = !Object.keys(envVars).some(function(k) {
+    return /[\r\n]/.test(envVars[k]) || envVars[k] !== envVars[k].trim();
+  });
   var conf = Object.keys(p.odoo_conf || {}).sort().map(function(k) {
     return k + ' = ' + p.odoo_conf[k];
   }).join('\n');
@@ -8525,6 +9686,8 @@ function _prodSettingsHtml(p) {
     '<div class="form-group"><label for="ps-image-' + n + '">Odoo image</label>' +
       '<input type="text" id="ps-image-' + n + '" value="' + escHtmlAttr(p.odoo_image || '') + '">' +
       '<div class="hint">Changing the image does not migrate the database</div></div>' +
+    '<div class="form-group"><label for="ps-mode-' + n + '">Server mode</label>' +
+      _prodServerModeSelect('ps-mode-' + n, p.server_mode) + '</div>' +
     '<div class="form-group"><label for="ps-repo-' + n + '">Repository URL</label>' +
       '<input type="text" id="ps-repo-' + n + '" value="' + escHtmlAttr(p.repo_url || '') + '"></div>' +
     '<div class="form-group"><label for="ps-branch-' + n + '">Branch</label>' +
@@ -8532,6 +9695,11 @@ function _prodSettingsHtml(p) {
       '<div class="hint">Switching deploys the new branch as-is; run Update afterwards if modules need install/upgrade</div></div>' +
     '<div class="form-group"><label for="ps-gituser-' + n + '">Git user (credential matching, optional)</label>' +
       '<input type="text" id="ps-gituser-' + n + '" value="' + escHtmlAttr(p.git_user || '') + '"></div>' +
+    '<div class="form-group"><label for="ps-envvars-' + n + '">Environment variables</label>' +
+      '<textarea class="mono-input" id="ps-envvars-' + n + '" rows="4" spellcheck="false"' +
+        (envEditable ? '' : ' disabled') + '>' + esc(formatEnvLines(envVars)) + '</textarea>' +
+      '<div class="hint">One KEY=VALUE per line. Use KEY=secret:&lt;name&gt; for secrets from Credentials → Secrets; secret values are never shown. Clearing this field removes all user variables. HOST, USER and PASSWORD are set automatically from the database credentials; those three and PORT are reserved names.' +
+        (envEditable ? '' : ' Values with line breaks or surrounding spaces must be edited over MCP.') + '</div></div>' +
     '<div class="form-group"><label for="ps-extras-' + n + '">Extra addon repos (one per line, repo=branch)</label>' +
       '<textarea id="ps-extras-' + n + '" rows="3">' + esc(extras) + '</textarea></div>' +
     '<div class="form-group"><label class="select-box"><input type="checkbox" id="ps-copy-' + n + '"' +
@@ -8541,7 +9709,7 @@ function _prodSettingsHtml(p) {
     '<div style="margin-bottom:16px"><button class="btn btn-start" onclick="prodApplySettings(\'' + n + '\')">Apply — recreates container</button></div>' +
     '<div class="form-group"><label for="ps-conf-' + n + '">odoo.conf overrides (one per line, key = value)</label>' +
       '<textarea id="ps-conf-' + n + '" rows="4" placeholder="limit_time_real = 300">' + esc(conf) + '</textarea>' +
-      '<div class="hint">Win over the auto-tuned workers/limits and survive deploys. Managed keys (addons_path, data_dir, db_*) are refused.</div></div>' +
+      '<div class="hint">Win over the auto-tuned workers/limits and survive deploys. Managed keys (addons_path, data_dir, db_*, listen interface/ports) are refused; workers must stay at least 1.</div></div>' +
     '<div><button class="btn" onclick="prodSaveOdooConf(\'' + n + '\')">Save odoo.conf — restarts Odoo</button></div>' +
   '</div>';
 }
@@ -8576,8 +9744,14 @@ async function prodApplySettings(name) {
     repo_url: v('ps-repo'),
     branch: v('ps-branch'),
     git_user: v('ps-gituser'),
-    extra_addons: extras
+    extra_addons: extras,
+    server_mode: v('ps-mode')
   };
+  var envEl = document.getElementById('ps-envvars-' + name);
+  if (!envEl.disabled && envEl.value !== envEl.defaultValue) {
+    body.env_vars = _parseProductionEnvLines(envEl.value);
+    if (body.env_vars === null) return;
+  }
   if (!(await confirmDialog({
     title: 'Reconfigure production',
     message: 'Apply the settings to "' + name + '"? The container is recreated (brief downtime); the database and filestore are preserved.',
@@ -8590,10 +9764,15 @@ async function prodApplySettings(name) {
   _prodSettingsDirty[name] = false;
   var data = await _prodPost(API_PRODUCTIONS + '/' + encodeURIComponent(name) + '/reconfigure', body, null);
   if (data) {
-    showToast(data.changed && data.changed.length
-      ? 'Reconfigured "' + name + '": ' + data.changed.join(', ') +
-        (data.healthy === false ? ' — NOT healthy yet, check logs' : '')
-      : (data.message || 'No settings changed'));
+    // A response without `message` recreated the container: either settings
+    // changed, or nothing changed but drifted state (e.g. outdated routing)
+    // was repaired. Only an explicit `message` means it was left alone.
+    var unhealthy = data.healthy === false ? ' — NOT healthy yet, check logs' : '';
+    showToast(data.message
+      ? data.message
+      : data.changed && data.changed.length
+        ? 'Reconfigured "' + name + '": ' + data.changed.join(', ') + unhealthy
+        : 'No settings changed; container recreated to repair drifted state' + unhealthy);
   } else {
     _prodSettingsDirty[name] = true;
   }
@@ -8647,9 +9826,12 @@ async function prodUpdate(name) {
     message: 'Pull the latest commits of "' + name + '" and deploy. If the deploy fails, the CODE is rolled back automatically (the database is not).',
     confirmLabel: 'Deploy'
   }))) return;
-  var data = await _prodPost(API_PRODUCTIONS + '/' + encodeURIComponent(name) + '/update', undefined,
-    'Deploy of "' + name + '" started (watch status and deploy history)');
-  if (data) setTimeout(loadProductions, 5000);
+  var data = await _prodPost(API_PRODUCTIONS + '/' + encodeURIComponent(name) + '/update', undefined, '');
+  if (!data) return;
+  showToast(data.queued
+    ? 'Deploy of "' + name + '" queued: the production is busy (' + data.busy + '). It starts when that finishes.'
+    : 'Deploy of "' + name + '" started (watch status and deploy history)');
+  setTimeout(loadProductions, 5000);
 }
 
 async function prodRollback(name) {
@@ -8833,6 +10015,22 @@ function _prodEnabled() {
   return PROD_ENABLED;
 }
 
+function _parseProductionEnvLines(raw) {
+  // Spaces around the "=" are refused, not silently absorbed: parseEnvLines
+  // trims only the key, so "KEY = value" would store " value" and the textarea
+  // (which cannot round-trip edge whitespace) would then lock itself as
+  // read-only for good. Such a value has to be set over MCP.
+  var invalid = raw.split(/\r?\n/).some(function(line) {
+    return line.trim() && !/^[A-Za-z_][A-Za-z0-9_]*=(?!\s)/.test(line.trim());
+  });
+  if (invalid) {
+    showToast('Environment variables: each line must be KEY=VALUE, with no space ' +
+      'around the "="', true);
+    return null;
+  }
+  return parseEnvLines(raw);
+}
+
 function openCreateProductionModal(fromEnv) {
   var overlay = document.createElement('div');
   overlay.className = 'modal-overlay show';
@@ -8855,6 +10053,11 @@ function openCreateProductionModal(fromEnv) {
           '<input type="text" id="cp-xdomains" placeholder="erp.customer.com">' +
           '<div class="hint">Additional public domains routed to this production, e.g. the client\'s own domain</div></div>' +
         '<div class="form-group"><label for="cp-image">Odoo image</label><input type="text" id="cp-image" placeholder="odoo:18.0"></div>' +
+        '<div class="form-group"><label for="cp-mode">Server mode</label>' +
+          _prodServerModeSelect('cp-mode', 'workers') + '</div>' +
+        '<div class="form-group"><label class="select-box"><input type="checkbox" id="cp-set-envvars" onchange="document.getElementById(\'cp-envvars\').disabled = !this.checked"> Set production environment variables</label>' +
+          '<label for="cp-envvars">Environment variables</label><textarea class="mono-input" id="cp-envvars" rows="4" spellcheck="false" disabled placeholder="API_TOKEN=secret:my_token"></textarea>' +
+          '<div class="hint">Unchecked: inherit variables when promoting from an environment. Checked: use only the variables below; empty means none. One KEY=VALUE per line. Manage named secrets in Credentials → Secrets. HOST, USER and PASSWORD are set automatically from the database credentials; those three and PORT are reserved names.</div></div>' +
         '<div class="form-group"><label for="cp-template">Template (optional)</label><input type="text" id="cp-template" placeholder="empty = fresh database"></div>' +
         '<div class="form-group"><label class="select-box"><input type="checkbox" id="cp-auto"> Deploy automatically on GitHub push</label></div>' +
       '</div>' +
@@ -8878,6 +10081,7 @@ async function submitCreateProduction() {
     odoo_image: v('cp-image'),
     template_name: v('cp-template'),
     from_environment: v('cp-fromenv'),
+    server_mode: v('cp-mode'),
     auto_update: document.getElementById('cp-auto').checked
   };
   if (!body.name || (!body.domain && !window._teamBaseDomain)) {
@@ -8891,6 +10095,10 @@ async function submitCreateProduction() {
   if (body.from_environment && body.template_name) {
     showToast('Pick either a template or an environment to seed from, not both', true);
     return;
+  }
+  if (document.getElementById('cp-set-envvars').checked) {
+    body.env_vars = _parseProductionEnvLines(document.getElementById('cp-envvars').value);
+    if (body.env_vars === null) return;
   }
   showToast('Creating production "' + body.name + '"… this can take a few minutes');
   var data = await _prodPost(API_PRODUCTIONS + '/create', body,
@@ -8926,7 +10134,10 @@ async function loadHealth() {
 }
 
 if (!SCOPED_ENV) {
-  loadLicense();
+  if (!WHITE_LABEL) loadLicense();
+  // Refresh the local status so an open dashboard notices expiration. This
+  // endpoint only reads the local key; it never contacts the license server.
+  if (!WHITE_LABEL) setInterval(loadLicense, 60000);
   loadStats();
   loadHealth();
   loadServicePresets();

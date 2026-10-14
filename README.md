@@ -3,7 +3,7 @@
   <img src="https://img.shields.io/badge/Python-3.10+-blue?logo=python&logoColor=white" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/Docker-Required-2496ED?logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/Protocol-MCP-green" alt="MCP">
-  <img src="https://img.shields.io/badge/License-BUSL--1.1-yellow" alt="Business Source License 1.1">
+  <img src="https://img.shields.io/badge/License-PolyForm_Noncommercial_1.0.0-blue" alt="PolyForm Noncommercial 1.0.0">
   <img src="https://img.shields.io/badge/Odoo-15.0--19.0-714B67?logo=odoo&logoColor=white" alt="Odoo">
 </p>
 
@@ -74,7 +74,8 @@ otherwise to `~/.oduflow/conf/oduflow.toml`. Fresh configs include generated
 secrets for HTTP access: `[team.1].auth_token` for MCP clients and
 `[team.1].ui_password` for the Web Dashboard. The file is created with mode
 `0600`; the secrets are never printed to the log, so read them from the config
-itself (`sudo grep -E 'auth_token|ui_password' /etc/oduflow/oduflow.toml`).
+itself: `sudo grep -E 'auth_token|ui_password' /etc/oduflow/oduflow.toml`
+(or the same `grep` on `~/.oduflow/conf/oduflow.toml` for a non-root install).
 
 By default, the server starts in **stdio** mode (for local MCP clients). For remote/multi-user deployments:
 
@@ -140,8 +141,17 @@ For full documentation, visit **[oduflow.dev](https://oduflow.dev)** or see the 
 
 ## Telemetry
 
-Oduflow collects anonymous usage telemetry (first startup and environment creation events) to understand adoption. Only the event name, version, and a random instance ID are sent — no personal data or environment details. To opt out, add `disable_telemetry = true` to the `[server]` section of your `oduflow.toml`. See the [documentation](https://oduflow.dev/installation/#telemetry) for details.
+Oduflow collects anonymous usage telemetry (first startup and environment creation events) to understand adoption. Only the event name, version, and a random instance ID are sent — no personal data or environment details. To opt out, add `disable_telemetry = true` to the `[server]` section of your `oduflow.toml`. To skip it for a single run (e.g. a test run), start Oduflow with `--no-telemetry`. See the [documentation](https://oduflow.dev/installation/#telemetry) for details.
 
 ## Licensing
 
-Oduflow is source-available under the [Business Source License 1.1](LICENSE). Evaluation, educational, and other non-commercial use is free forever. Commercial use requires a paid license in one of three tiers — Individual (solo developers), Business (internal company use), or Integrator (Odoo service providers) — visit [oduflow.dev](https://oduflow.dev). Each release converts to the open-source MPL 2.0 four years after publication.
+Oduflow is source-available under [PolyForm Noncommercial License 1.0.0](LICENSE).
+Noncommercial purposes and the organizations covered by that license may use it
+for free. A separate [internal evaluation permission](EVALUATION-LICENSE.md)
+allows companies to assess Oduflow before buying.
+
+Use outside those permissions requires an alternative
+[commercial license](COMMERCIAL-LICENSE.md): Solo, Business, Integrator, or
+Enterprise. Read the [Oduflow Commercial License Agreement](https://oduflow.dev/eula)
+and [compare plans](https://oduflow.dev/pricing). All plans include the same code,
+features and public updates. Earlier releases retain their original licenses.

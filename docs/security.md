@@ -28,6 +28,16 @@ value is stored in `oduflow.toml` (created with mode `0600`) and never written t
 the log; read it from the file and use it as
 `Authorization: Bearer <auth_token>` when connecting HTTP MCP clients.
 
+## Server settings console
+
+The [Server settings console](admin.md) at `/admin` edits `oduflow.toml`,
+including every team's tokens and passwords, so it is not part of any team's
+dashboard. It has its own `[admin] password` (plus optional TOTP via
+`oduflow ui-2fa setup --admin`), its own 12-hour session cookie, and refuses
+team credentials; a console session does not open a team dashboard either.
+While the password is empty, `/admin` answers 404. Secrets reach the browser
+only through an explicit, logged **Reveal**.
+
 ## Self-hosted OAuth (for Claude.ai and other MCP clients)
 
 Oduflow can act as its own OAuth 2.1 Authorization Server, so MCP clients that require an OAuth flow (e.g. Claude.ai Remote MCP, MCP Inspector) can connect without any external identity provider.
@@ -398,7 +408,7 @@ Environment variables on services and environments are visible to coding agents 
 
 **Secrets** are team-scoped named values that avoid this. A human operator creates them in the dashboard (**Credentials** tab → **Secrets**); values are *write-only* — they can be replaced or deleted, but no MCP tool or REST endpoint ever returns a stored value. Agents can list the names with `list_secrets`.
 
-When adding or replacing a secret, **Hide value** masks the input by default. **JSON value** opens a multiline field, turns off masking, and validates the JSON while you type. JSON secrets also undergo server-side validation before saving; invalid input leaves the previous value intact. The stored type (`text` or `json`) persists across replacements. Existing secrets default to `text`. JSON values retain their original formatting and may contain any valid JSON value, including arrays and scalars; `NaN` and `Infinity` are rejected.
+The secret form starts with **Name**, followed by the independent **Hide value** and **JSON value** switches. **Hide value** masks the ordinary text value and the individual key's **Value** by default. In JSON mode, **Replace Data** is always visible, even with masking enabled, and validates JSON while you type. Its warning makes clear that saving replaces all data in the secret. Text and JSON replacement drafts stay separate when switching modes. JSON secrets also undergo server-side validation before saving; invalid input leaves the previous value intact. The stored type (`text` or `json`) persists across replacements. Secrets saved before types existed are typed by their stored value: a JSON object or array is `json`, anything else (including scalars such as `123`) is `text`; an upgrade records that type once. JSON values retain their original formatting and may contain any valid JSON value, including arrays and scalars; `NaN` and `Infinity` are rejected.
 
 To use one, set the env-var value to a reference:
 
@@ -413,9 +423,85 @@ oduflow call create_service '{
 
 The real value is substituted only into the container's environment at creation time. Everything that stores or displays the configuration — the service preset, the environment's Docker label, template metadata, `get_service_info`/`get_environment_info` output — keeps the `secret:<name>` reference. Because only the reference travels, secrets migrate automatically when a service is restored from a preset, an environment is renamed, or an environment is saved as a template and new environments are created from it.
 
-A dangling reference (secret deleted or never created) fails the create/update with a clear error before anything is touched; running containers keep their resolved value until recreated. After replacing a secret's value, recreate the services/environments that use it (`update_service` / `update_environment`): a rotated value counts as a config change, so `update_service` recreates the container even when the image and every other setting are unchanged.
+A dangling reference (secret deleted or never created) fails the create/update with a clear error before anything is touched; running containers keep their resolved value until recreated. After replacing a secret's value, recreate the services, environments and productions that use it (`update_service` / `update_environment` / `reconfigure_production`): a rotated value counts as a config change, so `update_service` and `reconfigure_production` recreate the container even when the image and every other setting are unchanged. `restart_production` and `restart_environment` keep the old value.
 
 The store lives at `{team_data_dir}/secrets.json` with owner-only (0600) file permissions, like the other credential stores. Note the boundary: code running *inside* a container can always read its own environment — secrets protect the MCP/REST/dashboard read surfaces, not the container itself.
+
+### Updating one JSON element
+
+In the dashboard, choose **Edit secret** on an existing JSON secret. Above
+**Replace Data**, enter a path in **Update Key** (for example,
+`environment.OPENROUTER_API_KEY`) and the new non-empty text in **Value**, then
+click **Save key**. The value is saved as a string exactly as entered, without
+JSON quotes or automatic conversion of text such as `true` or `123`.
+**Hide value** controls masking for this field independently of the visible
+replacement JSON.
+
+**Update Key** and **Value** stay disabled for a secret stored as text, even
+with **JSON value** checked. Paste the full JSON into **Replace Data** and click
+**Replace data** once; the form closes and the secret is stored as JSON. Open
+**Edit secret** again to update individual keys.
+
+After saving, the form stays open and displays **Key created** or **Key updated**
+with the submitted path. The value field is cleared, and the path remains for
+reuse. The result comes from the server, which checks whether the key existed
+under the same lock as the write. Editing the key or value clears the previous
+result. Stored secret values are never displayed.
+
+**Save key** and **Replace data** are separate actions: saving a key never
+submits or clears the replacement draft, and replacing data never submits the
+key fields. Individual key saves are disabled for new or text secrets until
+they have been saved as JSON.
+
+To save a field through the API, send an authenticated request to
+`POST /api/secrets/{name}/update-json`:
+
+```json
+{"path": "environment.OPENROUTER_API_KEY", "value": "new-api-key"}
+```
+
+The secret must already have type `json`. A missing final object key is created;
+an existing key or array element is replaced. All parent containers must exist:
+`environment.OPENROUTER_API_KEY` requires an existing `environment` object.
+Text secrets return HTTP 400 even when their contents happen to be valid JSON;
+the method never changes a secret's type. A missing secret returns HTTP 404.
+
+`path` accepts either syntax:
+
+- Dot notation: `password` selects a top-level key,
+  `environment.OPENROUTER_API_KEY` selects a nested key, and `accounts.0.token`
+  selects a field in the first array element. Segments must be non-empty;
+  leading/trailing dots, consecutive dots and slashes are rejected.
+- JSON Pointer: `/password`, `/environment/OPENROUTER_API_KEY`, and
+  `/accounts/0/token` select the same paths. In this syntax dots are literal:
+  `/environment.OPENROUTER_API_KEY` selects one top-level key whose name contains
+  a dot. Escape `/` within a key as `~1`, and `~` as `~0`. `/` selects an
+  empty-string key.
+
+Array indices start at zero and cannot have leading zeros. Empty paths, missing
+parents, scalar parents, out-of-range array indices and array append (`-`) are
+rejected with HTTP 400 without modifying the secret. Arrays are never extended.
+
+`value` is the new JSON value itself, not a JSON-encoded string. Strings,
+numbers, booleans, objects, arrays, and `null` are supported; `null` replaces
+the element with null rather than deleting it. Replacing an object or array
+replaces that entire selected subtree. Other elements retain their values,
+though the stored JSON is reformatted with two-space indentation and non-ASCII
+characters are escaped as `\uXXXX` sequences (surrogate pairs where needed).
+JSON parsing restores the same characters. `NaN` and `Infinity` are rejected.
+
+The server performs the read/modify/write under the same team lock as other
+secret writes. It preserves `created_at` and updates `updated_at`. Responses
+contain only the secret name and creation/update flags, never secret values.
+`created: true` means a new key was added; `created: false` means an existing
+element was replaced (`updated` is the inverse). For example, an update returns:
+
+```json
+{"ok": true, "result": {"name": "my-secret", "created": false, "updated": true}}
+```
+
+Recreate consumers with `update_service` / `update_environment` to apply the
+updated value to their containers.
 
 ## iptables rule
 
@@ -430,4 +516,7 @@ The bundled `odoo.conf` template includes these security settings:
 - `max_cron_threads = 0` (disables cron in dev environments)
 
 A repository that ships its own `.oduflow/odoo.conf` replaces the template
-entirely and is responsible for these settings itself.
+entirely and is responsible for these settings itself. Either way, the
+generated conf always sets `http_interface = 0.0.0.0`: Odoo 20 otherwise
+listens only on `127.0.0.1`, which neither Traefik nor a published port can
+reach.

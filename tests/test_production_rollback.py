@@ -307,6 +307,7 @@ class TestProductionDatabaseRouting:
             patch.object(production_ops, "get_client", return_value=client),
             patch.object(production_ops, "_require_container", return_value=container),
             patch.object(production_ops, "wait_production_healthy", return_value=True),
+            patch.object(production_ops, "_has_routing_drift", return_value=False),
             patch("oduflow.docker_ops.env_ops.pull_environment", side_effect=fake_pull),
             patch.object(odoo_ops, "get_client", return_value=client),
             patch.object(
@@ -364,3 +365,108 @@ class TestProductionDatabaseRouting:
         assert deploy["from_commit"] == old_head
         assert deploy["to_commit"] == new_head
         container.restart.assert_called_once()
+
+
+def _deploy(settings, team, fake_pull, hook, **kwargs):
+    """Run update_production with *fake_pull* standing in for the pull engine."""
+    with (
+        patch.object(production_ops, "pre_update_hooks", [hook]),
+        patch.object(production_ops, "get_client", return_value=MagicMock()),
+        patch.object(production_ops, "_require_container", return_value=_container()),
+        patch("oduflow.docker_ops.env_ops.pull_environment", side_effect=fake_pull),
+        patch.object(production_ops, "wait_production_healthy", return_value=True),
+        patch.object(production_ops, "_has_routing_drift", return_value=False),
+    ):
+        return production_ops.update_production(settings, team, "erp", **kwargs)
+
+
+class TestPreUpdateHooks:
+    """Issue #309: the pre-update snapshot (minutes on a large filestore) runs
+    only when the deploy has something to apply, against the pre-deploy code."""
+
+    def test_nothing_to_apply_skips_hooks_and_clears_stale_flag(
+        self, settings, team, prod_repo
+    ):
+        _repo, _old, new_head = prod_repo
+        # A deploy thread that died without cleanup left the flag behind; a
+        # no-op deploy is what clears it.
+        production_registry.update_production(team, "erp", {"deploy_in_progress": True})
+        hook = MagicMock()
+
+        def fake_pull(*args, before_apply=None, **kw):
+            return {"action": "none", "message": "Already up to date."}
+
+        result = _deploy(settings, team, fake_pull, hook)
+
+        hook.assert_not_called()
+        assert result["action"] == "none"
+        assert result["commit"] == new_head
+        assert production_ops.read_deploys(team, "erp", limit=0) == []
+        assert not production_registry.get_production(team, "erp").get(
+            "deploy_in_progress"
+        )
+
+    def test_hooks_see_the_pre_deploy_commit(self, settings, team, prod_repo):
+        from oduflow.git_ops import reset_hard
+
+        repo_path, old_head, new_head = prod_repo
+        reset_hard(repo_path, old_head)
+        seen: list[str] = []
+
+        def hook(*args):
+            seen.append(rev_parse(repo_path))
+
+        def fake_pull(*args, before_apply=None, **kw):
+            reset_hard(repo_path, new_head)  # the pull moved the checkout
+            before_apply()
+            # The apply step must find the pulled code back in place.
+            assert rev_parse(repo_path) == new_head
+            return {"action": "upgrade", "exit_code": 0, "changed_files": ["a.py"]}
+
+        result = _deploy(settings, team, fake_pull, hook)
+
+        # The snapshot records the commit its database ran against, and the
+        # running server never sees the new code while it is taken.
+        assert seen == [old_head]
+        assert result["commit"] == new_head
+        assert result["deploy"]["to_commit"] == new_head
+
+    def test_failing_hook_still_restores_the_pulled_code(
+        self, settings, team, prod_repo
+    ):
+        from oduflow.git_ops import reset_hard
+
+        repo_path, old_head, new_head = prod_repo
+        reset_hard(repo_path, old_head)
+
+        def fake_pull(*args, before_apply=None, **kw):
+            reset_hard(repo_path, new_head)
+            before_apply()
+            return {"action": "restart", "exit_code": 0, "changed_files": ["a.py"]}
+
+        result = _deploy(
+            settings, team, fake_pull, MagicMock(side_effect=RuntimeError("s3 down"))
+        )
+
+        assert result["commit"] == new_head
+        assert rev_parse(repo_path) == new_head
+
+    def test_progress_is_reported_and_cleared(self, settings, team, prod_repo):
+        from oduflow.locking import current_progress, prod_lock_key
+
+        key = prod_lock_key(team.team_id, "erp")
+        phases: list[str] = []
+
+        def hook(*args):
+            phases.append(str(current_progress(key)["phase"]))
+
+        def fake_pull(*args, before_apply=None, **kw):
+            phases.append(str(current_progress(key)["phase"]))
+            before_apply()
+            phases.append(str(current_progress(key)["phase"]))
+            return {"action": "restart", "exit_code": 0, "changed_files": ["a.py"]}
+
+        _deploy(settings, team, fake_pull, hook)
+
+        assert phases == ["fetching code", "fetching code", "applying changes"]
+        assert current_progress(key) is None

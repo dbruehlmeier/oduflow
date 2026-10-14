@@ -5,7 +5,15 @@
 ```bash
 # Show version
 oduflow --version
+
+# Disable anonymous usage telemetry for this run only (e.g. test or CI runs);
+# place it before any subcommand
+oduflow --no-telemetry --transport http
+oduflow --no-telemetry stack apply oduflow.yaml
 ```
+
+`--no-telemetry` overrides `disable_telemetry` in `oduflow.toml` for the
+current process only. See [Telemetry](installation.md#telemetry).
 
 ## Running the Server
 
@@ -60,6 +68,54 @@ lookup as the server, do not require Docker access, and do not start the server.
 Changes take effect without a restart. Shared links and MCP clients are
 unaffected. See [UI 2FA](security.md#enable-authenticator-app-2fa) for enrollment,
 session expiry, and recovery details.
+
+## License Commands
+
+Manage the commercial license on the server. This is the only license interface
+under a [Custom license](licensing.md#custom-license-white-label), where the
+dashboard shows no license dialog to your clients.
+
+```bash
+# Holder, validity, and for a Custom license the brand, domains and white-label state
+oduflow license status
+
+# Verify and install a key file into the config directory
+oduflow license install ./license.key
+
+# Install a renewed key from the license server, if one was paid
+oduflow license refresh
+
+# Print a payment link when the license period ended without a subscription
+oduflow license subscribe
+```
+
+The commands read the existing configuration only and do not require Docker.
+Restart the service after installing or renewing a license so MCP clients see
+the change; the dashboard picks it up within a minute.
+
+## Server Settings Console
+
+The [Server settings console](admin.md) at `/admin` edits `oduflow.toml` from
+the browser. Its password is the one setting it cannot create for itself:
+
+```bash
+# Generate a console password, store it as [admin] password, print it once
+oduflow admin enable
+
+# Replace the password (signs every console session out)
+oduflow admin enable --reset
+
+# Remove the password; /admin answers 404 again
+oduflow admin disable
+
+# Optional: authenticator-app 2FA for the console
+oduflow ui-2fa setup --admin
+oduflow ui-2fa reset --admin
+```
+
+`enable` and `disable` write through the same validated, history-keeping writer
+as the console. Restart Oduflow afterwards so the running server picks the
+password up.
 
 ## Declarative Stack Commands
 
@@ -138,6 +194,13 @@ first-line `# KEEP` remains an unconditional opt-out.
 This command is separate from upgrading the Python package (for example,
 `uv tool upgrade oduflow`). It does not manage `postgresql.conf`; use
 `oduflow retune-postgres` for PostgreSQL planning and updates.
+
+Before reconciling, `oduflow upgrade` checks that the next server start
+accepts the configured `[database].image` and can complete a PostgreSQL upgrade
+it requests (see [Upgrading PostgreSQL](installation.md#upgrading-postgresql)).
+If environments or unexpected databases block the upgrade, or the image needs
+attention, the command lists the problems and exits with an error without
+changing anything, and `self-update` does not restart the service.
 
 `oduflow self-update` chains the whole documented upgrade: it compares the
 installed version with the latest GitHub release, upgrades the package through
@@ -253,7 +316,7 @@ The `cleanup` command detects and removes resources that no longer have a corres
 - **Orphan workspaces** — workspace directories on disk that have no matching environment container
 - **Orphan port entries** — entries in `ports.json` that have no matching environment container
 
-By default, `cleanup` runs in **dry-run mode** and only reports what would be removed. Use `--force` to actually delete the orphaned resources.
+By default, `cleanup` runs in **dry-run mode** and only reports what would be removed. Use `--force` to actually delete the orphaned resources; anything that could not be removed is reported on an `Error:` line. The dashboard's **Cleanup** button shows the same preview and can also remove unused Docker images.
 
 ## Systemd Service
 

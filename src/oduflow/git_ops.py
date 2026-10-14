@@ -106,8 +106,15 @@ def team_ssh_command(ssh_dir: str) -> str:
 
 
 def ssh_key_comment(team_id: str) -> str:
-    """The comment baked into a team's key (identifies it on the git host)."""
-    return f"oduflow-{team_id}"
+    """The comment baked into a team's key (identifies it on the git host).
+
+    Under white label the brand replaces the product name for newly generated
+    keys; an existing key keeps the comment it was created with.
+    """
+    from oduflow import branding
+
+    brand = branding.current()
+    return f"{brand.slug if brand.white_label else 'oduflow'}-{team_id}"
 
 
 def ensure_ssh_key(ssh_dir: str, comment: str = "oduflow", force: bool = False) -> bool:
@@ -597,6 +604,8 @@ def _check_token_with_provider(host: str, username: str, token: str) -> str:
     from urllib.error import HTTPError, URLError
     from urllib.request import Request, urlopen
 
+    from oduflow import branding
+
     api_url = _PROVIDER_API_URLS.get(host)
     if not api_url:
         return "unknown"
@@ -612,7 +621,7 @@ def _check_token_with_provider(host: str, username: str, token: str) -> str:
 
             b64 = base64.b64encode(f"{username}:{token}".encode()).decode()
             req.add_header("Authorization", f"Basic {b64}")
-        req.add_header("User-Agent", "oduflow")
+        req.add_header("User-Agent", branding.current().slug)
         resp = urlopen(req, timeout=10)
         return "valid" if resp.status == 200 else "invalid"
     except HTTPError as e:

@@ -414,8 +414,24 @@ oduflow call list_templates
 # → - prod: DB=loaded, ..., Source=prod @ c0ffee12 @ snapshot 2026-08-01
 ```
 
-`create_environment` compares that commit with the branch checkout and reports
-the drift in its response:
+One direction is handled for you. Before the environment is reported ready,
+`create_environment` compares each installed module's version in the cloned
+database (`ir_module_module.latest_version`) with the `version` in your
+checkout's `__manifest__.py`, and runs `odoo -u` for every module whose
+checkout is newer — for any template, imported ones included. Without that
+step Odoo would load the new models against the old tables, `/web/login`
+would fail with `column ... does not exist`, and the environment would be
+rolled back after the readiness timeout. The upgraded modules appear in the
+setup log as `[TEMPLATE-UPGRADE]`; if the upgrade itself fails, the
+environment is rolled back and the error carries Odoo's output. If the
+comparison itself cannot run (an unreadable `odoo.conf`, a database that does
+not answer), creation continues without it and the setup log says
+`[TEMPLATE-UPGRADE] version check skipped` with the reason — so a readiness
+timeout right after is explained by that line, not a mystery.
+
+The comparison only sees version bumps. For everything else,
+`create_environment` compares the template's snapshot commit with the branch
+checkout and reports the drift in its response:
 
 * **"Code is behind the template database"** — your branch does not contain the
   snapshot commit. The database already holds views and records written by newer
@@ -433,8 +449,9 @@ the drift in its response:
 
 Templates created before Oduflow recorded provenance — and templates imported
 from a running Odoo — have no commit to compare against, so no drift is
-reported. That is not an error; the rule above still applies, you just have to
-apply it by hand.
+reported. That is not an error: bumped modules are still upgraded at creation,
+and the rule above still applies to the rest — you just have to apply it by
+hand.
 
 !!! warning "Recreating the environment does not fix it"
     The template is unchanged, so the same drift comes straight back — and the
@@ -458,7 +475,14 @@ the work continues server-side. Wait for it to finish and retry; restarting or
 recreating the environment interrupts real work instead of clearing anything.
 
 Background operations take the same locks and are named too: `auto-stop`,
-`auto-delete`, `scheduled backup`, `webhook deploy`.
+`auto-delete`, `scheduled backup`, `webhook deploy`, `dashboard deploy`.
+
+Production deploys and snapshots also report their current step, so a
+long snapshot is distinguishable from a hung deploy:
+
+```
+Another operation on production 'erp' (dashboard deploy: pre-update snapshot (filestore 1200/12340 files, 3100 MiB) for 1m40s; running for 2m15s) is in progress.
+```
 
 ---
 

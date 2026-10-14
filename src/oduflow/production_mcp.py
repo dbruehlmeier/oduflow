@@ -14,7 +14,7 @@ from typing import Any
 
 import httpx
 
-from oduflow import production_registry
+from oduflow import branding, production_registry
 from oduflow.errors import FlowError, PrerequisiteNotMetError
 from oduflow.naming import get_repo_path, get_workspace_path, prod_env_name
 from oduflow.settings import Settings, TeamSettings
@@ -292,7 +292,8 @@ def execute(
                 headers={
                     "Authorization": "Bearer " + team.production_token,
                     "X-Request-ID": request_id,
-                    "User-Agent": "oduflow-production",
+                    # Lands in the client's production access log.
+                    "User-Agent": f"{branding.current().slug}-production",
                 },
                 json={"operation": operation, "params": params or {}},
             ) as response:
