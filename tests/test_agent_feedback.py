@@ -198,11 +198,19 @@ class TestGuideSection:
         _patch_instance(monkeypatch, Settings())
         assert "Session Feedback" not in call_tool("get_agent_instructions", ctx=None)
 
-    def test_appended_when_enabled(self, monkeypatch):
+    def test_appended_when_enabled(self, monkeypatch, feedback_enabled):
+        # The section documents a published tool, so the guide follows the
+        # surface startup exposed rather than reading the option again.
         _patch_instance(monkeypatch, Settings(agent_feedback=True))
         guide = call_tool("get_agent_instructions", ctx=None)
         assert "Session Feedback" in guide
         assert "submit_agent_feedback" in guide
+
+    def test_absent_while_the_option_is_on_but_the_tool_is_withheld(self, monkeypatch):
+        # White label withholds the tool at startup (see test_branding); the
+        # guide must not advertise it even though the option is on.
+        _patch_instance(monkeypatch, Settings(agent_feedback=True))
+        assert "Session Feedback" not in call_tool("get_agent_instructions", ctx=None)
 
 
 class TestSubmitTool:

@@ -162,6 +162,58 @@ add `# KEEP` as the **very first line**:
 Files marked with `# KEEP` are skipped and listed as `(kept)` in the upgrade
 output, including under `--force`.
 
+#### Upgrading PostgreSQL
+
+Oduflow supports PostgreSQL 15, 16 and 17; Odoo 20 needs 16 or newer, and the
+`postgres:18` images use a different data layout. New installations use
+`postgres:16`. An existing cluster keeps its major version until you raise
+`[database].image`: a newer default never upgrades a cluster. If
+`oduflow.toml` has no `image` key while a cluster holds older data, startup
+asks you to set the key explicitly, to keep the cluster or to upgrade it.
+
+Both clusters are upgraded together. Prepare the server first:
+
+1. Delete all development environments, including stopped ones. Their
+   databases are not carried over, so push their code first. Templates are
+   kept and restored from their dumps on disk.
+2. Back up anything you want to keep. With `[backup]` configured, the
+   production cluster's WAL-G archive (`<backup.prefix>/walg/` in the bucket)
+   is deleted during the upgrade, because its base backups cannot be restored
+   into a newer major. Logical production snapshots stay restorable.
+3. Set `[database].image` to the newer image, for example `postgres:16`, and
+   restart Oduflow. `oduflow upgrade`, which `oduflow self-update` runs before
+   restarting, lists anything that blocks the upgrade and exits with an error,
+   so the running server stays up while you resolve it.
+
+On startup, before changing anything, Oduflow checks that no environment
+remains, that the clusters hold only databases it can restore, that the new
+image provides every extension those databases use, and that there is room for
+the dumps. It then stops services and production Odoo containers, and dumps
+service databases and production databases (including productions deleted
+with their data kept) together with all PostgreSQL roles and their passwords.
+With `[backup]` configured, it then deletes the old WAL-G archive. Only then
+does it remove the old clusters, create new ones and restore everything, so
+service and production credentials stay valid. Productions and services start
+again once their databases are restored (productions after WAL archiving is
+verified), and a new base backup is taken shortly afterwards. Template
+databases are restored from their dumps on disk last, and the dumps are
+deleted. Productions and services are down while their databases are dumped
+and restored.
+
+A failure before an old cluster is removed, including a refused S3 delete,
+leaves everything as it was, and setting the image back cancels the upgrade; if
+the archive was already partly deleted, a new base backup is taken. After an
+old cluster is removed, a restart resumes where it stopped, so keep the new
+image configured. If a template cannot be restored, fix its dump and restart,
+or delete the template with `oduflow delete-template <name> --team <id>` and
+restart; productions and services keep running meanwhile.
+
+Only the server upgrades, and only when no other Oduflow server runs on the
+same data directory (an stdio MCP client starts its own): stop the others
+first, or startup refuses before changing anything. `oduflow stack apply`
+refuses while an upgrade is requested or under way, so restart the server
+first.
+
 ## Configuration Reference
 
 All settings are configured via a TOML file. Oduflow searches for `oduflow.toml` in the following order:
@@ -173,13 +225,20 @@ All settings are configured via a TOML file. Oduflow searches for `oduflow.toml`
 If no config file exists when Oduflow starts, the bundled default is copied to
 `/etc/oduflow/oduflow.toml` when that directory is writable, otherwise to
 `~/.oduflow/conf/oduflow.toml`. The copied file is populated with generated
-values for `[database].password`, `[team.1].auth_token`, and
-`[team.1].ui_password`. The file is created with mode `0600` and the generated
-secrets are never printed to the log — read them from the config file:
+values for `[database].password`, `[team.1].auth_token`,
+`[team.1].ui_password` and `[admin].password`. The file is created with mode
+`0600` and the generated secrets are never printed to the log — read them from
+the config file:
 
 ```bash
-sudo grep -E 'auth_token|ui_password' /etc/oduflow/oduflow.toml
+sudo grep -E 'auth_token|ui_password' /etc/oduflow/oduflow.toml 2>/dev/null \
+  || grep -E 'auth_token|ui_password' ~/.oduflow/conf/oduflow.toml
 ```
+
+You do not have to edit this file by hand afterwards: in HTTP mode the
+[Server settings console](admin.md) at `/admin` edits every section and every
+team from the browser, validates each change with the same parser the server
+boots with, keeps a history, and restarts Oduflow when a change needs it.
 
 ### Minimal configuration
 
@@ -200,6 +259,10 @@ allow_local_path = true     # trusted single-user local development; disable on 
 # trace = false             # verbose tracing for git analysis & env ops
 # disable_telemetry = false # disable anonymous first_run/env_created events
 
+# ── Server settings console ───────────────────────────
+[admin]
+password = ""               # /admin console password; empty = console disabled
+
 # ── Routing ───────────────────────────────────────────
 [routing]
 mode = "port"               # "port" (direct host port) | "traefik" (reverse proxy with auto-HTTPS)
@@ -218,7 +281,7 @@ mode = "port"               # "port" (direct host port) | "traefik" (reverse pro
 [database]
 user = "odoo"               # PostgreSQL user for the shared database container
 # password = "..."          # auto-generated on first launch; set explicitly to override
-image = "postgres:15"       # PostgreSQL Docker image
+image = "postgres:16"       # PostgreSQL Docker image (15-17; a newer major upgrades)
 
 # ── Storage ───────────────────────────────────────────
 [storage]
@@ -236,15 +299,22 @@ prod_purge_hours = 0        # purge DB/files kept by a production deletion after
 # from the dashboard (Agent Chat / Agent CLI). Opt-in per team via
 # agent_enabled below.
 # [agent]
-# image = "oduist/oduflow-coder:0.3.2"
+# image = "oduist/oduflow-coder:0.3.4"
 # claude_model = ""         # optional Claude model override; empty = CLI default
 # codex_model = ""          # optional Codex model override; empty = CLI default
 # opencode_model = ""       # optional provider/model override; empty = OpenCode default
 
+# Optional OpenAI-compatible gateway for OpenCode (Chat Completions); values
+# of the named variables come from [team.X.agent_env].
+# [agent.opencode_provider]
+# id = "litellm"            # select models as "litellm/<model>"
+# models = ["glm-5.3"]
+# base_url_env = "OPENCODE_PROVIDER_BASE_URL"
+# api_key_env = "OPENCODE_PROVIDER_API_KEY"
+
 # ── Production hosting (optional) ─────────────────────
 # [production]
 # enabled = true            # opt in; requires routing.mode = "traefik"
-# postgres_image = ""       # managed PG15 with CA; inherits custom [database].image
 # walg_version = ""         # empty = Oduflow's pinned WAL-G version
 # workers_cap = 8           # upper bound for auto-tuned Odoo workers
 
@@ -309,6 +379,12 @@ port_range = [50000, 50100]          # port range for Odoo containers [start, en
 | `[server].trace` | `false` | Enable detailed trace logging for git analysis and environment operations |
 | `[server].disable_telemetry` | `false` | Disable anonymous usage telemetry (see [Telemetry](#telemetry)) |
 
+### Server settings console
+
+| Key | Default | Description |
+|---|---|---|
+| `[admin].password` | *(empty; generated on fresh installs)* | Password of the deployment-wide [Server settings console](admin.md) at `/admin`, which edits this whole file from the browser. Empty = the console does not exist (404). Must differ from every team `ui_password`, `auth_token` and `production_token`. Enable it on an existing install with `oduflow admin enable` |
+
 ### Routing settings
 
 | Key | Default | Description |
@@ -324,7 +400,7 @@ port_range = [50000, 50100]          # port range for Odoo containers [start, en
 |---|---|---|
 | `[database].user` | `odoo` | PostgreSQL user for the shared database container |
 | `[database].password` | *(generated)* | PostgreSQL password. The bundled config omits it and one is auto-generated on first launch; set explicitly to override |
-| `[database].image` | `postgres:15` | PostgreSQL Docker image |
+| `[database].image` | `postgres:16` | PostgreSQL Docker image for both the development and production clusters: PostgreSQL 15, 16 or 17. A newer major than a cluster's data upgrades it on the next start (see [Upgrading PostgreSQL](#upgrading-postgresql)); an older one is refused |
 
 ### Storage settings
 
@@ -342,10 +418,16 @@ The global `[agent]` section holds deployment-wide settings for the per-team cod
 
 | Key | Default | Description |
 |---|---|---|
-| `[agent].image` | `oduist/oduflow-coder:0.3.2` | Immutable image for the per-team coding-agent container (Claude Code + OpenAI Codex + OpenCode); the default is coupled to the Oduflow release |
+| `[agent].image` | `oduist/oduflow-coder:0.3.4` | Immutable image for the per-team coding-agent container (Claude Code + OpenAI Codex + OpenCode); the default is coupled to the Oduflow release |
 | `[agent].claude_model` | *(empty)* | Optional Claude model override for the agent; empty = CLI default |
 | `[agent].codex_model` | *(empty)* | Optional Codex model override for the agent; empty = CLI default |
 | `[agent].opencode_model` | *(empty)* | Optional OpenCode model override in `provider/model` format; empty = OpenCode default |
+| `[agent].opencode_provider` | *(absent)* | Optional `[agent.opencode_provider]` sub-table: a custom OpenAI-compatible OpenCode provider using Chat Completions (for example a LiteLLM gateway); absent = OpenCode unchanged. See [OpenAI-compatible gateway](agent.md#openai-compatible-gateway-for-opencode) |
+| `[agent.opencode_provider].id` | — | Required provider id (lowercase letters, digits, `-`, `_`; not `anthropic`, `google`, `openai`, `opencode` or `openrouter`). Select its models as `<id>/<model>` |
+| `[agent.opencode_provider].models` | — | Required list of model ids as the gateway names them; an `opencode_model` naming this provider must be one of them |
+| `[agent.opencode_provider].name` | *(id)* | Display name shown in OpenCode |
+| `[agent.opencode_provider].base_url_env` | `OPENCODE_PROVIDER_BASE_URL` | Name of the agent environment variable holding the base URL, including `/v1` |
+| `[agent.opencode_provider].api_key_env` | `OPENCODE_PROVIDER_API_KEY` | Name of the agent environment variable holding the API key |
 
 ### Production settings
 
@@ -358,7 +440,6 @@ hosting at call time.
 | Key | Default | Description |
 |---|---|---|
 | `[production].enabled` | `false` | Enable long-lived production environments and their dedicated PostgreSQL cluster. Requires Traefik routing |
-| `[production].postgres_image` | *(empty)* | PostgreSQL image for the production cluster. Empty uses `oduist/oduflow-postgres:15-bookworm-1` with CA certificates when `[database].image` is the default `postgres:15`; custom database images/majors are inherited |
 | `[production].walg_version` | *(empty)* | WAL-G release override. Empty uses the version pinned by Oduflow |
 | `[production].odumcp_repo_url` | `https://github.com/oduflow/oduflow-client-addons.git` | Fallback source for automatic OduMCP installation when production repositories do not provide the addon |
 | `[production].odumcp_ref` | `19.0` | Connector branch or tag; must contain Odoo 19 addon version 19.0.1.1.0 or later with managed-key support |
@@ -507,6 +588,15 @@ Add to your `oduflow.toml`:
 ```toml
 [server]
 disable_telemetry = true
+```
+
+To disable telemetry for a single run only (for example, a test or CI run that
+should not count toward usage stats), pass the global `--no-telemetry` flag
+before any subcommand:
+
+```bash
+oduflow --no-telemetry --transport http
+oduflow --no-telemetry stack apply oduflow.yaml
 ```
 
 ## Auto-start with systemd

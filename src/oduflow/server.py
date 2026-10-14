@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import dataclasses
 import functools
 import inspect
 import json
@@ -11,6 +12,7 @@ import pathlib
 import re
 import shlex
 import sys
+import threading
 import warnings
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Any, ParamSpec, TypeVar, cast
@@ -32,6 +34,7 @@ from fastmcp.server.dependencies import get_access_token, get_http_request
 from oduflow import (
     activity,
     artifact_tokens,
+    branding,
     bundled_upgrade,
     git_ops,
     image_builds,
@@ -84,7 +87,13 @@ from oduflow.naming import (
 from oduflow.odoo_version import major_from_image_reference
 from oduflow.output_cache import CachedOutput, OutputCache
 from oduflow.po_tools import PoEntry
-from oduflow.settings import ImageRegistrySettings, Settings, TeamSettings, find_toml
+from oduflow.settings import (
+    ImageRegistrySettings,
+    Settings,
+    TeamSettings,
+    find_toml,
+    load_toml_dict,
+)
 from oduflow.stack_loader import StackValidationError
 
 logger = logging.getLogger("oduflow")
@@ -133,6 +142,13 @@ _locks = LockManager()
 # multi-gigabyte filestore — and an instant BusyError would discard all of it.
 ATTACH_SWAP_LOCK_TIMEOUT = 300.0
 _settings: Settings | None = None
+# The parsed document _settings was built from. The Server settings console
+# diffs it against the file to tell live changes from ones waiting for a
+# restart, and overlays only the live ones onto it (see config_store).
+_settings_raw: dict[str, Any] | None = None
+# Set from the global --no-telemetry CLI flag. Applied inside _get_settings so
+# the override survives every reload of the cached Settings.
+_no_telemetry: bool = False
 _instance_id: str = ""
 # Where the dashboard is reachable, recorded when the HTTP transport starts.
 # Stays None under stdio, where no web server is mounted and therefore no
@@ -149,22 +165,51 @@ def _get_settings() -> Settings:
     from validate() reaches the CLI entry point uncaught and systemd records a
     full traceback for what is really one sentence of feedback.
     """
-    global _settings
+    global _settings, _settings_raw
     if _settings is None:
         try:
             toml_path = find_toml()
         except FileNotFoundError as exc:
             raise ConfigError(str(exc)) from exc
         try:
-            settings = Settings.from_toml(toml_path)
+            raw = load_toml_dict(toml_path)
+            settings = Settings.from_raw(raw, toml_path)
+            settings_module.TRACE = settings.trace
             settings.validate()
-        # tomllib.TOMLDecodeError is a ValueError, so syntax errors land here too.
-        except (ValueError, TypeError, OverflowError) as exc:
+        # tomllib.TOMLDecodeError is a ValueError, so syntax errors land here
+        # too. TypeError/AttributeError/KeyError/OverflowError cover wrong-typed
+        # TOML values (a list where an int belongs, a scalar where a table
+        # belongs): still an operator mistake, so still one line, not a
+        # traceback.
+        except (ValueError, TypeError, AttributeError, KeyError, OverflowError) as exc:
             raise ConfigError(f"Invalid configuration in {toml_path}: {exc}") from exc
         except OSError as exc:
             raise ConfigError(f"Cannot read {toml_path}: {exc}") from exc
+        if _no_telemetry:
+            settings = dataclasses.replace(settings, disable_telemetry=True)
         _settings = settings
+        _settings_raw = raw
     return _settings
+
+
+def _swap_settings(settings: Settings, raw: dict[str, Any]) -> None:
+    """Hot-swap the cached Settings (Server settings console, live keys only).
+
+    Everything that reads configuration per request or per sweep goes through
+    _get_settings(), so the next call sees the new values. Startup-only
+    consumers (auth provider, threads, route table) keep theirs until restart.
+    """
+    global _settings, _settings_raw
+    if _no_telemetry:
+        settings = dataclasses.replace(settings, disable_telemetry=True)
+    settings_module.TRACE = settings.trace
+    _settings = settings
+    _settings_raw = raw
+
+
+def _running_settings() -> tuple[Settings, dict[str, Any] | None]:
+    settings = _get_settings()
+    return settings, _settings_raw
 
 
 def _resolve_team(ctx: Context | None) -> TeamSettings:
@@ -354,17 +399,20 @@ def handle_errors(fn: Callable[P, R]) -> Callable[P, Awaitable[R]]:
                 if fn.__name__.startswith("production_odoo_"):
                     preview = "OduMCP call completed (business response omitted from server log)"
                 logger.info("[%s] -> %s", fn.__name__, preview)
-                return result
+                # White label: show the brand instead of the product name.
+                return branding.rebrand(result) if isinstance(result, str) else result  # type: ignore[return-value]
+            except ToolError as e:
+                raise ToolError(branding.rebrand(str(e))) from e
             except FlowError as e:
                 logger.error("[%s] Error: %s", fn.__name__, e)
-                raise ToolError(str(e))
+                raise ToolError(branding.rebrand(str(e)))
             except ValueError as e:
                 # Intentional, developer-authored input validation (invalid
                 # env/module/template names, bad request path, …). These messages
                 # are safe to surface and helpful; every OTHER exception stays
                 # masked by mask_error_details=True so internal detail never leaks.
                 logger.error("[%s] Invalid input: %s", fn.__name__, e)
-                raise ToolError(str(e))
+                raise ToolError(branding.rebrand(str(e)))
 
         return await anyio.to_thread.run_sync(_run)
 
@@ -463,7 +511,7 @@ def with_key_lock(
     ``key_fn(team_id, name)`` builds the key from the caller's team and the
     tool argument that names the resource — ``name`` by default, overridable
     via ``name_arg`` for tools whose resource is not their first parameter
-    (``import_template_from_odoo`` takes ``odoo_url`` first). The argument is
+    (``import_template`` takes ``source`` first). The argument is
     read by name whether it was passed positionally or as a keyword, so the
     decorator does not care how FastMCP, the CLI or a test calls the tool.
     Pass ``require_name=False`` for tools whose key is team-scoped only.
@@ -662,34 +710,50 @@ def get_ssh_public_key(ctx: Context | None = None) -> str:
 
 @mcp.tool()
 @handle_errors
-def add_extra_repo(name: str, repo_url: str, ctx: Context | None = None) -> str:
+def add_extra_repo(
+    name: str, repo_url: str, branches: str = "", ctx: Context | None = None
+) -> str:
     """
-    Clone an extra addons repository for use with environments.
+    Register an extra addons repository for use with environments.
 
-    The repository is cloned as a shallow bare repo (only the latest commit of
-    each branch, no history) to the shared repos directory, so large repos like
-    Odoo Enterprise clone quickly. All branches are kept, so one repo serves any
-    Odoo version. When creating an environment, reference it by name to mount it
-    as additional addons (e.g., Odoo Enterprise).
+    Registration only checks access and reads the remote branch list; no code
+    is downloaded. The first environment that uses a branch downloads that
+    branch's latest commit (no history), so a large multi-version repo costs
+    only the versions actually used. When creating an environment, reference
+    the repo by name to mount it as additional addons (e.g., Odoo Enterprise).
 
     Args:
         name: Short name for the repo (e.g. "enterprise", "custom-themes").
         repo_url: Repository URL — HTTPS (https://github.com/owner/repo.git)
             or SSH (git@github.com:owner/repo.git, needs the team deploy key,
             see get_ssh_public_key).
+        branches: Optional comma-separated branch names (e.g. "17.0,18.0") to
+            download now instead of on first use. Empty (default): download
+            nothing yet.
     """
-    from oduflow.extra_addons import clone_extra_repo
+    from oduflow.extra_addons import register_extra_repo
 
     git_ops.validate_repo_url(repo_url)
     team = _resolve_team(ctx)
-    result = clone_extra_repo(team, name, repo_url)
-    return f"Extra repo '{result['name']}' cloned successfully.\nPath: {result['path']}"
+    branch_list = [b.strip() for b in branches.split(",") if b.strip()]
+    result = register_extra_repo(team, name, repo_url, branches=branch_list)
+    downloaded = (
+        f"Downloaded: {', '.join(branch_list)}."
+        if branch_list
+        else "Nothing downloaded yet; each branch is downloaded on first use."
+    )
+    available = ", ".join(result["available_branches"]) or "(none)"
+    return (
+        f"Extra repo '{result['name']}' registered. {downloaded}\n"
+        f"Remote branches: {available}\n"
+        f"Path: {result['path']}"
+    )
 
 
 @mcp.tool()
 @handle_errors
 def list_extra_repos(ctx: Context | None = None) -> str:
-    """List all cloned extra addons repositories."""
+    """List extra addons repositories with downloaded and remote branches."""
     from oduflow.extra_addons import list_extra_repos as _list
 
     team = _resolve_team(ctx)
@@ -698,8 +762,12 @@ def list_extra_repos(ctx: Context | None = None) -> str:
         return "No extra addons repositories found."
     lines = ["Extra addons repositories:"]
     for r in repos:
-        branches = ", ".join(r["branches"][:10]) if r["branches"] else "(no branches)"
-        lines.append(f"- {r['name']}: {r['repo_url']} [{branches}]")
+        downloaded = ", ".join(r["branches"][:10]) if r["branches"] else "none yet"
+        line = f"- {r['name']}: {r['repo_url']} [downloaded: {downloaded}]"
+        available = r.get("available_branches") or []
+        if available:
+            line += f" [on remote: {', '.join(available[:20])}]"
+        lines.append(line)
     return "\n".join(lines)
 
 
@@ -707,7 +775,7 @@ def list_extra_repos(ctx: Context | None = None) -> str:
 @handle_errors
 def delete_extra_repo(name: str, ctx: Context | None = None) -> str:
     """
-    Delete a cloned extra addons repository.
+    Delete an extra addons repository.
 
     Args:
         name: Name of the extra repo to delete.
@@ -722,18 +790,30 @@ def delete_extra_repo(name: str, ctx: Context | None = None) -> str:
 
 @mcp.tool()
 @handle_errors
-def update_extra_repo(name: str, ctx: Context | None = None) -> str:
+def update_extra_repo(
+    name: str, add_branch: str | list[str] = "", ctx: Context | None = None
+) -> str:
     """
     Pull latest changes from the remote for an extra addons repository.
 
-    Fetches all branches and prunes deleted remote refs.
+    Refreshes the remote branch list, fetches every downloaded branch and
+    prunes branches deleted on the remote. Branches never downloaded are left
+    alone; environments download them on first use.
 
     Args:
         name: Name of the extra repo to update (e.g. "enterprise").
+        add_branch: Optional branch, or list of branches, to download now and
+            keep updated, e.g. "16.0" or ["16.0", "17.0"], instead of waiting
+            for their first use.
     """
-    from oduflow.extra_addons import fetch_extra_repo
+    from oduflow.extra_addons import fetch_extra_repo, track_branches
 
     team = _resolve_team(ctx)
+    # No comma splitting: git allows commas in branch names.
+    requested = [add_branch] if isinstance(add_branch, str) else add_branch
+    branch_list = [b.strip() for b in requested if b.strip()]
+    if branch_list:
+        track_branches(team, name, branch_list)
     summary = fetch_extra_repo(team, name)
     return _format_fetch_summary(summary)
 
@@ -1036,7 +1116,7 @@ def create_environment(
         branch: The git branch to clone (e.g. "19.0", "feature/my-feature").
         env_name: Optional environment name. If empty, defaults to the branch name. Use this to create multiple environments from the same branch (e.g. env_name="client-a" with branch="19.0").
         hostname: Optional short Traefik hostname (for example "qa"). By default public hostnames remain environment-derived (feature.dev.example.com). Teams that explicitly set environment_hostname_mode="slots" reuse dev1.example.com through devN.example.com. An explicit value replaces the team prefix in either mode, so hostname="qa" produces qa.example.com.
-        template_name: Name of the template profile to use as database template. Pass "none" to skip template and initialise Odoo from scratch with -i base. When a template is specified, repo_url and odoo_image are loaded from template metadata (but can be overridden). A template saved from a live-mounted environment supplies local_path instead of repo_url and recreates the live-mount when allow_local_path is enabled.
+        template_name: Name of the template profile to use as database template. Pass "none" to skip template and initialise Odoo from scratch with -i base. When a template is specified, repo_url and odoo_image are loaded from template metadata (but can be overridden). A template saved from a live-mounted environment supplies local_path instead of repo_url and recreates the live-mount when allow_local_path is enabled. Installed modules whose __manifest__.py version in the checkout is higher than the one recorded in the template database are upgraded (-u) before the environment is reported ready; the setup log lists them under [TEMPLATE-UPGRADE].
         repo_url: URL of the git repository to clone. Optional when template_name is specified (loaded from template metadata).
         odoo_image: Full Docker image name with tag (e.g. "odoo:19.0"). Optional when template_name is specified (loaded from template metadata).
         extra_addons: Comma-separated list of extra addon repo names with branches (e.g. "enterprise:19.0,custom-themes:main"). Each entry must include a branch after a colon.
@@ -1468,57 +1548,39 @@ def list_templates(ctx: Context | None = None) -> str:
     return output
 
 
-@mcp.tool()
-@handle_errors
-# Not the team lock: an import refuses to touch an existing template
-# (system_ops.import_from_odoo), so the template it builds is always brand new
-# and no environment can reference it yet — there is nothing to remount and
-# nothing team-wide to protect. Holding the team lock here froze every
-# environment operation for the whole download (600s timeout) plus the restore.
-@with_key_lock(template_lock_key, name_arg="template_name")
-def import_template_from_odoo(
-    odoo_url: str,
-    master_pwd: str,
-    db_name: str = "",
-    template_name: str = "default",
-    without_filestore: bool = False,
-    ctx: Context | None = None,
-) -> str:
-    """
-    Import a template from a running Odoo instance via its database manager API.
-
-    Downloads a full ZIP backup or database-only PostgreSQL custom dump and
-    loads it into PostgreSQL as a template database.
-
-    Args:
-        odoo_url: Base URL of the Odoo instance (e.g. "https://my-odoo.example.com").
-        master_pwd: Odoo master password (database manager password).
-        db_name: Name of the database to back up. If empty, auto-detected (fails if multiple DBs exist).
-        template_name: Name of the template profile to create.
-        without_filestore: If true, request a database-only PostgreSQL custom dump.
-    """
-    settings = _get_settings()
-    team = _resolve_team(ctx)
-    result = system_ops.import_from_odoo(
-        settings,
-        team,
-        odoo_url=odoo_url,
-        master_pwd=master_pwd,
-        db_name=db_name,
-        template_name=template_name,
-        without_filestore=without_filestore,
-    )
-    lines = [
-        f"Template '{result['template_name']}' imported successfully!",
-        f"Source: {result['source_url']} (db: {result['source_db']})",
-        f"Odoo version: {result['odoo_version']}",
-        f"Odoo image: {result['odoo_image']}",
-        f"Template DB: {result['template_db']}",
-        "Filestore: "
-        + ("included" if result.get("includes_filestore") else "not included"),
-        f"Backup size: {result['zip_size_mb']} MB",
-        f"DB restore time: {result['restore_seconds']}s",
-    ]
+def _format_template_import_result(result: dict[str, object]) -> str:
+    """Human-readable summary shared by the MCP tool and the CLI runner."""
+    if "dump_reloaded" in result:  # s3 / local-path / refresh engine
+        verb = str(result.get("status") or "imported")
+        lines = [
+            f"Template '{result['template_name']}' {verb} successfully!",
+            f"Source: {result['source_url']} (dump: {result['source_db']})",
+            f"Odoo version: {result['odoo_version']}",
+            f"Odoo image: {result['odoo_image']}",
+            f"Template DB: {result['template_db']}",
+            "Filestore: "
+            + ("included" if result.get("includes_filestore") else "not included"),
+            f"Files: {result['downloaded_files']} fetched "
+            f"({result['downloaded_mb']} MB), {result['reused_files']} reused, "
+            f"{result['removed_files']} removed",
+            (
+                f"DB restore time: {result['restore_seconds']}s"
+                if result.get("dump_reloaded")
+                else "Database dump unchanged - template DB reload skipped."
+            ),
+        ]
+    else:
+        lines = [
+            f"Template '{result['template_name']}' imported successfully!",
+            f"Source: {result['source_url']} (db: {result['source_db']})",
+            f"Odoo version: {result['odoo_version']}",
+            f"Odoo image: {result['odoo_image']}",
+            f"Template DB: {result['template_db']}",
+            "Filestore: "
+            + ("included" if result.get("includes_filestore") else "not included"),
+            f"Backup size: {result['zip_size_mb']} MB",
+            f"DB restore time: {result['restore_seconds']}s",
+        ]
     affected = cast("list[str]", result.get("affected_envs", []))
     failures = cast("list[tuple[str, str]]", result.get("remount_failures", []))
     if affected:
@@ -1532,6 +1594,85 @@ def import_template_from_odoo(
             + "\n".join(f"- {env}: {msg}" for env, msg in failures)
         )
     return "\n".join(lines)
+
+
+@mcp.tool()
+@handle_errors
+@with_key_lock(template_lock_key, name_arg="template_name")
+def import_template(
+    source: str = "",
+    master_pwd: str = "",
+    db_name: str = "",
+    template_name: str = "default",
+    without_filestore: bool = False,
+    overwrite: bool = False,
+    refresh: bool = False,
+    s3_endpoint: str = "",
+    s3_access_key: str = "",
+    s3_secret_key: str = "",
+    s3_region: str = "",
+    ctx: Context | None = None,
+) -> str:
+    """
+    Import a template. One tool, four source shapes:
+
+    - http(s) URL of a running Odoo: downloads a full ZIP backup or
+      database-only dump via the database manager API (master_pwd required).
+    - "s3://bucket/prefix": syncs a raw backup layout file-by-file —
+      efficient for very large databases and filestores (parallel downloads,
+      resume, no archiving on the source). Credentials: s3_* args if given,
+      else the [backup] settings when the bucket matches, else anonymous.
+    - Local path on the Oduflow host: a directory with the same raw layout
+      (files are hardlinked, near-instant on the same filesystem), or a
+      single dump file for a database-only import.
+    - No source with refresh=true: the dump/filestore were already placed
+      into the template directory by an external process (rsync, backup
+      job); reloads the template DB from them and refreshes metadata.
+
+    Raw layout for s3/local sources: a dump at the root — dump.pgdump /
+    dump.sql / dump.sql.gz / dump.pgdump.gz (hand-made db.dump / db.dump.gz
+    also accepted; canonical names win when both are present) — plus an
+    optional filestore/ tree (a one-to-one copy of the Odoo filestore, e.g.
+    `aws s3 sync`).
+
+    Args:
+        source: http(s) Odoo URL, "s3://bucket/prefix", or a local path. Empty only with refresh=true.
+        master_pwd: Odoo master password (database manager password). Required for http(s) sources only.
+        db_name: Name of the database to back up (http mode only). If empty, auto-detected (fails if multiple DBs exist).
+        template_name: Name of the template profile to create or update.
+        without_filestore: http: request a database-only dump. s3/local: skip the filestore/ tree.
+        overwrite: s3/local only: incrementally re-sync an EXISTING template — only changed files are fetched, an unchanged dump skips the DB reload. Requires explicit user permission: it replaces the template's current data.
+        refresh: Reload the template DB from files already in the template directory (no source). Requires explicit user permission: it rebuilds the template database.
+        s3_endpoint: s3 only: custom S3 endpoint URL (MinIO etc.); empty = AWS S3 or the configured [backup] endpoint.
+        s3_access_key: s3 only: access key for the source bucket (with s3_secret_key); empty = [backup] credentials or anonymous.
+        s3_secret_key: s3 only: secret key paired with s3_access_key.
+        s3_region: s3 only: region of the source bucket.
+    """
+    settings = _get_settings()
+    team = _resolve_team(ctx)
+    # Replacement imports mutate lower layers under existing environments.
+    guard = (
+        _locks.team_lock(team.team_id, operation="import_template")
+        if overwrite or refresh
+        else contextlib.nullcontext()
+    )
+    with guard:
+        result = system_ops.import_template(
+            settings,
+            team,
+            source=source,
+            master_pwd=master_pwd,
+            db_name=db_name,
+            template_name=template_name,
+            without_filestore=without_filestore,
+            overwrite=overwrite,
+            refresh=refresh,
+            s3_endpoint=s3_endpoint,
+            s3_access_key=s3_access_key,
+            s3_secret_key=s3_secret_key,
+            s3_region=s3_region,
+        )
+    return _format_template_import_result(result)
 
 
 @mcp.tool()
@@ -1716,9 +1857,14 @@ def get_agent_instructions(ctx: Context | None = None) -> str:
 
     team = _resolve_team(ctx)
     guide = _guide_body()
-    # The feedback section ships nowhere on disk — it exists only while the
-    # (undocumented) [server] agent_feedback option is on.
-    if _get_settings().agent_feedback:
+    # The feedback section ships nowhere on disk — it exists only while
+    # submit_agent_feedback is actually published (the undocumented [server]
+    # agent_feedback option, withheld under white label). Read that published
+    # state instead of re-deriving it from settings and branding: the decision
+    # is made once in _apply_agent_feedback, while branding is live, so a
+    # license that expires (or is installed) mid-run would otherwise leave the
+    # guide pointing agents at a tool that is not in list_tools.
+    if submit_agent_feedback.enabled:
         from oduflow import agent_feedback as feedback_mod
 
         guide = guide.rstrip() + "\n\n" + feedback_mod.INSTRUCTIONS_SECTION
@@ -2270,6 +2416,8 @@ def get_environment_info(env_name: str, ctx: Context | None = None) -> str:
 
     Returns database name, URL, repository, image, template, extra addons,
     workspace path, container status, and CPU/RAM stats.
+
+    Fails with a not-found error if the environment does not exist.
 
     Args:
         env_name: The name of the environment to check.
@@ -2861,6 +3009,12 @@ def get_image_build(
     if job.error:
         lines.append(f"Error: {job.error}")
     if job.status == image_builds.STATUS_SUCCEEDED:
+        if job.local_tag:
+            lines.append(
+                f"Local image: {job.local_tag} — pass it as the image to "
+                "create_service or update_service to run this build before "
+                "publishing (no pull; same team only)."
+            )
         lines.append(
             f'Ready to publish: publish_image_build(build_id="{job.build_id}", '
             'repository="<name>", tags="...").'
@@ -3236,8 +3390,7 @@ def export_module_translations(
         if not result["host_path"]:
             local_path = artifact_tokens.materialize(str(result["filename"]), content)
             lines.append(
-                f"Host path: {local_path}  "
-                "(temporary; removed when this Oduflow process stops)"
+                f"Host path: {local_path}  (temporary; removed when this process stops)"
             )
     else:
         token = artifact_tokens.issue(str(result["filename"]), content)
@@ -4513,7 +4666,7 @@ def create_service(
     Args:
         name: Short name for the service (e.g. "redis", "meilisearch").
         runtime: Explicit Docker tmpfs, private cgroupns, stop_signal and stop_timeout settings.
-        image: Docker image with tag (e.g. "redis:7", "getmeili/meilisearch:v1.6").
+        image: Docker image with tag (e.g. "redis:7", "getmeili/meilisearch:v1.6"). A staging tag from start_image_build (oduflow-build/team-<id>:<build-id>, as reported by get_image_build) is taken from the local Docker daemon without a pull, so a build can be run as a service before publish_image_build.
         port: Catch-all exposure mode: forward every path to this one container port. Required outside Traefik. Mutually exclusive with routes.
         hostname: Custom hostname for traefik routing (optional, traefik mode only).
         env_vars: Comma- or newline-separated KEY=VALUE pairs (e.g. "MEILI_MASTER_KEY=abc,MEILI_ENV=production"). Commas inside values are preserved unless what follows the comma looks like another KEY=; put one pair per line when in doubt. So "CONNECT_MCP_TOOL_GROUPS=write,collaboration,documents" is one variable. A value "secret:<name>" references a team secret (see list_secrets): the real value is injected only inside the container and is never readable back.
@@ -4607,7 +4760,7 @@ def update_service(
         name: The name of the service to update (e.g. "redis", "meilisearch").
         env_vars: Comma- or newline-separated KEY=VALUE pairs that fully replace existing env vars (e.g. "MEILI_MASTER_KEY=abc,MEILI_ENV=production"). Commas inside values are preserved unless what follows the comma looks like another KEY=; put one pair per line when in doubt. Leave empty to keep current env vars. A value "secret:<name>" references a team secret (see list_secrets): the real value is injected only inside the container and is never readable back.
         runtime: Replace lifecycle settings; omit to preserve, pass {} to clear.
-        image: New Docker image with tag (e.g. "redis:8"). Leave empty to keep current image.
+        image: New Docker image with tag (e.g. "redis:8"). Leave empty to keep current image. A staging tag from start_image_build (oduflow-build/team-<id>:<build-id>, as reported by get_image_build) is taken from the local Docker daemon without a pull, so a build can be tested as a service before publish_image_build.
         port: New container port. Pass 0 to keep current port.
         hostname: New hostname for traefik routing. Leave empty to keep current hostname.
         host_mode: Run in host network mode. Leave unset (null) to keep current mode.
@@ -5296,6 +5449,7 @@ def create_production(
     template_name: str = "",
     from_environment: str = "",
     env_vars: dict[str, str] | None = None,
+    server_mode: str = "workers",
     ctx: Context | None = None,
 ) -> str:
     """
@@ -5347,6 +5501,13 @@ def create_production(
                 extra_addons default to the environment's own. Mutually
                 exclusive with template_name. No sanitization — the data
                 goes INTO production.
+        server_mode: How Odoo serves HTTP. "workers" (default, sync):
+                multi-process workers on port 8069 serve the pages, and
+                Traefik sends only the bus (/websocket, /longpolling) to the
+                gevent port 8072. "gevent" (async): Traefik sends ALL traffic
+                to the single gevent process on 8072 (suits many long-lived or
+                I/O-bound requests; one CPU-heavy request slows everyone).
+                Crons run in both modes.
     """
     settings = _get_settings()
     team = _resolve_team(ctx)
@@ -5385,10 +5546,14 @@ def create_production(
         from_environment=from_environment or None,
         env_vars=env_vars,
         env_lock=env_lock,
+        server_mode=production_ops.resolve_server_mode(
+            server_mode, production_ops.DEFAULT_SERVER_MODE
+        ),
     )
     lines = [
         f"Production '{name}' created in {result['elapsed_seconds']}s.",
         f"URL: {result['url']}",
+        f"Server mode: {result['server_mode']}",
         f"Database: {result['database']} (cluster: oduflow-prod-db)",
         f"Deployed commit: {result['commit'][:10]}",
         f"Container: {result['odoo_container']}",
@@ -5663,7 +5828,8 @@ def stop_production(name: str, ctx: Context | None = None) -> str:
 @with_prod_lock
 def restart_production(name: str, ctx: Context | None = None) -> str:
     """
-    Restart a production's Odoo container (brief downtime).
+    Restart a production's Odoo container (brief downtime). A container whose
+    Traefik routing is outdated is recreated instead.
 
     Args:
         name: The production name.
@@ -5671,6 +5837,11 @@ def restart_production(name: str, ctx: Context | None = None) -> str:
     settings = _get_settings()
     team = _resolve_team(ctx)
     result = production_ops.restart_production(settings, team, name)
+    if result.get("recreated"):
+        return (
+            f"Production '{name}' recreated ({result['odoo_container']}) to "
+            "apply its current Traefik routing."
+        )
     return f"Production '{name}' restarted ({result['odoo_container']})."
 
 
@@ -5712,21 +5883,32 @@ def reconfigure_production(
     git_user: str | None = None,
     extra_addons: dict[str, str] | None = None,
     env_vars: dict[str, str] | None = None,
+    server_mode: str = "",
+    recreate: bool = False,
     ctx: Context | None = None,
 ) -> str:
     """
     Change a production's infrastructure settings and recreate its container
     to match. Empty/omitted arguments are left unchanged. The database and
     filestore are preserved; expect a brief downtime while the container is
-    replaced.
+    replaced. A call with no changes still recreates a container whose state
+    drifted from the record (missing container or checkout, outdated Traefik
+    routing, or a team secret whose value changed since the container was
+    created).
+
+    To apply a rotated team secret, call this with just the name: secret
+    values are injected only when the container is created, so
+    restart_production keeps the old value; this call detects the changed
+    value and recreates the container. Pass recreate=true to recreate it
+    even when nothing appears to have changed.
 
     Changeable: the public domain (Traefik Host rule + Let's Encrypt), the
     Odoo Docker image, the deployed git branch or repository URL, the git
-    credential user, and the extra addon repos. Changing the image does NOT
-    migrate the database — a major Odoo version bump additionally needs an
-    explicit module upgrade plan. After a branch/repo change, run
-    update_production(install=..., upgrade=...) if the new code needs module
-    changes.
+    credential user, the extra addon repos, and the server mode. Changing the
+    image does NOT migrate the database — a major Odoo version bump
+    additionally needs an explicit module upgrade plan. After a branch/repo
+    change, run update_production(install=..., upgrade=...) if the new code
+    needs module changes.
 
     Args:
         name: The production name.
@@ -5746,6 +5928,11 @@ def reconfigure_production(
                 secret:<name> references. Omit to preserve; {} clears them.
         extra_addons: New full set of extra addon repos {repo_name: branch};
                       pass {} to remove all. Omit to leave unchanged.
+        server_mode: "workers" (sync: pages on 8069, bus on 8072) or "gevent"
+                (async: everything on 8072). Re-tunes odoo.conf workers and
+                re-points Traefik. Omit to leave unchanged.
+        recreate: Recreate the container even when no setting, secret value
+                or runtime state differs from the record.
     """
     settings = _get_settings()
     team = _resolve_team(ctx)
@@ -5763,13 +5950,22 @@ def reconfigure_production(
         git_user=git_user,
         extra_addons=extra_addons,
         env_vars=env_vars,
+        server_mode=production_ops.resolve_server_mode(server_mode, None),
+        force_recreate=recreate,
     )
     if result.get("message"):
         return str(result["message"])
-    changed = ", ".join(result["changed"]) or "none; repaired drifted state"
+    changed = ", ".join(result["changed"]) or (
+        "none; recreated on request"
+        if recreate
+        else "none; applied rotated secrets"
+        if result.get("rotated_secrets")
+        else "none; repaired drifted state"
+    )
     lines = [
         f"Reconfigured production '{name}' (changed: {changed}).",
         f"URL: {result['url']}",
+        f"Server mode: {result['server_mode']}",
         f"Healthy: {result['healthy']}",
     ]
     lines.extend(f"Note: {note}" for note in result.get("notes", []))
@@ -5791,8 +5987,9 @@ def set_production_odoo_conf(
     Set or remove odoo.conf [options] overrides for a production and re-apply
     the config. Overrides are stored per production, win over the auto-tuned
     worker settings, and survive deploys and retunes. Keys managed by Oduflow
-    (addons_path, data_dir, db_*) cannot be overridden. Current overrides are
-    shown by get_production_info.
+    (addons_path, data_dir, db_*, the listen interface/ports and their
+    xmlrpc* aliases) cannot be overridden. Current overrides are shown by
+    get_production_info.
 
     Args:
         name: The production name.
@@ -5824,8 +6021,10 @@ def set_production_odoo_conf(
     )
     if result["restarted"]:
         status += ", container restarted"
+    notes = "".join(f"\nNote: {note}" for note in result.get("notes", []))
     return (
-        f"odoo.conf overrides for '{name}' {status}.\nCurrent overrides:\n{conf_desc}"
+        f"odoo.conf overrides for '{name}' {status}.{notes}\n"
+        f"Current overrides:\n{conf_desc}"
     )
 
 
@@ -5916,7 +6115,7 @@ def rollback_production(
 def production_deploys(name: str, limit: int = 20, ctx: Context | None = None) -> str:
     """
     Deploy history of a production (newest last): commits, actions, modules,
-    status (success / rolled_back / rollback_failed), errors.
+    status (success / rolled_back / rollback_failed / skipped), errors.
 
     Args:
         name: The production name.
@@ -6358,8 +6557,12 @@ def _apply_agent_feedback(settings: Settings) -> None:
     Registered disabled, so by default the tool is absent from ``list_tools``
     and calling it answers "Unknown tool". Enabling also appends a one-liner to
     the MCP instructions every client receives in the initialize handshake.
+
+    White label hides the vendor surfaces (see _apply_branding), so the decision
+    is made here, before anything is published: hiding the tool afterwards would
+    leave the hint telling every client to call a tool that no longer exists.
     """
-    if not settings.agent_feedback:
+    if not settings.agent_feedback or branding.is_white_label():
         return
     from oduflow import agent_feedback as feedback_mod
 
@@ -6369,11 +6572,33 @@ def _apply_agent_feedback(settings: Settings) -> None:
     logger.info("Agent feedback enabled (submit_agent_feedback exposed)")
 
 
+def _apply_branding() -> None:
+    """White label (custom license): present the MCP server under the brand.
+
+    Applied once at startup to the server name, the instructions and the tool
+    descriptions; installing or renewing a license takes effect on restart.
+    Tool results and errors are rebranded per call in ``handle_errors``. The
+    tools that point at the vendor (GitHub issues, product feedback) are hidden.
+    """
+    brand = branding.current()
+    if not brand.white_label:
+        return
+    mcp._mcp_server.name = brand.name
+    mcp.instructions = brand.rebrand(mcp.instructions or "")
+    for tool in mcp._tool_manager._tools.values():
+        if tool.description:
+            tool.description = brand.rebrand(tool.description)
+    report_issue.disable()
+    submit_agent_feedback.disable()
+    logger.info("MCP server presented as %s (white label)", brand.name)
+
+
 def _ensure_initialized(settings: Settings) -> None:
     """Ensure shared infrastructure and per-team directories exist (idempotent)."""
     from oduflow import prereqs
 
     _apply_agent_feedback(settings)
+    _apply_branding()
     _copy_bundled_configs()
     prereqs.ensure_fuse_overlayfs()
     prereqs.ensure_rsync()
@@ -6449,6 +6674,21 @@ def _ensure_initialized(settings: Settings) -> None:
 
 def _run_upgrade(settings: Settings, *, force: bool = False) -> bool:
     """Three-way merge deployed bundled files with the current package."""
+    from oduflow.postgres_migration import preflight
+
+    # self-update runs this with the new code before restarting the service:
+    # refusing here keeps the old server running instead of one that cannot
+    # start.
+    try:
+        preflight(settings)
+    except PrerequisiteNotMetError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return False
+    except Exception as exc:
+        print(
+            f"Warning: could not check the PostgreSQL upgrade prerequisites: {exc}",
+            file=sys.stderr,
+        )
     bundled_dir = pathlib.Path(__file__).resolve().parent / "templates"
     managed_files: list[bundled_upgrade.ManagedFile] = []
     for team_id, team in settings.teams.items():
@@ -7016,6 +7256,25 @@ def _inject_ui_password(toml_text: str, password: str) -> str:
     return "\n".join(out) + "\n"
 
 
+def _inject_admin_password(toml_text: str, password: str) -> str:
+    """Fill the empty ``[admin] password`` of a freshly bootstrapped config,
+    so a fresh HTTP install has the Server settings console ready. Existing
+    user configs are never rewritten (``oduflow admin enable`` does that)."""
+    out: list[str] = []
+    in_admin = False
+    injected = False
+    for raw in toml_text.splitlines():
+        stripped = raw.split("#", 1)[0].strip()
+        if stripped.startswith("["):
+            in_admin = stripped == "[admin]"
+        if in_admin and not injected and stripped == 'password = ""':
+            out.append(f'password = "{password}"')
+            injected = True
+        else:
+            out.append(raw)
+    return "\n".join(out) + "\n"
+
+
 def _autofill_ui_passwords(toml_text: str) -> tuple[str, list[str]]:
     """Fill EVERY empty ``ui_password = ""`` in an existing oduflow.toml with a
     freshly generated password (one distinct password per team). Used to upgrade
@@ -7060,7 +7319,8 @@ def _ensure_web_ui_password(settings: Settings) -> Settings:
     ):
         return settings
     import pathlib
-    import tempfile
+
+    from oduflow.config_store import replace_config_file
 
     try:
         cfg_path = find_toml()
@@ -7069,26 +7329,10 @@ def _ensure_web_ui_password(settings: Settings) -> Settings:
         updated, generated = _autofill_ui_passwords(cfg.read_text(encoding="utf-8"))
         if not generated:
             return settings
-        original = cfg.stat()
-        # A chmod of the existing inode cannot revoke an already-open reader.
-        # Stage secrets privately and replace the inode, preserving ownership
-        # and any stricter owner permissions (e.g. 0400). If replacement is not
-        # supported, leave the original untouched and let HTTP fail closed.
-        fd, temporary = tempfile.mkstemp(prefix=f".{cfg.name}.", dir=cfg.parent)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as stream:
-                staged = os.fstat(stream.fileno())
-                if (staged.st_uid, staged.st_gid) != (original.st_uid, original.st_gid):
-                    os.fchown(stream.fileno(), original.st_uid, original.st_gid)
-                mode = original.st_mode & 0o600
-                if staged.st_mode & 0o777 != mode:
-                    os.fchmod(stream.fileno(), mode)
-                stream.write(updated)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, cfg)
-        finally:
-            pathlib.Path(temporary).unlink(missing_ok=True)
+        # Staged privately and swapped in, keeping owner and mode. If
+        # replacement is not supported, the original stays untouched and HTTP
+        # fails closed.
+        replace_config_file(str(cfg), updated)
     except Exception:
         logger.exception("Could not auto-provision a web-UI password")
         return settings
@@ -7104,25 +7348,6 @@ def _ensure_web_ui_password(settings: Settings) -> Settings:
     )
     _settings = None
     return _get_settings()
-
-
-def _run_reload_template(
-    settings: Settings, team: TeamSettings, template_name: str, dump_path: str = ""
-) -> None:
-    result = system_ops.reload_template(
-        settings,
-        team,
-        template_name=template_name,
-        dump_path=dump_path or None,
-    )
-    msg = f"Template DB {result['status']}.\nTemplate DB: {result['template_db']}"
-    if "restore_seconds" in result:
-        msg += f"\nDB restore time: {result['restore_seconds']}s"
-    if "tables" in result:
-        msg += f"\nTables restored: {result['tables']}"
-    if "message" in result and result["message"].strip():
-        msg += f"\nRestore output: {result['message']}"
-    print(msg)
 
 
 def _run_init_template(
@@ -7258,44 +7483,34 @@ def _run_delete_template(
 def _run_import_template(
     settings: Settings,
     team: TeamSettings,
-    odoo_url: str,
-    master_pwd: str,
+    source: str = "",
+    master_pwd: str = "",
     db_name: str = "",
     template_name: str = "",
     without_filestore: bool = False,
+    overwrite: bool = False,
+    refresh: bool = False,
+    s3_endpoint: str = "",
+    s3_access_key: str = "",
+    s3_secret_key: str = "",
+    s3_region: str = "",
 ) -> None:
-    result = system_ops.import_from_odoo(
+    result = system_ops.import_template(
         settings,
         team,
-        odoo_url=odoo_url,
+        source=source,
         master_pwd=master_pwd,
         db_name=db_name,
         template_name=template_name,
         without_filestore=without_filestore,
+        overwrite=overwrite,
+        refresh=refresh,
+        s3_endpoint=s3_endpoint,
+        s3_access_key=s3_access_key,
+        s3_secret_key=s3_secret_key,
+        s3_region=s3_region,
     )
-    lines = [
-        f"Template '{result['template_name']}' imported successfully!",
-        f"Source: {result['source_url']} (db: {result['source_db']})",
-        f"Odoo version: {result['odoo_version']}",
-        f"Odoo image: {result['odoo_image']}",
-        f"Template DB: {result['template_db']}",
-        "Filestore: "
-        + ("included" if result.get("includes_filestore") else "not included"),
-        f"Backup size: {result['zip_size_mb']} MB",
-        f"DB restore time: {result['restore_seconds']}s",
-    ]
-    affected = cast("list[str]", result.get("affected_envs", []))
-    failures = cast("list[tuple[str, str]]", result.get("remount_failures", []))
-    if affected:
-        lines.append(
-            "Remounted (changes preserved) filestore overlays for: "
-            + ", ".join(affected)
-        )
-    if failures:
-        lines.append(
-            "Remount issues:\n" + "\n".join(f"- {env}: {msg}" for env, msg in failures)
-        )
-    print("\n".join(lines))
+    print(_format_template_import_result(result))
 
 
 def _run_list_templates(settings: Settings, team: TeamSettings) -> None:
@@ -7387,9 +7602,13 @@ def _run_cleanup(
     workspaces = result["orphan_workspaces"]
     ports = result["orphan_ports"]
     roles = result["orphan_roles"]
+    # Failed removals are absent from the lists above; report them separately.
+    errors = result.get("errors", [])
 
     if not dbs and not workspaces and not ports and not roles:
-        print(f"[{mode}] No orphaned resources found.")
+        print(f"[{mode}] No orphaned resources {'removed' if errors else 'found'}.")
+        for error in errors:
+            print(f"[{mode}] Error: {error}")
         return
 
     print(f"[{mode}] Orphaned resources:")
@@ -7415,6 +7634,8 @@ def _run_cleanup(
         print(f"\n  {total} resource(s) would be removed. Run with --force to apply.")
     else:
         print(f"\n  {total} resource(s) removed.")
+    for error in errors:
+        print(f"[{mode}] Error: {error}")
 
 
 def _run_destroy(settings: Settings) -> None:
@@ -7609,6 +7830,7 @@ def _bootstrap_config() -> str:
     )
     rendered = _inject_auth_token(rendered, secrets.token_urlsafe(24))
     rendered = _inject_ui_password(rendered, secrets.token_urlsafe(18))
+    rendered = _inject_admin_password(rendered, secrets.token_urlsafe(18))
     # Create the file already private: the default umask would otherwise leave
     # these freshly generated secrets world-readable, and the config is only
     # ever read back by us. O_EXCL because bootstrap must only ever ADD a config:
@@ -7632,11 +7854,70 @@ def _bootstrap_config() -> str:
     # one log line turns them into a permanent leak. The config file is the one
     # place they live.
     logger.info(
-        "Config created: %s (auto-generated DB password, MCP auth_token and "
-        "web-UI password for team 1; read them from that file, mode 0600)",
+        "Config created: %s (auto-generated DB password, MCP auth_token, "
+        "web-UI password for team 1 and the /admin console password; read them "
+        "from that file, mode 0600)",
         dest,
     )
     return dest
+
+
+def _admin_cli(action: str, *, reset: bool = False) -> None:
+    """``oduflow admin enable|disable``: the one config edit the console
+    cannot make for itself. Goes through the same validated, history-keeping
+    writer as the console."""
+    import secrets
+
+    from oduflow import config_store
+
+    settings = _get_settings()
+    path = settings.toml_path
+    snapshot = config_store.read_snapshot(path)
+    current = config_store.parse_text(snapshot.text).get("admin", {})
+    has_password = isinstance(current, dict) and bool(
+        str(current.get("password", "")).strip()
+    )
+    if action == "disable":
+        if not has_password:
+            print("The Server settings console is already disabled.")
+            return
+        change = config_store.Change(path=("admin", "password"), unset=True)
+        note = "Console disabled (CLI)"
+        password = ""
+    else:
+        if has_password and not reset:
+            print(
+                "The Server settings console is already enabled; its password "
+                f"is [admin] password in {snapshot.path}. Use --reset for a new one."
+            )
+            return
+        password = secrets.token_urlsafe(18)
+        change = config_store.Change(path=("admin", "password"), value=password)
+        note = (
+            "Console password reset (CLI)" if has_password else "Console enabled (CLI)"
+        )
+    text = config_store.apply_changes(snapshot.text, [change])
+    config_store.validate_text(text, path, http=False)
+    config_store.write_config(
+        path,
+        text,
+        snapshot.revision,
+        note=note,
+        paths=["admin.password"],
+        actor="cli",
+    )
+    if action == "disable":
+        print(f"Server settings console disabled in {snapshot.path}.")
+    else:
+        team = next(iter(settings.teams.values()))
+        if settings.routing_mode == "traefik":
+            url = f"{settings.public_scheme_for(team)}://{team.hostname}/admin"
+        else:
+            url = f"{settings.public_scheme_for(team)}://{team.hostname}:{settings.port}/admin"
+        print(f"Server settings console password: {password}")
+        print(f"Stored as [admin] password in {snapshot.path}.")
+        print(f"Open {url} (any team hostname works) after the restart.")
+    print("Restart Oduflow to apply it, e.g.: sudo systemctl restart oduflow")
 
 
 def _run_cli() -> None:
@@ -7671,6 +7952,11 @@ def _run_cli() -> None:
         default="1",
         help="team for --stack startup reconciliation (default: 1)",
     )
+    parser.add_argument(
+        "--no-telemetry",
+        action="store_true",
+        help="disable anonymous usage telemetry for this run (e.g. test runs)",
+    )
     sub = parser.add_subparsers(dest="command", title="commands", metavar="")
 
     p_ui_2fa = sub.add_parser(
@@ -7679,7 +7965,43 @@ def _run_cli() -> None:
     ui_2fa_sub = p_ui_2fa.add_subparsers(dest="ui_2fa_action", required=True)
     for action in ("setup", "reset"):
         command = ui_2fa_sub.add_parser(action)
-        command.add_argument("--team", default="1", help="Team ID (default: 1)")
+        who = command.add_mutually_exclusive_group()
+        who.add_argument("--team", default="1", help="Team ID (default: 1)")
+        who.add_argument(
+            "--admin",
+            action="store_true",
+            help="the Server settings console (/admin) instead of a team",
+        )
+
+    p_admin = sub.add_parser(
+        "admin", help="Enable or disable the Server settings console (/admin)"
+    )
+    admin_sub = p_admin.add_subparsers(dest="admin_action", required=True)
+    for action, action_help in (
+        ("enable", "Generate a console password (printed once) and enable /admin"),
+        ("disable", "Remove the console password; /admin answers 404"),
+    ):
+        command = admin_sub.add_parser(action, help=action_help)
+        if action == "enable":
+            command.add_argument(
+                "--reset",
+                action="store_true",
+                help="replace an existing console password (signs every session out)",
+            )
+
+    p_license = sub.add_parser(
+        "license", help="Show, install, renew or subscribe the commercial license"
+    )
+    license_sub = p_license.add_subparsers(dest="license_action", required=True)
+    for action, action_help in {
+        "status": "Show the installed license",
+        "refresh": "Install a renewed key from the license server, if any",
+        "install": "Verify and install a license key file",
+        "subscribe": "Print a payment link after the license period ended",
+    }.items():
+        p_license_action = license_sub.add_parser(action, help=action_help)
+        if action == "install":
+            p_license_action.add_argument("file", help="Path to the license key file")
 
     # --- System commands ---
     sub.add_parser("destroy", help="Destroy all shared infrastructure")
@@ -7729,28 +8051,6 @@ def _run_cli() -> None:
     )
 
     # --- Template commands (need --team) ---
-    p_reload = sub.add_parser(
-        "reload-template",
-        help="Drop and re-restore a template DB from template profile",
-    )
-    p_reload.add_argument("template_name", help="Template profile name")
-    p_reload.add_argument(
-        "--dump-path",
-        default="",
-        help="Path to dump file (overrides template profile path)",
-    )
-    p_reload.add_argument(
-        "--source",
-        default="",
-        help="Sync template from s3://... or local path before reloading",
-    )
-    p_reload.add_argument(
-        "--quiet",
-        action="store_true",
-        help="Suppress info logging (for cron)",
-    )
-    p_reload.add_argument("--team", default="1", help="Team ID (default: 1)")
-
     p_init_tpl = sub.add_parser(
         "init-template",
         help="Generate template dump and filestore from a clean Odoo image",
@@ -7826,13 +8126,28 @@ def _run_cli() -> None:
     p_drop_tpl.add_argument("--team", default="1", help="Team ID (default: 1)")
 
     p_import = sub.add_parser(
-        "import-template", help="Import a template from a running Odoo instance"
+        "import-template",
+        help=(
+            "Import a template from a running Odoo, an S3 prefix, a local "
+            "path, or refresh it from its own files"
+        ),
     )
     p_import.add_argument(
-        "odoo_url",
-        help="Base URL of the Odoo instance (e.g. https://my-odoo.example.com)",
+        "source",
+        nargs="?",
+        default="",
+        help=(
+            "http(s) Odoo URL, s3://bucket/prefix, or a local path with "
+            "dump.* + filestore/ (a single dump file for DB-only). "
+            "Omit together with --refresh"
+        ),
     )
-    p_import.add_argument("master_pwd", help="Odoo master password")
+    p_import.add_argument(
+        "master_pwd",
+        nargs="?",
+        default="",
+        help="Odoo master password (required for http(s) sources only)",
+    )
     p_import.add_argument(
         "--db-name", default="", help="Database name (auto-detected if only one exists)"
     )
@@ -7842,7 +8157,32 @@ def _run_cli() -> None:
     p_import.add_argument(
         "--without-filestore",
         action="store_true",
-        help="Request a database-only PostgreSQL custom dump",
+        help="http: request a database-only dump; s3/local: skip the filestore/ tree",
+    )
+    p_import.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="s3/local: incrementally re-sync an existing template",
+    )
+    p_import.add_argument(
+        "--refresh",
+        action="store_true",
+        help=(
+            "No source: reload the template DB from files already placed in "
+            "the template directory (rsync drop point) and refresh metadata"
+        ),
+    )
+    p_import.add_argument(
+        "--s3-endpoint", default="", help="s3 only: custom S3 endpoint URL (MinIO etc.)"
+    )
+    p_import.add_argument(
+        "--s3-access-key", default="", help="s3 only: source bucket access key"
+    )
+    p_import.add_argument(
+        "--s3-secret-key", default="", help="s3 only: source bucket secret key"
+    )
+    p_import.add_argument(
+        "--s3-region", default="", help="s3 only: source bucket region"
     )
     p_import.add_argument("--team", default="1", help="Team ID (default: 1)")
 
@@ -7945,6 +8285,7 @@ def _run_cli() -> None:
     )
 
     args = parser.parse_args()
+    branding.configure(_get_settings)
 
     # --- Commands that don't need Settings -----------------------
 
@@ -7991,13 +8332,35 @@ def _run_cli() -> None:
         systemd_uninstall()
         return
 
+    if args.command == "license":
+        # Reads the existing configuration only; never bootstraps an install
+        # or touches Docker. The operator's tool under white label, where the
+        # dashboard has no license dialog.
+        _run_license_cli(_get_settings(), args)
+        return
+
     if args.command == "ui-2fa":
         from oduflow.ui_totp import run_cli
 
         # Use the existing server configuration; never bootstrap a new install,
         # initialize Docker, or publish this operation through MCP.
         settings = _get_settings()
-        run_cli(settings, settings.get_team(args.team), args.ui_2fa_action)
+        if args.admin:
+            from oduflow.admin_ui import admin_principal
+
+            if not settings.admin_password:
+                raise PrerequisiteNotMetError(
+                    "The Server settings console is disabled; run "
+                    "`oduflow admin enable` first."
+                )
+            principal = admin_principal(settings)
+        else:
+            principal = settings.get_team(args.team)
+        run_cli(settings, principal, args.ui_2fa_action)
+        return
+
+    if args.command == "admin":
+        _admin_cli(args.admin_action, reset=getattr(args, "reset", False))
         return
 
     # --- Load TOML settings ----------------------------------------
@@ -8011,13 +8374,19 @@ def _run_cli() -> None:
 
     # Bootstrap: if no config exists, create it from the bundled default with an
     # auto-generated PostgreSQL password and a random MCP auth_token, so a fresh
-    # install is authenticated by default even over HTTP (#37).
+    # install is authenticated by default even over HTTP (#37). Never bootstrap
+    # when ODUFLOW_TOML is set: find_toml() only ever reads that path, so a
+    # config written to the default location would be an orphaned secrets file
+    # — let _get_settings() report the missing path instead.
     try:
         find_toml()
     except FileNotFoundError:
-        _bootstrap_config()
+        if not os.getenv("ODUFLOW_TOML", "").strip():
+            _bootstrap_config()
 
-    global _settings
+    global _settings, _no_telemetry
+    # Lets test runs stay out of usage stats without editing oduflow.toml.
+    _no_telemetry = args.no_telemetry
     _settings = _get_settings()
     logger.info("conf=%s  data=%s", _settings.etc_dir, _settings.base_data_dir)
 
@@ -8038,12 +8407,18 @@ def _run_cli() -> None:
         # call that never returns would leave a live process serving nothing
         # and systemd none the wiser. The watchdog turns that into an exit and
         # a restart; see startup_watchdog for why silence is the stall signal.
+        from oduflow import instance_lock
         from oduflow.docker_ops.client import wait_for_docker
         from oduflow.startup_watchdog import guard_startup
 
+        instance_lock.hold_shared(_settings)
         with guard_startup():
             wait_for_docker()
+            from oduflow import postgres_migration
+
+            postgres_migration.validate_configuration(_settings)
             migrations.run_pending(_settings)
+            postgres_migration.upgrade(_settings)
             _ensure_initialized(_settings)
             quotas.apply_all(_settings)
             if args.stack_manifest:
@@ -8088,34 +8463,6 @@ def _run_cli() -> None:
             force=args.force,
         ):
             sys.exit(1)
-        return
-
-    if args.command == "reload-template":
-        if args.quiet:
-            logging.getLogger("oduflow").setLevel(logging.WARNING)
-        if args.source:
-            from oduflow.sync import sync_template_from_source
-
-            result = sync_template_from_source(
-                _settings,
-                _cli_team(),
-                args.template_name,
-                args.source,
-            )
-            msg = (
-                f"Template DB {result['status']}.\nTemplate DB: {result['template_db']}"
-            )
-            if "restore_seconds" in result:
-                msg += f"\nDB restore time: {result['restore_seconds']}s"
-            if not args.quiet:
-                print(msg)
-        else:
-            _run_reload_template(
-                _settings,
-                _cli_team(),
-                template_name=args.template_name,
-                dump_path=args.dump_path,
-            )
         return
 
     if args.command == "init-template":
@@ -8167,11 +8514,17 @@ def _run_cli() -> None:
         _run_import_template(
             _settings,
             _cli_team(),
-            odoo_url=args.odoo_url,
+            source=args.source,
             master_pwd=args.master_pwd,
             db_name=args.db_name,
             template_name=args.template_name,
             without_filestore=args.without_filestore,
+            overwrite=args.overwrite,
+            refresh=args.refresh,
+            s3_endpoint=args.s3_endpoint,
+            s3_access_key=args.s3_access_key,
+            s3_secret_key=args.s3_secret_key,
+            s3_region=args.s3_region,
         )
         return
 
@@ -8216,6 +8569,10 @@ def _run_cli() -> None:
             )
             return
         if args.stack_command == "apply":
+            from oduflow import postgres_migration
+
+            postgres_migration.validate_configuration(_settings)
+            postgres_migration.refuse_pending(_settings)
             migrations.run_pending(_settings)
             _ensure_initialized(_settings)
             quotas.apply_all(_settings)
@@ -8267,6 +8624,7 @@ def _start_stdio() -> None:
     _warn_local_path_security(settings)
     reaper.start_reaper(_get_settings, _locks)
     start_backup_scheduler(_get_settings, _locks)
+    branding.start_grace_renewal(_get_settings)
     from oduflow.wal_monitor import start_monitor
 
     start_monitor(_get_settings)
@@ -8324,55 +8682,22 @@ def _start_http() -> None:
 
     # Fail closed: never serve the MCP tool surface (run_odoo_command,
     # run_db_query, privileged service creation, …) unauthenticated by accident
-    # (#37). A fresh install bootstraps a random auth_token; reaching here with
-    # no auth means the operator cleared it, which must be explicit.
-    if auth is None and not settings.allow_insecure_http:
-        raise PrerequisiteNotMetError(
-            "Refusing to start the HTTP transport with no MCP authentication: "
-            "set a [team.*] auth_token in oduflow.toml. To "
-            "run unauthenticated on purpose (e.g. behind your own auth proxy), "
-            "set [server] allow_insecure_http = true."
-        )
+    # (#37), nor the web dashboard, which exposes even more (interactive
+    # shells/SQL/agent, credential management). A fresh install bootstraps a
+    # random auth_token and ui_password, and _ensure_web_ui_password just
+    # auto-provisioned passwords for existing teams — so a failure here means
+    # the operator cleared them, which must be explicit. With several teams,
+    # every team needs its own token: auth rejects a tokenless team's requests
+    # before Host-based routing. The Server settings console runs the same
+    # check on every save, so it cannot write a config that fails here.
+    from oduflow.config_store import check_http_auth
+
+    check_http_auth(settings)
     if auth is None:
         logger.warning(
             "HTTP transport starting WITHOUT authentication "
             "(allow_insecure_http=true) — the full MCP tool surface is open."
         )
-
-    # Fail closed for the WEB DASHBOARD too, symmetric to the MCP check above.
-    # The dashboard exposes MORE than MCP (interactive shells/SQL/agent to every
-    # environment, privileged service creation, credential management) and is
-    # only authenticated when a team sets ui_password. Fresh installs bootstrap
-    # one and _ensure_web_ui_password just auto-provisioned one for every existing
-    # team — so reaching here with ANY team still passwordless means the config
-    # write failed and the operator has not opted into an open server. Check
-    # ``all`` (not ``any``): a single passwordless team can never log in (auth is
-    # global; empty passwords are skipped), so refuse rather than silently lock it
-    # out.
-    if not settings.allow_insecure_http and (
-        not settings.teams or not all(t.ui_password for t in settings.teams.values())
-    ):
-        raise PrerequisiteNotMetError(
-            "Refusing to start the HTTP transport with an unauthenticated web "
-            "dashboard: set a [team.*] ui_password in oduflow.toml (the dashboard "
-            "exposes interactive shells, SQL and privileged service creation for "
-            "every environment). To run it open on purpose (e.g. behind your own "
-            "auth proxy), set [server] allow_insecure_http = true."
-        )
-
-    # With several teams, every team needs its own token: auth rejects a
-    # tokenless team's requests before Host-based routing, so its members
-    # would be locked out — and _resolve_team no longer falls back in HTTP
-    # mode, so misconfiguration must fail here, at startup.
-    if not settings.allow_insecure_http and len(settings.teams) > 1:
-        tokenless = sorted(
-            tid for tid, team in settings.teams.items() if not team.auth_token
-        )
-        if tokenless:
-            raise PrerequisiteNotMetError(
-                "HTTP transport with multiple teams requires an auth_token "
-                f"for every team; missing for: {', '.join(tokenless)}."
-            )
     if host not in ("127.0.0.1", "::1", "localhost"):
         logger.warning(
             "Binding %s on all/non-loopback interface — ensure a firewall and "
@@ -8400,13 +8725,30 @@ def _start_http() -> None:
     from oduflow.backup_scheduler import start_backup_scheduler
 
     start_backup_scheduler(_get_settings, _locks)
+    branding.start_grace_renewal(_get_settings)
     from oduflow.wal_monitor import start_monitor
 
     start_monitor(_get_settings)
 
+    from oduflow.config_store import ConfigRuntime
     from oduflow.web_ui import mount_web_ui
 
-    mount_web_ui(app, _get_settings, _locks)
+    mount_web_ui(
+        app,
+        _get_settings,
+        _locks,
+        config_runtime=ConfigRuntime(
+            running=_running_settings,
+            swap=_swap_settings,
+            restart=_request_restart,
+            busy=_locks.active_operations,
+            # The config this process booted with: what the threads, the auth
+            # provider and the route table above were built from. Live swaps
+            # move the cached Settings on, so the console cannot ask those for
+            # the boot state.
+            boot=settings,
+        ),
+    )
     global _web_bind
     _web_bind = (host, port)
 
@@ -8462,7 +8804,10 @@ def _start_http() -> None:
     # so without a cap uvicorn waits indefinitely on SIGTERM and systemd escalates
     # to SIGKILL after TimeoutStopSec (~90s). Force-close lingering connections
     # after 10s so a stop/restart completes cleanly instead of being killed.
-    uvicorn.run(
+    # Server/Config instead of uvicorn.run() so the console's restart can stop
+    # the server gracefully without a signal (uvicorn re-raises captured
+    # signals after shutdown, which would kill the process before re-exec).
+    config = uvicorn.Config(
         served,
         host=host,
         port=port,
@@ -8471,6 +8816,43 @@ def _start_http() -> None:
         proxy_headers=True,
         forwarded_allow_ips=forwarded_allow_ips,
     )
+    server = uvicorn.Server(config)
+    global _uvicorn_server
+    _uvicorn_server = server
+    server.run()
+    if _restart_requested.is_set():
+        _reexec()
+    if not server.started:
+        sys.exit(3)
+
+
+# The running uvicorn server, so a console restart can stop it gracefully.
+_uvicorn_server: Any = None
+_restart_requested = threading.Event()
+
+
+def _request_restart() -> None:
+    """Stop serving gracefully, then re-exec this process with the same argv.
+
+    Re-exec (same PID) restarts identically under systemd, in the container
+    and in a foreground shell, and runs the whole startup path again — Traefik
+    and agent reconciliation, quotas, auth provider, background threads — with
+    the config now on disk. Managed containers are independent of this process
+    and keep running.
+    """
+    if _uvicorn_server is None:
+        raise PrerequisiteNotMetError("Restart is only available in HTTP mode.")
+    _restart_requested.set()
+    _uvicorn_server.should_exit = True
+
+
+def _reexec() -> None:
+    argv = [sys.executable, *sys.orig_argv[1:]]
+    logger.warning("Restarting Oduflow: %s", " ".join(argv))
+    for handler in logging.getLogger().handlers:
+        with contextlib.suppress(Exception):
+            handler.flush()
+    os.execv(sys.executable, argv)
 
 
 def _build_auth(settings: Settings):  # type: ignore[no-untyped-def]
@@ -8495,6 +8877,58 @@ def _build_auth(settings: Settings):  # type: ignore[no-untyped-def]
     return None
 
 
+def _run_license_cli(settings: Settings, args: argparse.Namespace) -> None:
+    from oduflow import licensing
+
+    etc_dir = settings.etc_dir
+    action = args.license_action
+    try:
+        if action == "install":
+            info = licensing.install_license(args.file, etc_dir)
+            print(f"Installed: {info.label}")
+            print("Restart the Oduflow service to apply it to MCP clients.")
+        elif action == "refresh":
+            result = licensing.refresh_license(etc_dir)
+            if result.renewed:
+                print(f"Renewed: valid until {result.info.expires}")
+                print("Restart the Oduflow service to apply it to MCP clients.")
+            elif result.subscription_required:
+                print("No active subscription. Run `oduflow license subscribe`.")
+            else:
+                print("No newer paid period is available yet.")
+        elif action == "subscribe":
+            print(licensing.get_license_checkout_url(etc_dir))
+            return
+    except (OSError, ValueError) as exc:
+        raise FlowError(f"License: {exc}") from exc
+    info = licensing.get_license_info(etc_dir)
+    print(f"License: {info.label}")
+    for title, value in (
+        ("Holder", info.name),
+        ("Email", info.email),
+        ("Valid from", info.valid_from),
+        ("Expires", info.expires),
+    ):
+        if value:
+            print(f"{title}: {value}")
+    if info.type == licensing.TYPE_CUSTOM:
+        brand = branding.compute(settings)
+        print(f"Brand: {info.brand_name}")
+        print(f"Domains: {', '.join(info.domains)}")
+        if brand.white_label:
+            print("White label: active")
+        else:
+            print(f"White label: off ({brand.reason})")
+        days_left = branding.grace_days_left(settings)
+        if days_left is not None:
+            print(
+                f"Expired: white label turns off in {days_left} day(s) unless "
+                "renewed (`oduflow license refresh`)."
+            )
+        branding_dir = os.path.join(etc_dir, branding.BRANDING_DIRNAME)
+        print(f"Logo and icon: {branding_dir}/{{logo.png,icon.png}}")
+
+
 def main() -> None:
     """CLI entry point: run the server/command and translate a missing
     prerequisite (e.g. Docker daemon unreachable) into a friendly process exit
@@ -8509,6 +8943,12 @@ def main() -> None:
     except StackValidationError as exc:
         print(f"\n❌ {exc}", file=sys.stderr)
         sys.exit(1)
+    except KeyboardInterrupt:
+        # Uvicorn shuts down gracefully on Ctrl+C, then re-raises the captured
+        # SIGINT, which asyncio surfaces here as KeyboardInterrupt. Shutdown is
+        # already complete, so exit with the conventional SIGINT status.
+        print("\nInterrupted.", file=sys.stderr)
+        sys.exit(130)
 
 
 if __name__ == "__main__":

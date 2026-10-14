@@ -60,6 +60,84 @@ def _client(tmp_path) -> TestClient:
     return TestClient(app)
 
 
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")
+def test_cleanup_requires_preview_image_opt_in_and_prevents_duplicate_confirm():
+    dashboard = _DASHBOARD.read_text(encoding="utf-8")
+    source = dashboard.split("var cleanupPreview = null;", 1)[1].split(
+        "async function loadStats()", 1
+    )[0]
+    harness = (
+        "var cleanupPreview = null;"
+        + source
+        + r"""
+const assert = require('node:assert/strict');
+const fields = {};
+global.document = {getElementById: id => fields[id] || (fields[id] = {
+  disabled: false, checked: false, textContent: '', setAttribute() {}
+})};
+var refreshes = 0;
+function loadEnvironments() { refreshes++; }
+function loadStats() {}
+function fmtBytes(n) { return n + ' B'; }
+async function readResult(r) { return r; }
+const image = {id: 'sha256:' + 'a'.repeat(64), tags: ['<test-image>'], size_bytes: 100};
+const requests = [];
+let finishCleanup;
+let preview = {dry_run: true, images: [image]};
+global.fetch = async (url, options) => {
+  const body = JSON.parse(options.body);
+  requests.push(body);
+  if (!body.force) return {ok: true, result: preview};
+  return new Promise(resolve => { finishCleanup = resolve; });
+};
+const noOrphans = {orphan_databases: [], orphan_workspaces: [], orphan_ports: [], orphan_roles: []};
+(async () => {
+  await confirmCleanup();
+  assert.equal(requests.length, 0);
+  await scanCleanup();
+  assert.equal(requests[0].force, false);
+  assert.equal(fields['cleanup-confirm'].disabled, true);
+  assert.equal(fields['cleanup-images'].checked, false);
+  assert.match(fields['cleanup-output'].textContent, /<test-image>/);
+  fields['cleanup-images'].checked = true;
+  updateCleanupConfirm();
+  assert.equal(fields['cleanup-confirm'].disabled, false);
+  const pending = confirmCleanup();
+  await confirmCleanup();
+  assert.equal(requests.length, 2);
+  assert.deepEqual(requests[1], {force: true, orphans: noOrphans, image_ids: [image.id]});
+  assert.equal(fields['cleanup-confirm'].disabled, true);
+  finishCleanup({ok: true, result: {dry_run: false, images: {
+    removed: [], skipped: [{id: image.id, reason: 'Now used by a container.'}], errors: []
+  }}});
+  await pending;
+  assert.match(fields['cleanup-output'].textContent, /Now used by a container/);
+  assert.equal(fields['cleanup-confirm'].disabled, true);
+  assert.equal(refreshes, 1);
+  // A fresh scan is required after completion or a lost response.
+  await confirmCleanup();
+  assert.equal(requests.length, 2);
+  // Confirm names exactly the reviewed orphans, so the server removes no others.
+  preview = {dry_run: true, orphan_databases: ['oduflow_1_old'], images: [image]};
+  await scanCleanup();
+  assert.equal(fields['cleanup-images'].checked, false);
+  assert.equal(fields['cleanup-confirm'].disabled, false);
+  const orphanCleanup = confirmCleanup();
+  assert.deepEqual(requests[3], {
+    force: true, orphans: {...noOrphans, orphan_databases: ['oduflow_1_old']}, image_ids: []
+  });
+  finishCleanup({ok: true, result: {dry_run: false, orphan_databases: ['oduflow_1_old'], images: {
+    removed: [], skipped: [], errors: []
+  }}});
+  await orphanCleanup;
+  assert.match(fields['cleanup-output'].textContent, /oduflow_1_old/);
+  process.stdout.write(JSON.stringify({ok: true}));
+})().catch(error => { console.error(error); process.exit(1); });
+"""
+    )
+    assert _run_node(harness) == {"ok": True}
+
+
 def test_chat_assets_share_one_positive_integer_cache_version(tmp_path):
     client = _client(tmp_path)
     dashboard = client.get("/")
@@ -314,7 +392,24 @@ def test_dashboard_accepts_opencode_default_and_labels_it(tmp_path):
     assert dashboard.status_code == 200
     assert "data.default === 'opencode'" in dashboard.text
     assert "(agentType === 'opencode' ? 'OpenCode' : 'Claude')" in dashboard.text
-    assert "var CHAT_V = '7'" in dashboard.text
+
+
+def test_agent_chat_sits_next_to_connect_as(tmp_path):
+    dashboard = _client(tmp_path).get("/").text
+
+    connect = dashboard.index('<button class="btn btn-connect" title="Log in as a user')
+    chat = dashboard.index(
+        '<button class="btn btn-chat" title="Structured chat with the coding agent'
+    )
+    sync = dashboard.index('<button class="btn btn-sync"', connect)
+    # Agent Chat sits right of Connect As, ahead of the routine actions...
+    assert connect < chat < sync
+    assert ">Connect As</button>" in dashboard[connect:chat]
+    # ...and is no longer duplicated inside the More menu.
+    assert 'role="menuitem" title="Structured chat' not in dashboard
+    # Both stay plain outline actions (DESIGN.md: one primary per view).
+    assert ".btn-chat:hover, .btn-chat:focus-visible {" in dashboard
+    assert ".btn-main" not in dashboard
 
 
 def test_minimized_window_dock_has_group_semantics_and_restores_focus(tmp_path):
@@ -553,8 +648,8 @@ def test_extra_addon_pickers_offer_select_all_and_clear(tmp_path):
     assert 'id="cr-extra-clear"' in dashboard
     assert 'id="tset-extra-select-all"' in dashboard
     assert 'id="tset-extra-clear"' in dashboard
-    assert "setAllExtraRepos('.cr-extra-cb', true)" in dashboard
-    assert "setAllExtraRepos('.tset-extra-cb', false)" in dashboard
+    assert "setAllExtraRepos('cr-extra', true)" in dashboard
+    assert "setAllExtraRepos('tset-extra', false)" in dashboard
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")
@@ -562,41 +657,63 @@ def test_extra_repo_bulk_actions_stay_inside_their_own_picker():
     dashboard = _DASHBOARD.read_text(encoding="utf-8")
     functions = "\n".join(
         _js_function(dashboard, name)
-        for name in ("setAllExtraRepos", "setExtraRepoActionsEnabled")
+        for name in (
+            "_extraRepoRows",
+            "updateExtraRepoStatus",
+            "setAllExtraRepos",
+            "setExtraRepoActionsEnabled",
+        )
     )
     harness = (
         functions
         + r"""
-var lists = {
-  '.cr-extra-cb': [{checked: false}, {checked: false}],
-  '.tset-extra-cb': [{checked: true}]
+var EXTRA_REPO_PICKERS = {
+  'cr-extra': {list: 'cr-extra-addons-checkboxes', checkbox: '.cr-extra-cb'},
+  'tset-extra': {list: 'tset-extra-addons', checkbox: '.tset-extra-cb'}
 };
-var buttons = {
+function row(checked, hidden) {
+  var cb = {checked: checked, type: 'checkbox'};
+  var r = {hidden: !!hidden, cb: cb, querySelector: function () { return cb; }};
+  cb.closest = function () { return r; };
+  return r;
+}
+// The third create-modal repo is checked and hidden by the name filter.
+var crRows = [row(false), row(false), row(true, true)];
+var tsetRows = [row(true)];
+var lists = {
+  '.cr-extra-cb': crRows.map(function (r) { return r.cb; }),
+  '.tset-extra-cb': tsetRows.map(function (r) { return r.cb; })
+};
+var els = {
+  'cr-extra-addons-checkboxes': {querySelectorAll: function () { return crRows; }},
   'cr-extra-select-all': {disabled: true},
-  'cr-extra-clear': {disabled: true}
+  'cr-extra-clear': {disabled: true},
+  'cr-extra-status': {hidden: true, textContent: ''}
 };
 var document = {
   querySelectorAll: function (selector) { return lists[selector] || []; },
-  getElementById: function (id) { return buttons[id]; }
+  getElementById: function (id) { return els[id]; }
 };
 
-setAllExtraRepos('.cr-extra-cb', true);
-var selected = lists['.cr-extra-cb'].map(function (cb) { return cb.checked; });
+setAllExtraRepos('cr-extra', true);
+var selected = crRows.map(function (r) { return r.cb.checked; });
 setExtraRepoActionsEnabled('cr-extra', true);
 var enabled = {
-  selectAll: buttons['cr-extra-select-all'].disabled,
-  clear: buttons['cr-extra-clear'].disabled
+  selectAll: els['cr-extra-select-all'].disabled,
+  clear: els['cr-extra-clear'].disabled
 };
-// The template picker's buttons are absent from this harness: a modal that is
+// The template picker's controls are absent from this harness: a modal that is
 // not on screen must not break the one that is.
 setExtraRepoActionsEnabled('tset-extra', true);
-setAllExtraRepos('.cr-extra-cb', false);
+setAllExtraRepos('cr-extra', false);
 
 process.stdout.write(JSON.stringify({
   selected: selected,
-  cleared: lists['.cr-extra-cb'].map(function (cb) { return cb.checked; }),
-  untouched: lists['.tset-extra-cb'].map(function (cb) { return cb.checked; }),
-  enabled: enabled
+  cleared: crRows.map(function (r) { return r.cb.checked; }),
+  untouched: tsetRows.map(function (r) { return r.cb.checked; }),
+  enabled: enabled,
+  status: els['cr-extra-status'].textContent,
+  statusHidden: els['cr-extra-status'].hidden
 }));
 """
     )
@@ -604,11 +721,198 @@ process.stdout.write(JSON.stringify({
     result = _run_node(harness)
 
     assert result == {
-        "selected": [True, True],
-        "cleared": [False, False],
+        "selected": [True, True, True],
+        # Clear leaves the hidden row checked, so the status line has to say so:
+        # the repo is invisible but still mounted.
+        "cleared": [False, False, True],
         "untouched": [True],
         "enabled": {"selectAll": False, "clear": False},
+        "status": (
+            "1 selected repo is hidden by the filter and still mounted; "
+            "Select all and Clear only touch visible rows."
+        ),
+        "statusHidden": False,
     }
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")
+def test_extra_repo_filter_and_default_branch():
+    dashboard = _DASHBOARD.read_text(encoding="utf-8")
+    assert 'id="tset-extra-filter"' in dashboard
+    assert 'id="cr-extra-default-branch"' in dashboard
+    functions = "\n".join(
+        _js_function(dashboard, name)
+        for name in (
+            "escHtmlAttr",
+            "_tsetBranchOptions",
+            "extraRepoBranchChoices",
+            "extraRepoBranchNames",
+            "_extraRepoRows",
+            "updateExtraRepoStatus",
+            "filterExtraRepos",
+            "revealExtraRepos",
+            "initExtraRepoTools",
+            "applyDefaultExtraBranch",
+        )
+    )
+    harness = (
+        functions
+        + r"""
+// The dashboard's esc() goes through a DOM node; the attribute escaper is an
+// equivalent stand-in for these plain branch names.
+var esc = escHtmlAttr;
+var EXTRA_REPO_PICKERS = {'tset-extra': {list: 'tset-extra-addons', checkbox: '.tset-extra-cb'}};
+var cachedExtraRepos = [
+  {name: 'connect-addons', repo_url: 'https://example.test/connect.git',
+   branches: ['17.0'], available_branches: ['17.0', 'feature-x']},
+  {name: 'odusfera-addons', repo_url: 'https://example.test/odusfera.git',
+   branches: [], available_branches: ['origin/17.0', '9.0']},
+  {name: 'open-up', repo_url: 'https://example.test/OpenUpgrade.git',
+   branches: ['16.0'], available_branches: []}
+];
+function row(name, url, branch) {
+  var cb = {value: name, checked: false};
+  var input = {value: branch};
+  return {
+    hidden: false,
+    textContent: name + ' (' + url + ')',
+    cb: cb,
+    input: input,
+    querySelector: function (sel) { return sel === '.branch-input' ? input : cb; }
+  };
+}
+var rows = cachedExtraRepos.map(function (r) { return row(r.name, r.repo_url, ''); });
+rows.push(row('legacy', 'missing', 'keep-me'));
+// A repo the filter will hide, checked and therefore still mounted.
+rows[0].cb.checked = true;
+var els = {
+  'tset-extra-addons': {querySelectorAll: function () { return rows; }},
+  'tset-extra-filter': {value: 'stale'},
+  'tset-extra-default-branch': {value: '', innerHTML: ''},
+  'tset-extra-status': {hidden: true, textContent: ''}
+};
+var document = {getElementById: function (id) { return els[id]; }};
+
+initExtraRepoTools('tset-extra');
+var options = els['tset-extra-default-branch'].innerHTML;
+var afterInit = {filter: els['tset-extra-filter'].value, hidden: rows.map(function (r) { return r.hidden; })};
+
+els['tset-extra-filter'].value = 'UP';
+filterExtraRepos('tset-extra');
+var filtered = rows.map(function (r) { return r.hidden; });
+var statusWhenSome = els['tset-extra-status'].textContent;
+
+els['tset-extra-filter'].value = 'nothing-matches';
+filterExtraRepos('tset-extra');
+var statusWhenNone = els['tset-extra-status'].textContent;
+
+// Filtered-out rows still receive the branch.
+els['tset-extra-default-branch'].value = '17.0';
+applyDefaultExtraBranch('tset-extra');
+// One-shot: the control returns to its placeholder, so picking the same branch
+// again is a fresh change event rather than a no-op.
+var pickerAfterApply = els['tset-extra-default-branch'].value;
+rows[0].input.value = 'hand-edited';
+els['tset-extra-default-branch'].value = '17.0';
+applyDefaultExtraBranch('tset-extra');
+
+// Anything the form must act on is revealed again, filter and all.
+revealExtraRepos('tset-extra');
+
+process.stdout.write(JSON.stringify({
+  options: options,
+  afterInit: afterInit,
+  filtered: filtered,
+  statusWhenSome: statusWhenSome,
+  statusWhenNone: statusWhenNone,
+  pickerAfterApply: pickerAfterApply,
+  revealed: rows.map(function (r) { return r.hidden; }),
+  statusAfterReveal: {text: els['tset-extra-status'].textContent, hidden: els['tset-extra-status'].hidden},
+  branches: rows.map(function (r) { return r.input.value; }),
+  checked: rows.map(function (r) { return r.cb.checked; })
+}));
+"""
+    )
+
+    result = _run_node(harness)
+
+    hidden_selection = (
+        "1 selected repo is hidden by the filter and still mounted; "
+        "Select all and Clear only touch visible rows."
+    )
+    assert result == {
+        "options": (
+            '<option value="">Set branch\u2026</option>'
+            '<option value="9.0">9.0 (1 repo)</option>'
+            '<option value="16.0">16.0 (1 repo)</option>'
+            '<option value="17.0">17.0 (2 repos)</option>'
+            '<option value="feature-x">feature-x (1 repo)</option>'
+        ),
+        "afterInit": {"filter": "", "hidden": [False, False, False, False]},
+        "filtered": [True, True, False, True],
+        "statusWhenSome": hidden_selection,
+        "statusWhenNone": "No repos match the filter. " + hidden_selection,
+        "pickerAfterApply": "",
+        "revealed": [False, False, False, False],
+        "statusAfterReveal": {"text": "", "hidden": True},
+        # Only repos that have the branch get it; nothing gets ticked. The
+        # second apply restores the branch edited away by hand.
+        "branches": ["17.0", "17.0", "", "keep-me"],
+        "checked": [True, False, False, False],
+    }
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")
+def test_create_modal_branch_suggestions_match_the_branch_picker():
+    """Both suggestion lists offer mountable names, not raw remote refs."""
+    dashboard = _DASHBOARD.read_text(encoding="utf-8")
+    functions = "\n".join(
+        _js_function(dashboard, name)
+        for name in (
+            "escAttr",
+            "_tsetBranchOptions",
+            "extraRepoBranchChoices",
+            "extraRepoBranchNames",
+            "extraRepoBranchDatalist",
+        )
+    )
+    harness = (
+        functions
+        + r"""
+// A repo cloned before on-demand registration lists refs/remotes/, so its
+// downloaded branches read "origin/17.0" and include origin/HEAD.
+var legacy = {name: 'legacy', branches: ['origin/17.0', 'origin/HEAD', '17.0'],
+              available_branches: ['18.0']};
+process.stdout.write(JSON.stringify({
+  datalist: extraRepoBranchDatalist(legacy),
+  picker: extraRepoBranchNames(legacy)
+}));
+"""
+    )
+
+    result = _run_node(harness)
+
+    assert result == {
+        "datalist": (
+            '<datalist id="extra-branches-legacy">'
+            '<option value="17.0"></option>'
+            '<option value="18.0"></option>'
+            "</datalist>"
+        ),
+        "picker": ["17.0", "18.0"],
+    }
+
+
+def test_branch_required_error_reveals_filtered_extra_repos():
+    """An error naming repos must not leave any of them behind the filter."""
+    dashboard = _DASHBOARD.read_text(encoding="utf-8")
+    errors = [
+        m.start()
+        for m in re.finditer(r"Branch is required for extra addon\(s\)", dashboard)
+    ]
+    assert len(errors) == 2  # create modal + template settings
+    for start in errors:
+        assert "revealExtraRepos(" in dashboard[start - 300 : start]
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")
@@ -797,4 +1101,489 @@ def test_prompt_dialog_escape_is_handled_on_the_overlay(tmp_path):
         r"overlay\.addEventListener\('keydown',\s*function\(e\)\s*\{\s*"
         r"if \(e\.key === 'Escape'\) \{ e\.stopPropagation\(\); close\(null\); \}",
         dashboard.text,
+    )
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")
+def test_secret_editor_masks_values_and_keeps_update_and_replace_independent():
+    dashboard = _DASHBOARD.read_text(encoding="utf-8")
+    functions = "\n".join(
+        _js_function(dashboard, name)
+        for name in (
+            "clearSecretKeyResult",
+            "canUpdateSecretKey",
+            "secretKeyPath",
+            "updateSecretValueMode",
+            "validateSecretKey",
+            "validateSecretValue",
+            "openSecretModal",
+            "closeSecretModal",
+            "submitSecret",
+        )
+    )
+    harness = (
+        functions
+        + r"""
+const assert = require('node:assert/strict');
+var API_SECRETS = '/api/secrets';
+var secretTypes = {config: 'json', plain: 'text'};
+var secretEditingName = '';
+var secretSaving = '';
+var fields = {};
+var resultWrites = [];
+var document = {getElementById: function(id) {
+  if (id === 'secret-key-result' && !fields[id]) {
+    var state = {hidden: true, text: ''};
+    fields[id] = {
+      get hidden() { return state.hidden; },
+      set hidden(v) { state.hidden = v; resultWrites.push('hidden=' + v); },
+      get textContent() { return state.text; },
+      set textContent(v) { state.text = v; resultWrites.push('text=' + (v ? 'set' : 'cleared')); }
+    };
+  }
+  if (!fields[id]) fields[id] = {
+    value: '', checked: false, disabled: false, hidden: false, textContent: '',
+    style: {}, setAttribute: function(k, v) { this[k] = v; }, focus: function() {}
+  };
+  return fields[id];
+}};
+function field(id) { return document.getElementById('secret-' + id); }
+var visible = false;
+function showModal() { visible = true; }
+function hideModal() { visible = false; }
+function showToast() {}
+async function loadSecrets() {}
+async function readResult(r) { return r; }
+var requests = [];
+var reply = {ok: true, result: {created: false, updated: true}};
+async function fetch(url, options) {
+  requests.push({url: url, body: JSON.parse(options.body)});
+  return reply;
+}
+(async function() {
+  openSecretModal('config');
+  assert.equal(field('name').value, 'config');
+  assert.equal(field('name').readOnly, true);
+  assert.equal(field('hide-value').checked, true);
+  assert.equal(field('hide-value').disabled, false);
+  assert.equal(field('key-value').type, 'password');
+  assert.equal(field('json-fields').hidden, false);
+  assert.equal(field('submit').hidden, true);
+  field('key').value = '/database/password';
+  field('key-value').value = 'true';
+  field('json-value').value = '{invalid replacement';
+  validateSecretValue();
+  assert.equal(field('update-submit').disabled, false);
+  assert.equal(field('replace-submit').disabled, true);
+  await submitSecret('update');
+  assert.deepEqual(requests.pop(), {
+    url: '/api/secrets/config/update-json',
+    body: {path: '/database/password', value: 'true'}
+  });
+  assert.equal(visible, true);
+  assert.equal(field('key-value').value, '');
+  assert.equal(field('key').value, '/database/password');
+  assert.equal(field('json-value').value, '{invalid replacement');
+  assert.equal(field('key-result').hidden, false);
+  assert.ok(field('key-result').textContent.startsWith('Key updated: /database/password.'));
+  // aria-live regions only announce mutations while rendered: unhide, then write.
+  assert.deepEqual(resultWrites.slice(-2), ['hidden=false', 'text=set']);
+  assert.equal(field('update-submit').disabled, true);
+
+  field('key').value = '  environment.OPENROUTER_API_KEY  ';
+  field('key-value').value = 'new-private';
+  validateSecretKey();
+  assert.equal(field('update-submit').disabled, false);
+  reply = {ok: true, result: {created: true, updated: false}};
+  await submitSecret('update');
+  assert.deepEqual(requests.pop(), {
+    url: '/api/secrets/config/update-json',
+    body: {path: 'environment.OPENROUTER_API_KEY', value: 'new-private'}
+  });
+  assert.equal(visible, true);
+  assert.ok(field('key-result').textContent.startsWith('Key created: environment.OPENROUTER_API_KEY.'));
+  assert.equal(field('key').value, 'environment.OPENROUTER_API_KEY');
+  assert.ok(!field('key-result').textContent.includes('new-private'));
+  assert.equal(field('key-value').value, '');
+  clearSecretKeyResult();
+  assert.equal(field('key-result').hidden, true);
+  assert.equal(field('key-result').textContent, '');
+  closeSecretModal();
+  ['value', 'key', 'key-value', 'json-value'].forEach(id => assert.equal(field(id).value, ''));
+
+  openSecretModal('config');
+  field('key').value = '   ';
+  field('key-value').value = 'must-not-submit';
+  assert.equal(validateSecretKey(), false);
+  field('key').value = 'invalid..path';
+  field('key-value').value = 'must-not-submit';
+  field('json-value').value = '{"number":123}';
+  validateSecretValue();
+  assert.equal(field('update-submit').disabled, true);
+  assert.equal(field('replace-submit').disabled, false);
+  await submitSecret();
+  assert.deepEqual(requests.pop(), {
+    url: '/api/secrets/config/set', body: {value: '{"number":123}', value_type: 'json'}
+  });
+
+  openSecretModal('plain');
+  field('value').value = 'masked-draft';
+  field('is-json').checked = true;
+  updateSecretValueMode();
+  assert.equal(field('json-value').value, '');
+  assert.equal(field('key').disabled, true);
+  assert.equal(field('update-submit').disabled, true);
+  field('hide-value').checked = false;
+  updateSecretValueMode();
+  assert.equal(field('key-value').type, 'text');
+  assert.equal(field('json-fields').hidden, false);
+  field('is-json').checked = false;
+  updateSecretValueMode();
+  assert.equal(field('value').value, 'masked-draft');
+  assert.equal(field('value').type, 'text');
+  assert.equal(field('submit').hidden, false);
+  await submitSecret();
+  assert.deepEqual(requests.pop(), {
+    url: '/api/secrets/plain/set', body: {value: 'masked-draft', value_type: 'text'}
+  });
+
+  openSecretModal();
+  field('name').value = 'new-secret';
+  field('is-json').checked = true;
+  updateSecretValueMode();
+  assert.equal(field('update-submit').disabled, true);
+  assert.equal(field('replace-submit').textContent, 'Save JSON');
+  closeSecretModal();
+
+  openSecretModal('config');
+  field('key').value = '/database/password';
+  field('key-value').value = 'retry-me';
+  reply = {ok: false, error: 'Rejected'};
+  await submitSecret('update');
+  assert.equal(visible, true);
+  assert.equal(field('key-value').value, 'retry-me');
+  assert.equal(field('error').textContent, 'Rejected');
+  assert.equal(field('update-submit').disabled, false);
+  assert.equal(secretSaving, '');
+  requests = [];
+  var finish;
+  fetch = function(url, options) {
+    requests.push({url: url, body: JSON.parse(options.body)});
+    return new Promise(resolve => { finish = resolve; });
+  };
+  var pending = submitSecret('update');
+  assert.equal(field('update-submit').textContent, 'Saving…');
+  assert.equal(field('replace-submit').disabled, true);
+  assert.equal(field('is-json').disabled, true);
+  await submitSecret('update');
+  closeSecretModal();
+  assert.equal(visible, true);
+  assert.equal(requests.length, 1);
+  finish({ok: true, result: {created: false, updated: true}});
+  await pending;
+  assert.equal(visible, true);
+  assert.ok(field('key-result').textContent.startsWith('Key updated:'));
+  closeSecretModal();
+  assert.equal(visible, false);
+  assert.equal(field('key-result').hidden, true);
+  process.stdout.write(JSON.stringify({ok: true}));
+})().catch(error => { console.error(error); process.exitCode = 1; });
+"""
+    )
+    assert _run_node(harness) == {"ok": True}
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")
+def test_long_extra_repo_list_folds_and_filters_without_losing_state():
+    dashboard = _DASHBOARD.read_text(encoding="utf-8")
+    functions = "\n".join(
+        _js_function(dashboard, name)
+        for name in (
+            "extrasHtml",
+            "_extrasQuery",
+            "applyExtrasState",
+            "measureExtras",
+            "pruneExtrasState",
+            "extrasFilterInput",
+            "extrasFilterKey",
+            "toggleExtras",
+        )
+    )
+    harness = (
+        functions
+        + r"""
+var _extrasOpen = Object.create(null);
+var _extrasFilter = Object.create(null);
+function getComputedStyle() { return {lineHeight: '20px'}; }
+// Stand-in for the dashboard's DOM-based esc(): enough to inspect the markup.
+function esc(s) {
+  return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
+}
+function classes() {
+  var set = new Set();
+  return {
+    toggle: function (name, on) { if (on) set.add(name); else set.delete(name); },
+    add: function (name) { set.add(name); },
+    contains: function (name) { return set.has(name); }
+  };
+}
+function makeBox(branch, repos, fullHeight) {
+  var attrs = {'data-extras-for': branch};
+  var items = repos.map(function (repo) {
+    var attrs = {'data-search': (repo[0] + ' (' + repo[1] + ')').toLowerCase()};
+    return {hidden: false, getAttribute: function (key) { return attrs[key]; }};
+  });
+  var nodes = {
+    '.extras-filter': {value: ''},
+    '.extras-toggle': {
+      hidden: false, textContent: '', attrs: {},
+      setAttribute: function (k, v) { this.attrs[k] = v; }
+    },
+    '.extras-match': {textContent: '', classList: classes()},
+    '.extras-list': {hidden: false},
+    // The wrapper is never clamped, so it is what carries the full height.
+    '.extras-items': {
+      scrollHeight: fullHeight,
+      getClientRects: function () { return [1]; }
+    }
+  };
+  var box = {
+    classList: classes(),
+    getAttribute: function (k) { return attrs[k]; },
+    querySelector: function (sel) { return nodes[sel]; },
+    querySelectorAll: function () { return items; }
+  };
+  nodes['.extras-filter'].closest = function () { return box; };
+  nodes['.extras-toggle'].closest = function () { return box; };
+  box.nodes = nodes;
+  box.items = items;
+  return box;
+}
+function snapshot(box) {
+  return {
+    overflow: box.classList.contains('has-overflow'),
+    clamped: box.classList.contains('is-clamped'),
+    visible: box.items.filter(function (i) { return !i.hidden; }).length,
+    listHidden: box.nodes['.extras-list'].hidden,
+    match: box.nodes['.extras-match'].textContent,
+    toggleHidden: box.nodes['.extras-toggle'].hidden,
+    toggle: box.nodes['.extras-toggle'].textContent,
+    expanded: box.nodes['.extras-toggle'].attrs['aria-expanded']
+  };
+}
+
+var out = {};
+// The rendered item is "name (branch)" and both halves are searchable.
+var markup = extrasHtml('work', {'web-OCA': '16.0'}, 3);
+out.markup = {
+  search: /data-search="([^"]*)"/.exec(markup)[1],
+  wrapped: markup.indexOf('<div class="extras-items">') !== -1
+};
+
+var short = makeBox('short', [['web-OCA', '16.0'], ['queue-OCA', '16.0']], 40);
+applyExtrasState(short);
+out.short = snapshot(short);
+
+var repos = [
+  ['account-payment-OCA', '17.0'],
+  ['account-invoicing-OCA', '17.0'],
+  ['web-OCA', '16.0'],
+  ['queue-OCA', '16.0']
+];
+var long = makeBox('work', repos, 200);
+applyExtrasState(long);
+out.folded = snapshot(long);
+
+toggleExtras(long.nodes['.extras-toggle']);
+out.unfolded = snapshot(long);
+toggleExtras(long.nodes['.extras-toggle']);
+
+var input = long.nodes['.extras-filter'];
+input.value = 'Account';
+extrasFilterInput(input);
+out.filtered = snapshot(long);
+
+input.value = '16.0';
+extrasFilterInput(input);
+out.byBranch = snapshot(long);
+
+input.value = 'stock';
+extrasFilterInput(input);
+out.missing = snapshot(long);
+
+// A re-render builds a fresh box: the stored filter is applied back to it.
+var rerendered = makeBox('work', repos, 200);
+applyExtrasState(rerendered);
+out.rerenderValue = rerendered.nodes['.extras-filter'].value;
+
+var stopped = false;
+extrasFilterKey({
+  key: 'Escape',
+  preventDefault: function () {},
+  stopPropagation: function () { stopped = true; }
+}, input);
+out.escape = {stopped: stopped, value: input.value, state: snapshot(long)};
+
+// A deleted environment leaves no state behind: recreating it under the same
+// name must not inherit the old fold/filter.
+_extrasFilter['gone'] = 'web';
+_extrasOpen['gone'] = true;
+pruneExtrasState(['work', 'short']);
+out.pruned = {
+  filter: 'gone' in _extrasFilter,
+  open: 'gone' in _extrasOpen,
+  kept: 'work' in _extrasFilter
+};
+
+process.stdout.write(JSON.stringify(out));
+"""
+    )
+
+    result = _run_node(harness)
+
+    assert result["markup"]["search"] == "web-oca (16.0)"
+    assert result["markup"]["wrapped"] is True
+    assert result["short"]["overflow"] is False
+    assert result["short"]["visible"] == 2
+    assert result["folded"] == {
+        "overflow": True,
+        "clamped": True,
+        "visible": 4,
+        "listHidden": False,
+        "match": "",
+        "toggleHidden": False,
+        "toggle": "Show all (4)",
+        "expanded": "false",
+    }
+    assert result["unfolded"]["clamped"] is False
+    assert result["unfolded"]["toggle"] == "Collapse"
+    assert result["unfolded"]["expanded"] == "true"
+    # Matches are shown in full even though the list is folded.
+    assert result["filtered"]["visible"] == 2
+    assert result["filtered"]["clamped"] is False
+    assert result["filtered"]["match"] == "2 of 4"
+    assert result["filtered"]["toggleHidden"] is True
+    # A branch is as good a filter as a repo name.
+    assert result["byBranch"]["visible"] == 2
+    assert result["byBranch"]["match"] == "2 of 4"
+    assert result["missing"]["visible"] == 0
+    assert result["missing"]["listHidden"] is True
+    assert result["missing"]["overflow"] is True
+    assert "not included" in result["missing"]["match"]
+    assert result["rerenderValue"] == "stock"
+    assert result["escape"]["stopped"] is True
+    assert result["escape"]["value"] == ""
+    assert result["escape"]["state"]["visible"] == 4
+    assert result["escape"]["state"]["clamped"] is True
+    assert result["pruned"] == {"filter": False, "open": False, "kept": True}
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")
+def test_production_env_vars_forms():
+    dashboard = _DASHBOARD.read_text(encoding="utf-8")
+    functions = "\n".join(
+        _js_function(dashboard, name)
+        for name in (
+            "parseEnvLines",
+            "formatEnvLines",
+            "_parseProductionEnvLines",
+            "_parseKvLines",
+            "prodApplySettings",
+            "submitCreateProduction",
+            "_prodSettingsHtml",
+            "_prodServerModeSelect",
+            "esc",
+            "escAttr",
+            "escHtmlAttr",
+        )
+    )
+    result = _run_node(
+        functions
+        + r"""
+var fields = {};
+global.document = {
+  getElementById: id => fields[id],
+  createElement: () => ({textContent: '', get innerHTML() {
+    return this.textContent.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }})
+};
+global.window = {_teamBaseDomain: 'example.com'};
+var _prodSettingsDirty = {}, API_PRODUCTIONS = '/api/productions';
+var sent = [], errors = [];
+function showToast(msg, error) { if (error) errors.push(msg); }
+async function confirmDialog() { return true; }
+async function _prodPost(url, body) { sent.push(body); return null; }
+['cp-name', 'cp-repo', 'cp-branch', 'cp-domain', 'cp-xdomains', 'cp-image',
+ 'cp-template', 'cp-fromenv', 'cp-auto', 'cp-mode', 'cp-set-envvars', 'cp-envvars',
+ 'ps-domain-erp', 'ps-xdomains-erp', 'ps-image-erp', 'ps-repo-erp',
+ 'ps-branch-erp', 'ps-gituser-erp', 'ps-extras-erp', 'ps-envvars-erp'].forEach(
+ id => fields[id] = {value: '', defaultValue: '', checked: false, disabled: false});
+fields['cp-name'].value = 'erp';
+fields['cp-fromenv'].value = 'dev';
+(async () => {
+  await submitCreateProduction();
+  fields['cp-set-envvars'].checked = true;
+  await submitCreateProduction();
+  fields['cp-envvars'].value = 'TOKEN=secret:api\nOPTIONS=a,b,X=c';
+  await submitCreateProduction();
+  fields['cp-envvars'].value = 'BROKEN';
+  await submitCreateProduction();
+  fields['cp-envvars'].value = 'KEY = value';
+  await submitCreateProduction();
+  fields['cp-envvars'].value = 'KEY= value';
+  await submitCreateProduction();
+  fields['cp-envvars'].value = 'OPTIONS=a b,c';
+  await submitCreateProduction();
+  var env = fields['ps-envvars-erp'];
+  env.value = env.defaultValue = 'TOKEN=secret:api';
+  await prodApplySettings('erp');
+  env.value = '';
+  await prodApplySettings('erp');
+  env.value = 'TOKEN=secret:replacement';
+  await prodApplySettings('erp');
+  env.disabled = true;
+  await prodApplySettings('erp');
+  var rendered = _prodSettingsHtml({name: 'erp', env_vars: {
+    TOKEN: 'secret:api', HTML: '</textarea><script>bad</script>'
+  }});
+  var multiline = _prodSettingsHtml({name: 'erp', env_vars: {CERT: 'a\nb'}});
+  process.stdout.write(JSON.stringify({
+    variables: sent.map(body => Object.hasOwn(body, 'env_vars') ? body.env_vars : null),
+    errors: errors,
+    referenceShown: rendered.includes('TOKEN=secret:api'),
+    monoClass: rendered.includes('<textarea class="mono-input" id="ps-envvars-erp"'),
+    escaped: rendered.includes('&lt;/textarea&gt;&lt;script&gt;bad&lt;/script&gt;'),
+    multilineDisabled: /id="ps-envvars-erp"[^>]*disabled/.test(multiline)
+  }));
+})();
+"""
+    )
+    assert result == {
+        # A refused line sends nothing at all, so only the accepted submissions
+        # (and the four Settings applies) appear here.
+        "variables": [
+            None,
+            {},
+            {"TOKEN": "secret:api", "OPTIONS": "a,b,X=c"},
+            {"OPTIONS": "a b,c"},
+            None,
+            {},
+            {"TOKEN": "secret:replacement"},
+            None,
+        ],
+        # Spaces around the "=" are refused instead of ending up inside the
+        # value, which would disable the textarea for good.
+        "errors": [
+            "Environment variables: each line must be KEY=VALUE, with no "
+            'space around the "="'
+        ]
+        * 3,
+        "referenceShown": True,
+        "monoClass": True,
+        "escaped": True,
+        "multilineDisabled": True,
+    }
+    # .form-group textarea would otherwise override the class on font-family.
+    assert (
+        ".form-group textarea.mono-input { font-family: var(--font-mono);" in dashboard
     )

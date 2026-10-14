@@ -10,6 +10,8 @@ environments it was built for. Productions get special treatment:
   the same production (e.g. the client's own public domain);
 - an **auto-tuned production `odoo.conf`** (workers from host CPU/RAM, cron
   enabled, proxy mode) — never the dev profile;
+- a choice of **server mode**: sync multi-process workers or one async gevent
+  process, with Traefik routing to the matching Odoo port;
 - **no sanitization/neutralization**, no idle reaper, no `--dev=xml`;
 - deploys with **automatic code rollback** on failure;
 - **S3 backups**: continuous WAL archiving (WAL-G), scheduled snapshots
@@ -140,7 +142,6 @@ restart Oduflow; productions themselves are then created at runtime:
 ```toml
 [production]
 enabled = true          # required; restart Oduflow after changing
-postgres_image = ""     # default: [database].image
 workers_cap = 8         # upper bound for auto-tuned Odoo workers
 
 [backup]                # configures backups; production must also be enabled
@@ -190,6 +191,7 @@ create_production(
     template_name="acme-prod",   # optional: seed DB+filestore from a template
     auto_update=False,
     allow_copy_to_dev_mcp=True,  # may agents copy this production into dev?
+    server_mode="workers",       # or "gevent", see Server mode below
 )
 ```
 
@@ -210,8 +212,8 @@ create_production(name="erp", domain="demo.example.com",
                   extra_domains=["myodoo.pl"], ...)
 ```
 
-All domains land in one Traefik router (`Host(a) || Host(b)`), each with its
-own Let's Encrypt certificate; every DNS record must point at this server.
+All domains share the production's Traefik routes (`Host(a) || Host(b)`),
+each with its own Let's Encrypt certificate; every DNS record must point at this server.
 Extra domains may be arbitrary FQDNs but must not fall inside another team's
 zone, and every domain — primary or extra — must be unused anywhere else in
 the deployment (other productions, team hostnames, static routes).
@@ -223,6 +225,47 @@ filestore into the production's plain (non-overlay) directory.
 
 The clone is **full** (not shallow): the branch's commit history is the
 production's deploy history and the source of rollback targets.
+
+### Server mode
+
+`server_mode` picks how Odoo serves HTTP and where Traefik sends the traffic:
+
+| Mode | Odoo | Traefik routes |
+|---|---|---|
+| `workers` (default, sync) | auto-tuned HTTP worker processes on 8069, plus the gevent process on 8072 | pages to **8069**; the live bus (`/websocket`, and `/longpolling` on Odoo ≤ 15) to **8072** |
+| `gevent` (async) | one HTTP worker on 8069 (kept for in-container calls) and the gevent process on 8072 | **everything to 8072** |
+
+Both modes run Odoo's multi-process server, so cron workers run either way,
+and the gevent process is always present. In `workers` mode it only holds the
+bus connections: a worker process refuses a websocket ("Is the connection
+opened on the evented port?"), so without the bus route Discuss and live
+notifications would not work. In `gevent` mode a single cooperative process
+serves every request: it handles many concurrent long-lived or I/O-bound
+requests (long polling, slow external calls) cheaply, but one CPU-heavy
+request stalls everyone else, and it uses one CPU core. `db_maxconn` keeps its
+full auto-tuned size in both modes; in `gevent` mode it is the connection
+pool that bounds how many requests that process serves at once. Because that
+one process is the whole site, `gevent` mode also raises its memory limits
+(`limit_memory_soft_gevent`/`limit_memory_hard_gevent`, and the general
+`limit_memory_*` for Odoo ≤ 15) to half the Odoo RAM budget instead of a
+worker's 2 GB, so it does not recycle itself — dropping every connection — under
+normal load.
+
+The listen settings are pinned in the generated `odoo.conf` whatever the base
+conf (team `odoo.prod.conf`) says: `http_interface = 0.0.0.0` (Odoo 20
+otherwise listens only on `127.0.0.1`, which Traefik cannot reach),
+`http_port = 8069`, `gevent_port`/`longpolling_port = 8072`,
+`http_enable = True`, and the legacy `xmlrpc`, `xmlrpc_port` and
+`xmlrpc_interface` keys are dropped; a base conf that set them is logged.
+The deploy health check requires **both** ports to answer `/web/health` in
+either mode, so a dead gevent process (a broken bus in `workers` mode, a
+dead site in `gevent` mode) fails the deploy and triggers the code rollback.
+
+Change the mode with `reconfigure_production(name="erp", server_mode="gevent")`
+(the container is recreated). The listen ports are managed keys (see
+[odoo.conf overrides](#odooconf-overrides)), and a `workers` override must stay
+at least 1: with `workers = 0` Odoo would switch to its threaded server, which
+does not listen on 8072.
 
 ### Promoting a dev environment
 
@@ -266,8 +309,8 @@ To promote into a production that **already exists**, use
 
 A production's settings are not frozen at creation.
 `reconfigure_production` changes any of the domain, extra domains, Odoo
-image, deployed branch, repository URL, git user, or the extra addon repos,
-then **recreates the container** to match — the database and filestore live outside the
+image, deployed branch, repository URL, git user, the extra addon repos, or
+the [server mode](#server-mode), then **recreates the container** to match — the database and filestore live outside the
 container and are preserved; expect a brief downtime:
 
 ```text
@@ -275,13 +318,30 @@ reconfigure_production(name="erp", domain="erp.newcustomer.com")
 reconfigure_production(name="erp", extra_domains=["myodoo.pl"])  # [] removes all
 reconfigure_production(name="erp", branch="18.0-stable")
 reconfigure_production(name="erp", extra_addons={"acme-addons": "production"})
+reconfigure_production(name="erp", server_mode="gevent")
 ```
 
 Omitted arguments are left unchanged (`git_user=""` explicitly clears the
 git user). The registry record is updated first and the workspace/container
 are converged to it, so re-running the same call after a mid-way failure
-repairs a missing container or checkout instead of reporting a no-op. Two
-things reconfigure deliberately does **not** do:
+repairs a missing container or checkout instead of reporting a no-op. The same
+applies to a container whose Traefik routing no longer matches the record
+(e.g. a production created before the bus route existed). Such a container is
+also recreated, without a separate maintenance window, by the next deploy
+that changes code (`update_production` or an auto-deploy) and by
+`restart_production`; a plain `reconfigure_production(name="erp")` does it
+immediately.
+
+**Applying a rotated secret.** Secret values reach the container only when it
+is created, so `restart_production` keeps running with the old value. After
+replacing a secret's value in the dashboard, call
+`reconfigure_production(name="erp")`: it compares the current value of every
+`secret:<name>` reference with what the container runs with, recreates the
+container when one differs and lists the affected variables by name. A
+reference to a deleted secret is not treated as a change; the next recreate
+reports it. `recreate=true` recreates the container even when nothing differs.
+
+Two things reconfigure deliberately does **not** do:
 
 - Changing `odoo_image` does not migrate the database. A minor image refresh
   is safe; a major Odoo version bump additionally needs an explicit module
@@ -296,19 +356,30 @@ The dashboard offers the same settings on each production card under
 
 ### odoo.conf overrides
 
-The generated production `odoo.conf` merges a base conf chain
-(`.oduflow/odoo.prod.conf` in the repo > team `odoo.prod.conf` > bundled)
-with [auto-tuned](#configuration) worker/limit settings. Per-production
-overrides sit on top of both and survive deploys, retunes and reconfigures:
+The generated production `odoo.conf` merges a base conf chain (team
+`odoo.prod.conf` > bundled) with [auto-tuned](#configuration) worker/limit
+settings. Per-production overrides sit on top of both and survive deploys,
+retunes and reconfigures:
 
 ```text
 set_production_odoo_conf(name="erp", options={"limit_time_real": "300"})
 set_production_odoo_conf(name="erp", unset="limit_time_real")
 ```
 
-An explicit override beats the auto-tuned value (e.g. pin `workers`). Keys
-managed by Oduflow are refused: `addons_path` and `data_dir` are generated,
-and the `db_*` connection keys come from container env vars (option names
+The repository is never part of the chain: a `.oduflow/odoo.prod.conf`
+(honoured by earlier versions) is ignored and logged, so pushing to the
+deployed branch cannot change how the production server runs. Move such
+settings into overrides or the team `odoo.prod.conf`.
+
+An explicit override beats the auto-tuned value (e.g. pin `workers`; it must
+be at least 1, see [Server mode](#server-mode)). Keys managed by Oduflow are
+refused: `addons_path` and `data_dir` are generated, the `db_*` connection
+keys come from container env vars, and the listen settings (`http_interface`,
+`http_port`, `gevent_port`, `longpolling_port`, `http_enable` and the legacy
+`xmlrpc`, `xmlrpc_port`, `xmlrpc_interface`) are pinned to what Traefik
+routes to.
+Such keys saved before they became managed are ignored (and logged) and are
+removed from the record by the next override save or reconfigure (option names
 are compared case-insensitively and stored lowercased, matching how Odoo
 reads them). Current overrides are shown by `get_production_info`; the
 dashboard edits them in the same **Settings** panel. Applying restarts the
@@ -337,11 +408,29 @@ config re-applied and the container restarted — **the code rolls back
 automatically**. The database is *never* rolled back automatically: if a
 module upgrade left it inconsistent, restore a snapshot explicitly
 (`restore_production`). A snapshot is taken automatically before every deploy
-when backups are configured.
+when backups are configured — but only once the pull has found something to
+apply: a deploy with nothing new on the branch, or with Markdown-only changes
+(and no explicit `install` / `upgrade` / `restart`), skips it. The snapshot is
+taken with the checkout still on the pre-deploy commit, so it records the code
+its database ran against.
+
+While a deploy runs, its current step (fetching code, pre-update snapshot with
+file progress, applying changes, verifying health, rolling back code) is shown
+next to the production's status on the dashboard, returned as `progress` by
+`list_productions` / `get_production_info`, and quoted in the `BusyError` a
+concurrent call on the same production receives.
+
+A deploy started from the dashboard (or by a GitHub push) while another
+operation holds the production — a scheduled snapshot, a restart, another
+deploy — queues instead of failing: the production shows a `queued` badge with
+the waiting time and what it waits for, and a second click while one is already
+queued is refused. If the production stays busy past the wait limit (5 min for
+the dashboard, 30 min for webhooks), the deploy is not started and a `skipped`
+entry with the reason lands in the deploy history.
 
 Every deploy lands in the production's history (`production_deploys`):
 commits, action, modules, status (`success` / `rolled_back` /
-`rollback_failed`), trigger (mcp / ui / webhook / schedule).
+`rollback_failed` / `skipped`), trigger (mcp / ui / webhook / schedule).
 
 Manual code rollback to any commit: `rollback_production(name, to_commit)`.
 
@@ -447,14 +536,16 @@ fails; inventory commands have a 30-second timeout.
 
 ### Production readiness at deployment
 
-New installations using the default PostgreSQL 15 use
-`oduist/oduflow-postgres:15-bookworm-1`. This image includes `ca-certificates`
-and pins the upstream Debian Bookworm image by digest. A custom
-`[production].postgres_image` takes precedence; a non-default
-`[database].image` is still inherited for compatibility with other PostgreSQL
-majors. Existing containers are reused, never automatically replaced or
-upgraded across majors. Their WAL-G trust is repaired through the persistent
-mounted CA bundle described above.
+The production cluster uses the same image as the development cluster,
+`[database].image` (default: the official `postgres:16`). WAL-G trusts the
+persistent mounted CA bundle described above, so no custom PostgreSQL image is
+needed. Existing containers are reused and keep their major version until
+`[database].image` names a newer one. The upgrade then carries every production,
+including its roles and passwords, into a new cluster and deletes the old
+WAL-G archive, as described in
+[Upgrading PostgreSQL](installation.md#upgrading-postgresql). Odoo 20 needs
+PostgreSQL 16 or newer: creating a production with an Odoo 20 image, or
+switching one to it, is refused on an older cluster.
 
 With `[backup]` configured, provisioning and production start/restart/deploy
 require a successful check **inside PostgreSQL as the postgres user**:
@@ -489,12 +580,6 @@ until provisioning decides. Existing working archiving continues during a
 preflight failure; the disk/queue guard remains responsible for emergency
 shutdown. Development environments can still start if production is unready.
 
-The PostgreSQL image is published for amd64 and arm64 by
-`.github/workflows/publish-postgres.yml` only from `main`, with an immutable
-version tag. Publish it successfully before releasing the Oduflow package;
-both the PyPI and application Docker release workflows verify its availability.
-For an image update, change the base digest, bump `POSTGRES_IMAGE_VERSION`
-and `DEFAULT_PROD_POSTGRES_IMAGE` together, merge, and wait for publication.
 No package installation is performed inside PostgreSQL during deployment or
 emergency recovery.
 

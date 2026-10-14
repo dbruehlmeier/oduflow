@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import hashlib
 import hmac
 import html
@@ -37,9 +38,11 @@ from starlette.websockets import WebSocket
 
 from oduflow import (
     activity,
+    admin_ui,
     agent_config,
     agent_uploads,
     artifact_tokens,
+    branding,
     connect_tokens,
     env_share,
     feedback,
@@ -52,8 +55,10 @@ from oduflow import (
     ui_totp,
     updates,
 )
+from oduflow.config_store import ConfigRuntime
 from oduflow.docker_ops import (
     env_ops,
+    image_cleanup,
     odoo_ops,
     production_ops,
     service_database_ops,
@@ -78,10 +83,17 @@ from oduflow.errors import (
     NotFoundError,
     PrerequisiteNotMetError,
 )
-from oduflow.licensing import get_license_info, install_license_from_text
+from oduflow.licensing import (
+    get_license_checkout_url,
+    get_license_info,
+    install_license_from_text,
+    refresh_license,
+)
 from oduflow.locking import (
     LockManager,
     credentials_lock_key,
+    current_waiters,
+    image_cleanup_lock_key,
     prod_backups_lock_key,
     prod_lock_key,
     service_database_lock_key,
@@ -99,7 +111,7 @@ from oduflow.naming import (
     validate_env_name,
     validate_template_name,
 )
-from oduflow.settings import Settings, TeamSettings
+from oduflow.settings import OpenCodeProviderSettings, Settings, TeamSettings
 
 logger = logging.getLogger("oduflow")
 
@@ -151,6 +163,9 @@ _PUBLIC_PREFIXES = ("/static/", ui_scope.PAGE_PREFIX)
 _SESSION_SALT = "oduflow.ui-auth.v1"
 _SHARE_SALT = "oduflow.env-share.v1"
 _SESSION_MAX_AGE = 7 * 24 * 3600  # 7 days
+# How long a dashboard deploy queues behind another operation on the
+# production before it gives up (and says so in the deploy history).
+_UI_DEPLOY_WAIT_SECONDS = 300
 _SECRET_FILENAME = ".ui_session_secret"
 
 # Cached per data dir (process-wide; the server runs against a single one).
@@ -353,7 +368,11 @@ class UIAuthMiddleware:
 
         path = scope.get("path", "")
         if scope["type"] == "http" and (
-            path in _PUBLIC_PATHS or path.startswith(_PUBLIC_PREFIXES)
+            path in _PUBLIC_PATHS
+            or path.startswith(_PUBLIC_PREFIXES)
+            # The Server settings console is not a team surface: its routes
+            # authenticate the console credential themselves (admin_ui).
+            or admin_ui.is_admin_path(path)
         ):
             await self._app(scope, receive, send)
             return
@@ -407,6 +426,12 @@ class UIAuthMiddleware:
             ):
                 if scope["type"] == "websocket":
                     await WebSocket(scope, receive, send).close(code=1008)
+                elif method in ("GET", "HEAD") and not path.startswith("/api/"):
+                    # Recover browser navigation using the saved session; the
+                    # shared dashboard includes the control to leave this mode.
+                    target = ui_scope.PAGE_PREFIX + quote(scoped_env, safe="/")
+                    redirect = RedirectResponse(target, status_code=303)
+                    await redirect(scope, receive, send)
                 else:
                     denied: Response = JSONResponse(
                         {"ok": False, "error": "Not available for a shared link."},
@@ -447,13 +472,16 @@ def _is_secure_request(request: Request) -> bool:
 _TEMPLATE_DIR = pathlib.Path(__file__).resolve().parent / "templates"
 
 
+_apply_branding = branding.render_page
+
+
 def _render_login(error: str = "") -> str:
     """Render the login page, optionally with a server-controlled error banner."""
     page = (_TEMPLATE_DIR / "login.html").read_text(encoding="utf-8")
     # Escape the message so the banner stays safe even if a future caller passes
     # user-influenced text (today's callers pass static literals).
     banner = f'<div class="error">{html.escape(error)}</div>' if error else ""
-    return page.replace("<!--ERROR-->", banner)
+    return _apply_branding(page.replace("<!--ERROR-->", banner))
 
 
 async def _read_login_credentials(request: Request) -> tuple[str, str]:
@@ -479,6 +507,11 @@ async def _read_login_credentials(request: Request) -> tuple[str, str]:
 
 _EXTERNAL_COMMAND_UI_ERROR = "Operation failed. Check server logs for details."
 
+# Result groups of system_ops.cleanup_orphans that Confirm may name.
+_CLEANUP_ORPHAN_KEYS = frozenset(
+    {"orphan_databases", "orphan_workspaces", "orphan_ports", "orphan_roles"}
+)
+
 
 def _flow_error_status(e: FlowError) -> int:
     if isinstance(e, NotFoundError):
@@ -491,12 +524,33 @@ def _flow_error_status(e: FlowError) -> int:
 
 
 def _public_flow_error(e: FlowError, *, context: str = "Dashboard operation") -> str:
+    """The message a browser may see for a failed dashboard operation.
+
+    Rebranded here because this is the one place every REST and WebSocket error
+    message passes through - the same role handle_errors plays for the MCP
+    surface. Messages stay written as "Oduflow" wherever they are raised.
+    """
     if isinstance(e, ExternalCommandError):
         # Command output can contain tracebacks, filesystem paths, or connection
         # details. Keep it in the server log instead of returning it to browsers.
         logger.error("%s failed: %s", context, e)
-        return _EXTERNAL_COMMAND_UI_ERROR
-    return str(e)
+        return branding.rebrand(_EXTERNAL_COMMAND_UI_ERROR)
+    return _public_error_text(e)
+
+
+def _public_error_text(e: BaseException) -> str:
+    """A validation message (ValueError and the like) as the browser sees it.
+
+    The raw exception text is still the message; only the product name follows
+    the brand, as in _public_flow_error.
+    """
+    return branding.rebrand(str(e))
+
+
+def _error_text_response(e: BaseException, status_code: int = 400) -> JSONResponse:
+    return JSONResponse(
+        {"ok": False, "error": _public_error_text(e)}, status_code=status_code
+    )
 
 
 def _error_response(e: FlowError) -> JSONResponse:
@@ -504,6 +558,11 @@ def _error_response(e: FlowError) -> JSONResponse:
         {"ok": False, "error": _public_flow_error(e)},
         status_code=_flow_error_status(e),
     )
+
+
+def _term_error(exc: Exception) -> str:
+    """A red error line for the WebSocket terminals, under the brand."""
+    return f"\x1b[31mError: {branding.rebrand(str(exc))}\x1b[0m\r\n"
 
 
 def _validate_dev_env_name(env_name: str) -> str:
@@ -589,15 +648,23 @@ def _parse_extra_addons(raw: str) -> dict[str, str]:
 
 
 def _guide_title(filepath: str) -> str:
+    """A guide's first heading under the brand, as get_agent_instructions shows it.
+
+    A guide without a heading falls back to its file name, which is rebranded
+    too (after title-casing, so the brand's own capitalization survives): a
+    team guide saved as ``oduflow_tips.md`` would otherwise list the product
+    name in the Agent Guides tab.
+    """
     try:
         with open(filepath, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if line.startswith("# "):
-                    return line[2:].strip()
+                    return branding.rebrand(line[2:].strip())
     except Exception:
         pass
-    return os.path.basename(filepath).replace("_", " ").replace(".md", "").title()
+    name = os.path.basename(filepath).replace("_", " ").replace(".md", "").title()
+    return branding.rebrand(name)
 
 
 def _acp_adapter_cmd(agent_type: str) -> list[str]:
@@ -627,6 +694,10 @@ def _annotate_acp_auth_error(
     recognizable authentication failures. In particular, quota/spend-limit
     failures must remain untouched: silently trying a different credential
     could switch accounts or billing modes.
+
+    The guidance and the marker that makes this idempotent are rebranded
+    together: the marker is what the next frame is checked against, so a brand
+    in one but not the other would append the guidance again on every frame.
     """
     if agent_type not in {"claude", "opencode"}:
         return frame
@@ -641,21 +712,21 @@ def _annotate_acp_auth_error(
     if not isinstance(error_message, str):
         return frame
 
+    brand = branding.current()
     lowered = error_message.lower()
     if agent_type == "opencode":
         if "provider authentication required" not in lowered:
             return frame
-        if _OPENCODE_AUTH_GUIDANCE_MARKER in error_message:
+        guidance_marker = brand.rebrand(_OPENCODE_AUTH_GUIDANCE_MARKER)
+        if guidance_marker in error_message:
             return frame
-        guidance = (
+        guidance = brand.rebrand(
             "Open Agent CLI and run `opencode auth login`, or configure the "
             "selected provider's credential in "
             f"[team.{team_id}.agent_env] (or the single-team server environment), "
             "then restart Oduflow."
         )
-        error["message"] = (
-            f"{error_message}\n\n{_OPENCODE_AUTH_GUIDANCE_MARKER} {guidance}"
-        )
+        error["message"] = f"{error_message}\n\n{guidance_marker} {guidance}"
         return json.dumps(message, separators=(",", ":"), ensure_ascii=False)
 
     specific_markers = (
@@ -670,7 +741,8 @@ def _annotate_acp_auth_error(
     )
     if not generic_401 and not any(marker in lowered for marker in specific_markers):
         return frame
-    if _CLAUDE_AUTH_GUIDANCE_MARKER in error_message:
+    guidance_marker = brand.rebrand(_CLAUDE_AUTH_GUIDANCE_MARKER)
+    if guidance_marker in error_message:
         return frame
 
     if auth_mode == "setup_token":
@@ -695,7 +767,7 @@ def _annotate_acp_auth_error(
             "reopen Agent Chat."
         )
 
-    error["message"] = f"{error_message}\n\n{_CLAUDE_AUTH_GUIDANCE_MARKER} {guidance}"
+    error["message"] = f"{error_message}\n\n{guidance_marker} {brand.rebrand(guidance)}"
     return json.dumps(message, separators=(",", ":"), ensure_ascii=False)
 
 
@@ -711,9 +783,9 @@ def _codex_cli_cmd(mcp_url: str, model: str = "") -> list[str]:
         "codex",
         "--dangerously-bypass-approvals-and-sandbox",
         "-c",
-        f'mcp_servers.oduflow.url="{mcp_url}"',
+        f'mcp_servers.{env_ops.AGENT_MCP_SERVER}.url="{mcp_url}"',
         "-c",
-        'mcp_servers.oduflow.bearer_token_env_var="ODUFLOW_MCP_TOKEN"',
+        f'mcp_servers.{env_ops.AGENT_MCP_SERVER}.bearer_token_env_var="ODUFLOW_MCP_TOKEN"',
     ]
     if model:
         cmd += ["--model", model]
@@ -738,18 +810,40 @@ def _opencode_config(
     include_browser: bool = True,
     include_oduflow: bool = False,
     model: str = "",
+    provider: OpenCodeProviderSettings | None = None,
 ) -> str:
     """Return session-local OpenCode config with no embedded credential.
 
     ``OPENCODE_CONFIG_CONTENT`` has high precedence, so Oduflow's approval-free
     trust model and scoped MCP wiring cannot be silently shadowed by a checkout
     config. The bearer remains an environment placeholder resolved only inside
-    this docker-exec process.
+    this docker-exec process. A configured custom provider is declared the
+    same way: its base URL and key are ``{env:...}`` placeholders resolved
+    from the agent container's environment.
     """
     config: dict[str, Any] = {
         "autoupdate": False,
         "permission": "allow",
     }
+    if provider is not None:
+        # @ai-sdk/openai-compatible is bundled with OpenCode and talks Chat
+        # Completions (POST <baseURL>/chat/completions). OpenCode merges a
+        # provider whose id is in its models.dev catalog with the built-in
+        # entry; the empty env list and the whitelist keep only the declared
+        # models and variables.
+        config["provider"] = {
+            provider.id: {
+                "npm": "@ai-sdk/openai-compatible",
+                "name": provider.display_name,
+                "env": [],
+                "whitelist": list(provider.models),
+                "options": {
+                    "baseURL": f"{{env:{provider.base_url_env}}}",
+                    "apiKey": f"{{env:{provider.api_key_env}}}",
+                },
+                "models": {m: {"name": m} for m in provider.models},
+            },
+        }
     if include_browser:
         config["mcp"] = {
             "agent_browser": {
@@ -764,7 +858,7 @@ def _opencode_config(
     if model:
         config["model"] = model
     if include_oduflow:
-        config.setdefault("mcp", {})["oduflow"] = {
+        config.setdefault("mcp", {})[env_ops.AGENT_MCP_SERVER] = {
             "type": "remote",
             "url": mcp_url,
             "enabled": True,
@@ -774,6 +868,53 @@ def _opencode_config(
             },
         }
     return json.dumps(config, separators=(",", ":"))
+
+
+def _opencode_provider_env_warning(settings: Settings, team: TeamSettings) -> str:
+    """Explain a custom OpenCode provider whose variables the team lacks.
+
+    OpenCode substitutes an unset ``{env:...}`` with an empty string, which
+    surfaces only as an opaque connection or 401 error from the gateway.
+    Only a provider that ``opencode_model`` selects is checked: a team that
+    does not use it must not be told its requests will fail. Returns an empty
+    string when there is nothing to warn about.
+    """
+    provider = settings.agent_opencode_provider
+    if provider is None or not settings.agent_opencode_model.startswith(
+        f"{provider.id}/"
+    ):
+        return ""
+    env = env_ops._agent_env_vars(settings, team)
+    missing = [
+        name
+        for name in (provider.base_url_env, provider.api_key_env)
+        if not env.get(name, "").strip()
+    ]
+    if not missing:
+        return ""
+    return branding.rebrand(
+        f"the OpenCode model {settings.agent_opencode_model} reads "
+        f"{', '.join(missing)}, which this team's agent environment does not "
+        "set, so its requests will fail. Set the variables in "
+        f"[team.{team.team_id}.agent_env] and restart Oduflow; the server "
+        "environment is forwarded only for the known provider keys of a "
+        "single-team server."
+    )
+
+
+def _confirm_before_start(cmd: list[str], warning: str) -> list[str]:
+    """Wrap a TUI command so a warning stays on screen until Enter is pressed.
+
+    Full-screen TUIs switch to the alternate screen at once and would wipe a
+    warning written just before them. The warning is passed as an argument,
+    never interpolated into the script.
+    """
+    script = (
+        'printf "\\033[33mWarning: %s\\033[0m\\r\\n\\r\\n'
+        'Press Enter to start anyway, or close the console. " "$1"; '
+        'read -r _; shift; exec "$@"'
+    )
+    return ["sh", "-c", script, "sh", warning, *cmd]
 
 
 def _wire_client_acp_mcp(
@@ -807,7 +948,12 @@ def _wire_client_acp_mcp(
         server
         for server in servers
         if not isinstance(server, dict)
-        or server.get("name") not in {"agent_browser", "oduflow"}
+        or server.get("name")
+        not in {
+            "agent_browser",
+            env_ops.AGENT_MCP_SERVER,
+            env_ops.LEGACY_AGENT_MCP_SERVER,
+        }
     ]
     servers.append(
         {
@@ -827,7 +973,7 @@ def _wire_client_acp_mcp(
         servers.append(
             {
                 "type": "http",
-                "name": "oduflow",
+                "name": env_ops.AGENT_MCP_SERVER,
                 "url": mcp_url,
                 "headers": [{"name": "Authorization", "value": f"Bearer {mcp_token}"}],
             }
@@ -912,7 +1058,10 @@ def _build_routes(
         )
 
     def _render_dashboard(
-        settings: Settings, scoped_env: str = "", team: TeamSettings | None = None
+        settings: Settings,
+        scoped_env: str = "",
+        team: TeamSettings | None = None,
+        admin: bool = False,
     ) -> str:
         """Render the dashboard page. With ``scoped_env`` set it renders in
         shared single-environment mode (see oduflow.ui_scope): the client-side
@@ -920,7 +1069,7 @@ def _build_routes(
         allowlist, not this rendering, is the boundary."""
         html_path = _TEMPLATE_DIR / "dashboard.html"
         return (
-            html_path.read_text(encoding="utf-8")
+            _apply_branding(html_path.read_text(encoding="utf-8"))
             .replace(
                 "__PRODUCTION_TAB_HIDDEN__",
                 "" if settings.prod_enabled and not scoped_env else "hidden",
@@ -943,12 +1092,19 @@ def _build_routes(
                 "__TEAM_BASE_DOMAIN__",
                 html.escape(team.base_domain if team else "", quote=True),
             )
+            # Only a browser already signed in to the Server settings console
+            # gets the link; team members never learn the console exists.
+            .replace(
+                "__ADMIN_LINK_HIDDEN__", "" if admin and not scoped_env else "hidden"
+            )
         )
 
     def dashboard(request: Request) -> HTMLResponse:
         settings = get_settings()
         team = getattr(request.state, "team", None)
-        page = _render_dashboard(settings, team=team)
+        page = _render_dashboard(
+            settings, team=team, admin=admin_ui.has_admin_session(request, settings)
+        )
         return HTMLResponse(page)
 
     def _team_for_share(
@@ -1025,7 +1181,8 @@ def _build_routes(
             return HTMLResponse(_render_dashboard(settings, scoped_env=env_name))
         return _share_link_error(
             "This link is missing its key. Open the full share link you were "
-            "sent (it ends with ?key=...).",
+            "sent (it ends with ?key=...) to get back to this environment. "
+            "If you have a team password, sign in at /login instead.",
             401,
         )
 
@@ -1091,15 +1248,18 @@ def _build_routes(
         # already authenticated browser, leaving scoped mode restores that
         # operator session instead of signing it out too.
         settings = get_settings()
-        share_token = request.cookies.get(ui_scope.SHARE_COOKIE, "")
-        share = _check_share_token(share_token, settings)
+        share = _check_share_token(
+            request.cookies.get(ui_scope.SHARE_COOKIE, ""), settings
+        )
         session = request.cookies.get(_AUTH_COOKIE, "")
         operator = _check_cookie_token(session, settings) if session else None
-        if share_token and operator is not None:
+        if share and operator is not None:
             response = RedirectResponse("/", status_code=303)
             response.delete_cookie(ui_scope.SHARE_COOKIE, path="/", samesite="strict")
             return response
         if share:
+            # A visitor with no team credentials: land back on the scoped page,
+            # which now explains both ways back in (reopen the link, or sign in).
             target = ui_scope.PAGE_PREFIX + quote(share[1], safe="/")
             response = RedirectResponse(target, status_code=303)
             response.delete_cookie(ui_scope.SHARE_COOKIE, path="/", samesite="strict")
@@ -1112,11 +1272,27 @@ def _build_routes(
         response.delete_cookie(ui_scope.SHARE_COOKIE, path="/", samesite="strict")
         return response
 
+    def _brand_image(path: str) -> Response | None:
+        """A white-label image from the config dir, if one is installed."""
+        if not path:
+            return None
+        try:
+            data = pathlib.Path(path).read_bytes()
+        except OSError:
+            return None
+        return Response(data, media_type="image/png")
+
     def favicon(request: Request) -> Response:
+        custom = _brand_image(branding.current().icon_path)
+        if custom:
+            return custom
         ico_path = _TEMPLATE_DIR / "favicon.ico"
         return Response(ico_path.read_bytes(), media_type="image/x-icon")
 
     def logo(request: Request) -> Response:
+        custom = _brand_image(branding.current().logo_path)
+        if custom:
+            return custom
         logo_path = _TEMPLATE_DIR / "logo.png"
         return Response(logo_path.read_bytes(), media_type="image/png")
 
@@ -1130,6 +1306,11 @@ def _build_routes(
 
     def static_file(request: Request) -> Response:
         filename = request.path_params["filename"]
+        if filename in ("icon.png", "apple-icon.png"):
+            custom = _brand_image(branding.current().icon_path)
+            if custom:
+                custom.headers["Cache-Control"] = "public, max-age=86400"
+                return custom
         static_dir = (_TEMPLATE_DIR / "static").resolve()
         file_path = (static_dir / filename).resolve()
         media_type = _STATIC_MEDIA_TYPES.get(file_path.suffix)
@@ -1282,7 +1463,7 @@ def _build_routes(
         except FlowError as e:
             return _error_response(e)
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except Exception:
             logger.exception("Unexpected error in api_modules")
             return JSONResponse(
@@ -1293,7 +1474,7 @@ def _build_routes(
         try:
             branch = _validate_dev_env_name(request.path_params["branch"])
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         team = _get_ui_team(request)
         try:
             body = await request.json()
@@ -1406,7 +1587,7 @@ def _build_routes(
         except FlowError as e:
             return _error_response(e)
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except Exception:
             logger.exception("Unexpected error in api_modules_apply")
             return JSONResponse(
@@ -1457,7 +1638,7 @@ def _build_routes(
         except FlowError as e:
             return _error_response(e)
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except Exception:
             logger.exception("Unexpected error in api_switch_branch")
             return JSONResponse(
@@ -1538,7 +1719,7 @@ def _build_routes(
         except ValueError as e:
             # A rejected new_name (validate_env_name); the message is written
             # for the operator reading it.
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except Exception:
             logger.exception("Unexpected error in api_update")
             return JSONResponse(
@@ -1650,6 +1831,11 @@ def _build_routes(
             # nothing — create_environment would only re-check after
             # delete_environment has already destroyed the working environment.
             secret_store.resolve_env_secrets(team, env_vars)
+            # Same for a stopped database server or a template without its
+            # database: create_environment would refuse only after the delete.
+            env_ops._ensure_system_ready(
+                client, settings, team, template_name, odoo_image
+            )
 
             env_ops.delete_environment(settings, team, branch, preserve_share=True)
             result = env_ops.create_environment(
@@ -1725,7 +1911,7 @@ def _build_routes(
         try:
             validate_template_name(template_name)
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         # Team lock (not just the env): publishing can remount other envs' overlay
         # filestores, so it must serialize against the whole team like the MCP tool.
         try:
@@ -1757,7 +1943,7 @@ def _build_routes(
                 }
             )
         except ValueError as e:  # invalid template name
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except FlowError as e:
             return _error_response(e)
         except Exception:
@@ -1818,6 +2004,9 @@ def _build_routes(
         auto_install_raw = (body.get("auto_install_modules") or "").strip()
         hostname = (body.get("hostname") or "").strip()
         from_production = (body.get("from_production") or "").strip()
+        # Where the branch starts when origin does not have it yet; it is then
+        # created and pushed. Empty keeps the old rule: the branch must exist.
+        base_branch = (body.get("base_branch") or "").strip()
         env_vars = _env_vars_from_body(body.get("env_vars"))
         if from_production and template_name_raw:
             return JSONResponse(
@@ -1842,8 +2031,15 @@ def _build_routes(
             # and starts no work that has to be unwound.
             if hostname:
                 hostname = validate_env_hostname(hostname)
+            if base_branch:
+                from oduflow.extra_addons import validate_branch_name
+
+                # Both names reach git (checkout -b, push), so both must be
+                # names git accepts as branches.
+                validate_branch_name(base_branch)
+                validate_branch_name(branch)
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
 
         team = _get_ui_team(request)
         # Acquire the env lock in its own try so a BusyError returns WITHOUT
@@ -1952,6 +2148,7 @@ def _build_routes(
                 env_vars={**template_env_vars, **env_vars} or None,
                 local_path=local_path_from_meta,
                 hostname=hostname,
+                base_branch=base_branch,
             )
             payload: dict[str, Any] = {"ok": True, "result": result}
             if from_production:
@@ -1975,7 +2172,7 @@ def _build_routes(
             # messages are authored for the user, so surface them as 400
             # instead of masking them behind a 500.
             logger.warning("create_environment rejected %s: %s", env_name, e)
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except Exception:
             logger.exception("Unexpected error in api_create")
             return JSONResponse(
@@ -2006,6 +2203,83 @@ def _build_routes(
             logger.exception("Unexpected error in api_logs")
             return JSONResponse(
                 {"ok": False, "error": "Internal server error."}, status_code=500
+            )
+
+    async def api_cleanup(request: Request) -> JSONResponse:
+        try:
+            body = await request.json()
+        except ValueError:
+            return JSONResponse(
+                {"ok": False, "error": "Invalid JSON body."}, status_code=400
+            )
+        if not isinstance(body, dict) or type(body.get("force", False)) is not bool:
+            return JSONResponse(
+                {"ok": False, "error": "force must be a boolean."}, status_code=400
+            )
+        force = body.get("force", False)
+        image_ids = body.get("image_ids", [])
+        if not isinstance(image_ids, list) or any(
+            not isinstance(image_id, str)
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id)
+            for image_id in image_ids
+        ):
+            return JSONResponse(
+                {"ok": False, "error": "image_ids must contain full image IDs."},
+                status_code=400,
+            )
+        # Confirm removes only the orphans the user reviewed in the preview.
+        orphans = body.get("orphans", {})
+        if not isinstance(orphans, dict) or any(
+            key not in _CLEANUP_ORPHAN_KEYS
+            or not isinstance(names, list)
+            or not all(isinstance(name, str) for name in names)
+            for key, names in orphans.items()
+        ):
+            return JSONResponse(
+                {"ok": False, "error": "orphans must list reviewed names by group."},
+                status_code=400,
+            )
+
+        def run() -> dict[str, Any]:
+            settings = get_settings()
+            team = _get_ui_team(request)
+            if not force:
+                # Read-only, like the CLI dry run: no lock, so a scan neither
+                # fails on nor blocks the team's environment operations.
+                result = system_ops.cleanup_orphans(settings, team, dry_run=True)
+                result["images"] = image_cleanup.list_unused_images()
+                return result
+            # Hold locks in the worker so disconnects cannot unlock live work,
+            # and take them all before deleting anything.
+            with contextlib.ExitStack() as stack:
+                if image_ids:
+                    # One image cleanup at a time across all dashboard teams.
+                    stack.enter_context(
+                        locks.env_lock(image_cleanup_lock_key(), operation="cleanup")
+                    )
+                with locks.team_lock(team.team_id, operation="cleanup"):
+                    result = system_ops.cleanup_orphans(
+                        settings, team, dry_run=False, only=orphans
+                    )
+                result["images"] = (
+                    image_cleanup.remove_unused_images(image_ids)
+                    if image_ids
+                    else {"removed": [], "skipped": [], "errors": []}
+                )
+            return result
+
+        try:
+            return JSONResponse({"ok": True, "result": await _offload(run)})
+        except FlowError as e:
+            return _error_response(e)
+        except Exception:
+            logger.exception("Unexpected error in api_cleanup")
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "error": "Cleanup failed. Check server logs and scan again to see remaining resources.",
+                },
+                status_code=500,
             )
 
     def api_stats(request: Request) -> JSONResponse:
@@ -2120,16 +2394,34 @@ def _build_routes(
                 status_code=400,
             )
 
-        odoo_url = str(body.get("odoo_url") or "").strip()
+        # "odoo_url" is the legacy field name the dashboard form still posts.
+        source = str(body.get("source") or body.get("odoo_url") or "").strip()
         master_pwd = str(body.get("master_pwd") or "")
         db_name = str(body.get("db_name") or "").strip()
         template_name = str(body.get("template_name") or "").strip()
         without_filestore = body.get("without_filestore", False)
-        if not odoo_url:
+        overwrite = body.get("overwrite", False)
+        refresh = body.get("refresh", False)
+        s3_endpoint = str(body.get("s3_endpoint") or "").strip()
+        s3_access_key = str(body.get("s3_access_key") or "")
+        s3_secret_key = str(body.get("s3_secret_key") or "")
+        s3_region = str(body.get("s3_region") or "").strip()
+        for flag_name, flag in (
+            ("without_filestore", without_filestore),
+            ("overwrite", overwrite),
+            ("refresh", refresh),
+        ):
+            if not isinstance(flag, bool):
+                return JSONResponse(
+                    {"ok": False, "error": f"{flag_name} must be a boolean"},
+                    status_code=400,
+                )
+        if not source and not refresh:
             return JSONResponse(
-                {"ok": False, "error": "odoo_url is required"}, status_code=400
+                {"ok": False, "error": "source is required"}, status_code=400
             )
-        if not master_pwd:
+        # Only the Odoo database-manager path needs the master password.
+        if not master_pwd and source.startswith(("http://", "https://")):
             return JSONResponse(
                 {"ok": False, "error": "master_pwd is required"}, status_code=400
             )
@@ -2137,58 +2429,64 @@ def _build_routes(
             return JSONResponse(
                 {"ok": False, "error": "template_name is required"}, status_code=400
             )
-        if not isinstance(without_filestore, bool):
-            return JSONResponse(
-                {"ok": False, "error": "without_filestore must be a boolean"},
-                status_code=400,
-            )
         try:
             validate_template_name(template_name)
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
 
-        # Template key, not the team lock: an import refuses to touch an
-        # existing template, so it builds a brand-new one that no environment
-        # can reference yet — nothing to remount. The team lock used to hold
-        # every environment operation hostage for the whole download.
+        # New templates need only their own key; replacements also protect
+        # environments while changing their overlay lower layer.
         try:
             with _template_locks(
                 team,
                 template_name,
-                operation="import_template_from_odoo",
-                team_wide=False,
+                operation="import_template",
+                team_wide=overwrite or refresh,
             ):
                 result = await _offload(
-                    system_ops.import_from_odoo,
+                    system_ops.import_template,
                     get_settings(),
                     team,
-                    odoo_url=odoo_url,
+                    source=source,
                     master_pwd=master_pwd,
                     db_name=db_name,
                     template_name=template_name,
                     without_filestore=without_filestore,
+                    overwrite=overwrite,
+                    refresh=refresh,
+                    s3_endpoint=s3_endpoint,
+                    s3_access_key=s3_access_key,
+                    s3_secret_key=s3_secret_key,
+                    s3_region=s3_region,
                 )
-            return JSONResponse(
-                {
-                    "ok": True,
-                    "result": {
-                        "template_name": result.get("template_name"),
-                        "source_url": result.get("source_url"),
-                        "source_db": result.get("source_db"),
-                        "odoo_version": result.get("odoo_version"),
-                        "odoo_image": result.get("odoo_image"),
-                        "template_db": result.get("template_db"),
-                        "includes_filestore": result.get("includes_filestore"),
-                        "zip_size_mb": result.get("zip_size_mb"),
-                        "restore_seconds": result.get("restore_seconds"),
-                        "affected_envs": result.get("affected_envs", []),
-                        "remount_failures": result.get("remount_failures", []),
-                    },
-                }
-            )
+            payload = {
+                "template_name": result.get("template_name"),
+                "source_url": result.get("source_url"),
+                "source_db": result.get("source_db"),
+                "odoo_version": result.get("odoo_version"),
+                "odoo_image": result.get("odoo_image"),
+                "template_db": result.get("template_db"),
+                "includes_filestore": result.get("includes_filestore"),
+                "zip_size_mb": result.get("zip_size_mb"),
+                "restore_seconds": result.get("restore_seconds"),
+                "affected_envs": result.get("affected_envs", []),
+                "remount_failures": result.get("remount_failures", []),
+            }
+            if "dump_reloaded" in result:  # s3 / local-path / refresh engine
+                payload.update(
+                    {
+                        "status": result.get("status"),
+                        "dump_reloaded": result.get("dump_reloaded"),
+                        "downloaded_files": result.get("downloaded_files"),
+                        "downloaded_mb": result.get("downloaded_mb"),
+                        "reused_files": result.get("reused_files"),
+                        "removed_files": result.get("removed_files"),
+                    }
+                )
+            return JSONResponse({"ok": True, "result": payload})
         except FlowError as e:
             logger.warning(
-                "import_from_odoo failed for template %s: %s", template_name, e
+                "import_template failed for template %s: %s", template_name, e
             )
             return _error_response(e)
         except Exception:
@@ -2243,7 +2541,7 @@ def _build_routes(
                 )
             return JSONResponse({"ok": True, "result": result})
         except ValueError as e:  # invalid template name
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except FlowError as e:
             return _error_response(e)
         except Exception:
@@ -2259,7 +2557,7 @@ def _build_routes(
             result = system_ops.get_template_metadata(team, name)
             return JSONResponse({"ok": True, **result})
         except ValueError as e:  # invalid template name
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except FlowError as e:
             return _error_response(e)
         except UnicodeDecodeError:
@@ -2283,7 +2581,7 @@ def _build_routes(
             validate_template_name(name)
             body = await request.json()
         except (TypeError, ValueError) as e:
-            message = str(e) or "Invalid JSON body"
+            message = _public_error_text(e) or "Invalid JSON body"
             return JSONResponse({"ok": False, "error": message}, status_code=400)
 
         if not isinstance(body, dict):
@@ -2316,9 +2614,9 @@ def _build_routes(
                 )
             return JSONResponse({"ok": True, **result})
         except ConflictError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=409)
+            return _error_text_response(e, 409)
         except (TypeError, ValueError) as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except FlowError as e:
             return _error_response(e)
         except Exception:
@@ -2436,6 +2734,11 @@ def _build_routes(
 
     def import_odoo_script(request: Request) -> Response:
         script = (_TEMPLATE_DIR / "import-odoo.sh").read_text(encoding="utf-8")
+        brand = branding.current()
+        # The script quotes its messages for bash and for an inline Python
+        # program, so only characters that are inert in both reach it.
+        name = re.sub(r"[^\w .&+-]", "", brand.name).strip() or brand.slug
+        script = dataclasses.replace(brand, name=name).rebrand(script)
         return Response(
             script,
             media_type="text/x-shellscript; charset=utf-8",
@@ -2481,7 +2784,7 @@ def _build_routes(
                 addon_error_policy=addon_error_policy,
             )
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except Exception:
             logger.exception("Unexpected error in api_import_token")
             return JSONResponse(
@@ -2517,7 +2820,7 @@ def _build_routes(
         except FlowError as e:
             return _error_response(e)
         except ValueError as e:  # invalid template name
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         return JSONResponse(
             {
                 "ok": True,
@@ -2562,7 +2865,7 @@ def _build_routes(
                 os.path.join(staging, "metadata.json"), metadata, sort_keys=False
             )
         except ValueError as e:  # invalid template name
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         return JSONResponse({"ok": True})
 
     async def _receive_offset_chunk(
@@ -2602,7 +2905,7 @@ def _build_routes(
         try:
             staging = team.get_import_staging_dir(template_name)
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         os.makedirs(staging, exist_ok=True)
         dest = os.path.join(staging, "dump.sql.gz")
         part = f"{dest}.part"
@@ -2673,7 +2976,7 @@ def _build_routes(
         try:
             staging = team.get_import_staging_dir(template_name)
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         fs_dir = os.path.join(staging, "filestore")
         os.makedirs(staging, exist_ok=True)
         fd, tmp_tar = tempfile.mkstemp(
@@ -2763,7 +3066,7 @@ def _build_routes(
         try:
             staging = team.get_import_staging_dir(template_name)
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         addons_dir = os.path.join(staging, "addons")
         os.makedirs(staging, exist_ok=True)
         part = os.path.join(staging, f".addon_{name}.tar.part")
@@ -2913,7 +3216,7 @@ def _build_routes(
 
             await _offload(_record_remote_addon)
         except ValueError as e:  # invalid template name
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         return JSONResponse({"ok": True})
 
     def api_import_finalize(request: Request) -> JSONResponse:
@@ -2925,7 +3228,7 @@ def _build_routes(
         try:
             progress = _import_progress(team, template_name)
         except ValueError as e:  # invalid template name
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         if not progress["manifest"] or not progress["dump"]:
             return JSONResponse(
                 {
@@ -3015,7 +3318,7 @@ def _build_routes(
                 headers={"Cache-Control": "no-store"},
             )
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except FlowError as e:
             return _error_response(e)
         except Exception:
@@ -3046,7 +3349,7 @@ def _build_routes(
                 headers={"Cache-Control": "no-store"},
             )
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except FlowError as e:
             return _error_response(e)
         except Exception:
@@ -3074,7 +3377,7 @@ def _build_routes(
                 headers={"Cache-Control": "no-store"},
             )
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except FlowError as e:
             return _error_response(e)
         except Exception:
@@ -3099,7 +3402,7 @@ def _build_routes(
             )
             return JSONResponse({"ok": True, "result": result})
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except FlowError as e:
             return _error_response(e)
         except Exception:
@@ -3131,7 +3434,7 @@ def _build_routes(
             result = service_database_ops.set_protected(team, name, protected)
             return JSONResponse({"ok": True, "result": result})
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except FlowError as e:
             return _error_response(e)
         except Exception:
@@ -3191,7 +3494,7 @@ def _build_routes(
             cap_add = ["NET_ADMIN"] if net_admin else None
             command = _command_from_body(body.get("command")) or None
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except FlowError as e:
             return _error_response(e)
         except Exception:
@@ -3224,7 +3527,7 @@ def _build_routes(
             )
             return JSONResponse({"ok": True, "result": result})
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except FlowError as e:
             return _error_response(e)
         except Exception:
@@ -3312,7 +3615,7 @@ def _build_routes(
             )
             return JSONResponse({"ok": True, "result": result})
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except FlowError as e:
             return _error_response(e)
         except Exception:
@@ -3494,7 +3797,7 @@ def _build_routes(
                 except NotFoundError:
                     pass
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except FlowError as e:
             return _error_response(e)
         except Exception:
@@ -3528,7 +3831,7 @@ def _build_routes(
             )
             return JSONResponse({"ok": True, "result": result})
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except FlowError as e:
             return _error_response(e)
         except Exception:
@@ -3683,7 +3986,15 @@ def _build_routes(
                 return JSONResponse(
                     {"ok": False, "error": "Guide not found"}, status_code=404
                 )
-            return JSONResponse({"ok": True, "content": content, "filename": filename})
+            # Rebranded for display only, like the MCP tools serving the same
+            # files; the copies on disk keep the product name.
+            return JSONResponse(
+                {
+                    "ok": True,
+                    "content": branding.rebrand(content),
+                    "filename": filename,
+                }
+            )
         except Exception:
             logger.exception("Unexpected error in api_agent_guide_get")
             return JSONResponse(
@@ -3785,9 +4096,7 @@ def _build_routes(
         try:
             agent_uploads.normalize_filename(filename)
         except agent_uploads.AttachmentError as e:
-            return JSONResponse(
-                {"ok": False, "error": str(e)}, status_code=e.status_code
-            )
+            return _error_text_response(e, e.status_code)
 
         content_length = request.headers.get("content-length")
         if content_length:
@@ -3857,8 +4166,9 @@ def _build_routes(
                 )
                 return JSONResponse({"ok": True, "attachment": attachment})
             except agent_uploads.AttachmentError as e:
-                return JSONResponse(
-                    {"ok": False, "error": str(e)}, status_code=e.status_code
+                return _error_text_response(
+                    e,
+                    e.status_code,
                 )
             except FlowError as e:
                 return _error_response(e)
@@ -3889,9 +4199,7 @@ def _build_routes(
             )
             return JSONResponse({"ok": True})
         except agent_uploads.AttachmentError as e:
-            return JSONResponse(
-                {"ok": False, "error": str(e)}, status_code=e.status_code
-            )
+            return _error_text_response(e, e.status_code)
         except FlowError as e:
             return _error_response(e)
         except Exception:
@@ -3902,10 +4210,57 @@ def _build_routes(
         finally:
             locks.release_env(branch)
 
+    def _white_label_hidden() -> JSONResponse | None:
+        # Under white label the operator's clients use this dashboard; the
+        # operator manages the license with `oduflow license` on the server,
+        # and the vendor's update check and issue tracker are not theirs.
+        if branding.is_white_label():
+            return JSONResponse({"ok": False, "error": "Not found"}, status_code=404)
+        return None
+
     def api_license(request: Request) -> JSONResponse:
+        if hidden := _white_label_hidden():
+            return hidden
         settings = get_settings()
         info = get_license_info(settings.etc_dir)
         return JSONResponse({"ok": True, "license": info.to_dict()})
+
+    async def api_license_refresh(request: Request) -> JSONResponse:
+        if hidden := _white_label_hidden():
+            return hidden
+        try:
+            result = await _offload(refresh_license, get_settings().etc_dir)
+            return JSONResponse(
+                {
+                    "ok": True,
+                    "license": result.info.to_dict(),
+                    "renewed": result.renewed,
+                    "subscription_required": result.subscription_required,
+                }
+            )
+        except (ValueError, OSError):
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "error": "Unable to update the license. Check your payment and retry, or contact support.",
+                },
+                status_code=400,
+            )
+
+    async def api_license_checkout(request: Request) -> JSONResponse:
+        if hidden := _white_label_hidden():
+            return hidden
+        try:
+            url = await _offload(get_license_checkout_url, get_settings().etc_dir)
+            return JSONResponse({"ok": True, "checkout_url": url})
+        except (ValueError, OSError):
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "error": "Unable to open checkout. Update license status or contact support.",
+                },
+                status_code=400,
+            )
 
     async def api_version(request: Request) -> JSONResponse:
         """Compare the running version with the latest GitHub release.
@@ -3915,10 +4270,14 @@ def _build_routes(
         for. Failures are reported in the payload, never as a 5xx: "could
         not reach GitHub" is an answer the dialog shows, not a server error.
         """
+        if hidden := _white_label_hidden():
+            return hidden
         result = await _offload(updates.check_for_update)
         return JSONResponse({"ok": True, "version": result.to_dict()})
 
     async def api_license_activate(request: Request) -> JSONResponse:
+        if hidden := _white_label_hidden():
+            return hidden
         try:
             body = await request.json()
             key_text = (body.get("key") or "").strip()
@@ -3930,7 +4289,7 @@ def _build_routes(
             info = install_license_from_text(key_text, settings.etc_dir)
             return JSONResponse({"ok": True, "license": info.to_dict()})
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except Exception:
             logger.exception("Unexpected error in api_license_activate")
             return JSONResponse(
@@ -3944,6 +4303,8 @@ def _build_routes(
         length budget have one owner (oduflow.feedback) shared with the
         report_issue MCP tool.
         """
+        if hidden := _white_label_hidden():
+            return hidden
         try:
             try:
                 body = await request.json()
@@ -4007,21 +4368,72 @@ def _build_routes(
             name = (body.get("name") or "").strip()
             repo_url = (body.get("repo_url") or "").strip()
             git_user = (body.get("git_user") or "").strip()
+            branches = body.get("branches") or []
             if not name or not repo_url:
                 return JSONResponse(
                     {"ok": False, "error": "name and repo_url are required."},
                     status_code=400,
                 )
-            from oduflow.extra_addons import clone_extra_repo
+            if not isinstance(branches, list) or any(
+                not isinstance(b, str) for b in branches
+            ):
+                return JSONResponse(
+                    {"ok": False, "error": "branches must be a list of names."},
+                    status_code=400,
+                )
+            # Same URL validation + SSRF guard as the MCP add_extra_repo path.
+            from oduflow.git_ops import validate_repo_url
+
+            validate_repo_url(repo_url)
+
+            from oduflow.extra_addons import register_extra_repo
 
             result = await _offload(
-                clone_extra_repo, team, name, repo_url, git_user=git_user
+                register_extra_repo,
+                team,
+                name,
+                repo_url,
+                git_user=git_user,
+                branches=branches,
             )
             return JSONResponse({"ok": True, "result": result})
         except FlowError as e:
             return _error_response(e)
+        except ValueError as e:
+            return _error_text_response(e)
         except Exception:
             logger.exception("Unexpected error in api_extra_repo_add")
+            return JSONResponse(
+                {"ok": False, "error": "Internal server error."}, status_code=500
+            )
+
+    async def api_extra_repo_ls_remote(request: Request) -> JSONResponse:
+        """List remote branches before adding (add-repo wizard branch picker)."""
+        team = _get_ui_team(request)
+        try:
+            body = await request.json()
+            repo_url = (body.get("repo_url") or "").strip()
+            git_user = (body.get("git_user") or "").strip()
+            if not repo_url:
+                return JSONResponse(
+                    {"ok": False, "error": "repo_url is required."}, status_code=400
+                )
+            # SSRF guard: ls-remote runs server-side with team credentials, so
+            # apply the same URL validation as the MCP add_extra_repo path.
+            from oduflow.git_ops import validate_repo_url
+
+            validate_repo_url(repo_url)
+
+            from oduflow.extra_addons import list_remote_branches
+
+            branches = await _offload(
+                list_remote_branches, team, repo_url, git_user=git_user
+            )
+            return JSONResponse({"ok": True, "branches": branches})
+        except FlowError as e:
+            return _error_response(e)
+        except Exception:
+            logger.exception("Unexpected error in api_extra_repo_ls_remote")
             return JSONResponse(
                 {"ok": False, "error": "Internal server error."}, status_code=500
             )
@@ -4038,6 +4450,112 @@ def _build_routes(
             return _error_response(e)
         except Exception:
             logger.exception("Unexpected error in api_extra_repo_pull")
+            return JSONResponse(
+                {"ok": False, "error": "Internal server error."}, status_code=500
+            )
+
+    async def api_extra_repo_branches(request: Request) -> JSONResponse:
+        """Downloaded and remote branches plus who uses each (Branches dialog)."""
+        name = request.path_params["name"]
+        team = _get_ui_team(request)
+        try:
+            from oduflow.extra_addons import branch_usage, get_extra_repo
+
+            repo = await _offload(get_extra_repo, team, name)
+            usage = await _offload(branch_usage, get_settings(), team, name)
+            return JSONResponse(
+                {
+                    "ok": True,
+                    "name": repo["name"],
+                    "local": repo["local"],
+                    "downloaded": repo["branches"],
+                    "available": repo["available_branches"],
+                    "available_known": repo["available_known"],
+                    "protected": repo["protected"],
+                    "usage": usage,
+                }
+            )
+        except FlowError as e:
+            return _error_response(e)
+        except ValueError as e:
+            return _error_text_response(e)
+        except Exception:
+            logger.exception("Unexpected error in api_extra_repo_branches")
+            return JSONResponse(
+                {"ok": False, "error": "Internal server error."}, status_code=500
+            )
+
+    async def api_extra_repo_remote_branches(request: Request) -> JSONResponse:
+        name = request.path_params["name"]
+        team = _get_ui_team(request)
+        try:
+            from oduflow.extra_addons import refresh_remote_branches
+
+            branches = await _offload(refresh_remote_branches, team, name)
+            return JSONResponse({"ok": True, "available": branches})
+        except FlowError as e:
+            return _error_response(e)
+        except ValueError as e:
+            return _error_text_response(e)
+        except Exception:
+            logger.exception("Unexpected error in api_extra_repo_remote_branches")
+            return JSONResponse(
+                {"ok": False, "error": "Internal server error."}, status_code=500
+            )
+
+    async def api_extra_repo_add_branches(request: Request) -> JSONResponse:
+        # No lock: extra_addons serialises every mutator per repo.
+        name = request.path_params["name"]
+        team = _get_ui_team(request)
+        try:
+            body = await request.json()
+            branches = body.get("branches") if isinstance(body, dict) else None
+            if (
+                not isinstance(branches, list)
+                or not branches
+                or any(not isinstance(b, str) for b in branches)
+            ):
+                return JSONResponse(
+                    {"ok": False, "error": "branches must be a non-empty list."},
+                    status_code=400,
+                )
+            from oduflow.extra_addons import track_branches
+
+            result = await _offload(track_branches, team, name, branches)
+            return JSONResponse({"ok": True, "result": result})
+        except FlowError as e:
+            return _error_response(e)
+        except ValueError as e:
+            return _error_text_response(e)
+        except Exception:
+            logger.exception("Unexpected error in api_extra_repo_add_branches")
+            return JSONResponse(
+                {"ok": False, "error": "Internal server error."}, status_code=500
+            )
+
+    async def api_extra_repo_remove_branch(request: Request) -> JSONResponse:
+        # Branch names may contain "/", so the branch travels in the body.
+        name = request.path_params["name"]
+        team = _get_ui_team(request)
+        try:
+            body = await request.json()
+            branch = body.get("branch") if isinstance(body, dict) else None
+            if not isinstance(branch, str) or not branch.strip():
+                return JSONResponse(
+                    {"ok": False, "error": "branch is required."}, status_code=400
+                )
+            from oduflow.extra_addons import untrack_branch
+
+            result = await _offload(
+                untrack_branch, get_settings(), team, name, branch.strip()
+            )
+            return JSONResponse({"ok": True, "result": result})
+        except FlowError as e:
+            return _error_response(e)
+        except ValueError as e:
+            return _error_text_response(e)
+        except Exception:
+            logger.exception("Unexpected error in api_extra_repo_remove_branch")
             return JSONResponse(
                 {"ok": False, "error": "Internal server error."}, status_code=500
             )
@@ -4289,7 +4807,7 @@ def _build_routes(
             locks.release_env(key)
 
     def api_secrets(request: Request) -> JSONResponse:
-        """Names and timestamps only — secret values never leave the server."""
+        """Names, types and timestamps only — never secret values."""
         try:
             team = _get_ui_team(request)
             return JSONResponse(
@@ -4319,14 +4837,48 @@ def _build_routes(
                 {"ok": False, "error": "Invalid JSON body."}, status_code=400
             )
         try:
-            result = secret_store.set_secret(team, name, value)
+            result = await _offload(
+                secret_store.set_secret, team, name, value, body.get("value_type")
+            )
             return JSONResponse({"ok": True, "result": result})
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except FlowError as e:
             return _error_response(e)
         except Exception:
             logger.exception("Unexpected error in api_secret_set")
+            return JSONResponse(
+                {"ok": False, "error": "Internal server error."}, status_code=500
+            )
+
+    async def api_secret_update_json(request: Request) -> JSONResponse:
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse(
+                {"ok": False, "error": "Invalid JSON body."}, status_code=400
+            )
+        if not isinstance(body, dict) or "path" not in body or "value" not in body:
+            return JSONResponse(
+                {"ok": False, "error": "An object with path and value is required."},
+                status_code=400,
+            )
+        try:
+            team = _get_ui_team(request)
+            result = await _offload(
+                secret_store.update_secret_json,
+                team,
+                request.path_params["name"],
+                body["path"],
+                body["value"],
+            )
+            return JSONResponse({"ok": True, "result": result})
+        except ValueError as e:
+            return _error_text_response(e)
+        except FlowError as e:
+            return _error_response(e)
+        except Exception:
+            logger.exception("Unexpected error in api_secret_update_json")
             return JSONResponse(
                 {"ok": False, "error": "Internal server error."}, status_code=500
             )
@@ -4338,7 +4890,7 @@ def _build_routes(
             secret_store.delete_secret(team, name)
             return JSONResponse({"ok": True, "result": {"deleted": name}})
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except FlowError as e:
             return _error_response(e)
         except Exception:
@@ -4697,7 +5249,7 @@ def _build_routes(
             try:
                 validate_env_name(branch)
             except ValueError as e:
-                await websocket.send_text(f"\x1b[31mError: {e}\x1b[0m\r\n")
+                await websocket.send_text(_term_error(e))
                 await websocket.close(code=1008)
                 return
 
@@ -4820,7 +5372,7 @@ def _build_routes(
         except Exception as e:
             logger.exception("WebSocket terminal error for branch %s", branch)
             try:
-                await websocket.send_text(f"\x1b[31mError: {e}\x1b[0m\r\n")
+                await websocket.send_text(_term_error(e))
                 await websocket.close(code=1011)
             except Exception:
                 pass
@@ -4840,7 +5392,7 @@ def _build_routes(
             try:
                 validate_env_name(branch)
             except ValueError as e:
-                await websocket.send_text(f"\x1b[31mError: {e}\x1b[0m\r\n")
+                await websocket.send_text(_term_error(e))
                 await websocket.close(code=1008)
                 return
 
@@ -4882,7 +5434,7 @@ def _build_routes(
                     allow_fallback=False,
                 )
             except MissingCredentialsError as e:
-                await websocket.send_text(f"\x1b[31mError: {e}\x1b[0m\r\n")
+                await websocket.send_text(_term_error(e))
                 await websocket.close(code=1011)
                 return
 
@@ -4972,7 +5524,7 @@ def _build_routes(
         except Exception as e:
             logger.exception("WebSocket SQL terminal error for branch %s", branch)
             try:
-                await websocket.send_text(f"\x1b[31mError: {e}\x1b[0m\r\n")
+                await websocket.send_text(_term_error(e))
                 await websocket.close(code=1011)
             except Exception:
                 pass
@@ -4992,7 +5544,7 @@ def _build_routes(
             try:
                 validate_env_name(branch)
             except ValueError as e:
-                await websocket.send_text(f"\x1b[31mError: {e}\x1b[0m\r\n")
+                await websocket.send_text(_term_error(e))
                 await websocket.close(code=1008)
                 return
 
@@ -5113,8 +5665,12 @@ def _build_routes(
                     mcp_url,
                     include_oduflow=bool(mcp_token),
                     model=settings.agent_opencode_model,
+                    provider=settings.agent_opencode_provider,
                 )
                 cmd = _opencode_cli_cmd(settings.agent_opencode_model)
+                provider_warning = _opencode_provider_env_warning(settings, team)
+                if provider_warning:
+                    cmd = _confirm_before_start(cmd, provider_warning)
             else:
                 # Approval-free like Codex: Docker + the unprivileged `agent`
                 # user are the security boundary, so the console skips per-tool
@@ -5216,7 +5772,7 @@ def _build_routes(
         except Exception as e:
             logger.exception("WebSocket agent console error for branch %s", branch)
             try:
-                await websocket.send_text(f"\x1b[31mError: {e}\x1b[0m\r\n")
+                await websocket.send_text(_term_error(e))
                 await websocket.close(code=1011)
             except Exception:
                 pass
@@ -5270,7 +5826,7 @@ def _build_routes(
         try:
             validate_env_name(branch)
         except ValueError as e:
-            await _err(str(e), close_code=1008)
+            await _err(_public_error_text(e), close_code=1008)
             return
 
         try:
@@ -5389,7 +5945,11 @@ def _build_routes(
                 exec_env["OPENCODE_CONFIG_CONTENT"] = _opencode_config(
                     include_browser=False,
                     model=settings.agent_opencode_model,
+                    provider=settings.agent_opencode_provider,
                 )
+                provider_warning = _opencode_provider_env_warning(settings, team)
+                if provider_warning:
+                    await _notice(provider_warning)
 
             exec_id = client.api.exec_create(
                 container.id,
@@ -5528,6 +6088,11 @@ def _build_routes(
             settings = get_settings()
             team = _get_ui_team(request)
             prods = production_ops.list_productions(settings, team)
+            for prod in prods:
+                # Who holds the lock a queued deploy waits for — named even
+                # when the holder reports no progress of its own.
+                holder = locks.describe_env_holder(_prod_lock_key(team, prod["name"]))
+                prod["busy"] = holder.strip().removeprefix("(").removesuffix(")")
             webhook_secret = production_registry.get_webhook_secret(team)
             return JSONResponse(
                 {
@@ -5562,7 +6127,7 @@ def _build_routes(
         except FlowError as e:
             return _error_response(e)
         except Exception as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         raw_extra = data.get("extra_addons")
         try:
             locks.acquire_env(_prod_lock_key(team, name))
@@ -5599,13 +6164,21 @@ def _build_routes(
                 auto_update=bool(data.get("auto_update")),
                 template_name=str(data.get("template_name", "")).strip() or None,
                 from_environment=from_environment or None,
+                env_vars=(
+                    _env_vars_from_body(data["env_vars"])
+                    if "env_vars" in data
+                    else None
+                ),
                 env_lock=env_lock,
+                server_mode=production_ops.resolve_server_mode(
+                    data.get("server_mode"), production_ops.DEFAULT_SERVER_MODE
+                ),
             )
             return JSONResponse({"ok": True, **result})
         except FlowError as e:
             return _error_response(e)
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except Exception:
             logger.exception("api_production_create failed")
             return JSONResponse(
@@ -5645,7 +6218,7 @@ def _build_routes(
         except FlowError as e:
             return _error_response(e)
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except Exception:
             logger.exception("production action failed for '%s'", name)
             return JSONResponse(
@@ -5687,7 +6260,7 @@ def _build_routes(
         except FlowError as e:
             return _error_response(e)
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except Exception:
             logger.exception("production action failed for '%s'", name)
             return JSONResponse(
@@ -5731,10 +6304,37 @@ def _build_routes(
         except FlowError as e:
             return _error_response(e)
 
+        key = _prod_lock_key(team, name)
+        operation = "dashboard deploy"
+        if any(w["operation"] == operation for w in current_waiters(key)):
+            # The queued one pulls the branch tip when it runs anyway.
+            return _error_response(
+                BusyError(
+                    f"A dashboard deploy of '{name}' is already queued; it "
+                    "starts as soon as the production is free."
+                )
+            )
+        # Non-empty while another operation holds the lock: this deploy queues.
+        busy = locks.describe_env_holder(key)
+        queued_at = time.time()
+
         def _run() -> None:
-            key = _prod_lock_key(team, name)
-            if not locks.acquire_env_blocking(key, 300):
-                logger.warning("UI deploy of '%s' timed out on lock", name)
+            if not locks.acquire_env_blocking(
+                key, _UI_DEPLOY_WAIT_SECONDS, operation=operation
+            ):
+                holder = locks.describe_env_holder(key)
+                logger.warning("UI deploy of '%s' timed out on lock%s", name, holder)
+                production_ops.record_skipped_deploy(
+                    team,
+                    name,
+                    trigger="ui",
+                    queued_at=queued_at,
+                    reason=(
+                        "Not started: the production stayed busy for "
+                        f"{_UI_DEPLOY_WAIT_SECONDS // 60} min{holder}. "
+                        "Deploy again once it is free."
+                    ),
+                )
                 return
             try:
                 production_ops.update_production(settings, team, name, trigger="ui")
@@ -5746,7 +6346,10 @@ def _build_routes(
         threading.Thread(
             target=_run, name=f"oduflow-ui-deploy-{name}", daemon=True
         ).start()
-        return JSONResponse({"ok": True, "started": True}, status_code=202)
+        return JSONResponse(
+            {"ok": True, "started": True, "queued": bool(busy), "busy": busy.strip()},
+            status_code=202,
+        )
 
     def api_production_rollback(request: Request) -> JSONResponse:
         settings = get_settings()
@@ -5845,14 +6448,22 @@ def _build_routes(
             # Present-but-empty means "clear" (the dashboard always submits
             # the field); only an absent key means "leave unchanged".
             git_user=(str(data["git_user"]).strip() if "git_user" in data else None),
+            env_vars=(
+                _env_vars_from_body(data["env_vars"]) if "env_vars" in data else None
+            ),
             extra_addons=(
                 _normalize_extra_addons(raw_extra) if raw_extra is not None else None
             ),
+            server_mode=production_ops.resolve_server_mode(
+                data.get("server_mode"), None
+            ),
+            force_recreate=data.get("recreate") is True,
         )
 
     async def api_production_reconfigure(request: Request) -> JSONResponse:
-        """Change infra settings (domain/image/branch/repo/extra addons) and
-        recreate the production container to match; DB/filestore preserved."""
+        """Change infra settings (domain/image/branch/repo/extra addons/server
+        mode) and recreate the production container to match; DB/filestore
+        preserved."""
         return await _production_body_action(request, _reconfigure_action)
 
     def _odoo_conf_action(
@@ -5903,7 +6514,7 @@ def _build_routes(
         try:
             validate_template_name(template_name)
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         # Fail fast on an unknown production before taking a team-wide lock.
         try:
             production_registry.get_production(team, name)
@@ -5946,7 +6557,7 @@ def _build_routes(
                 }
             )
         except ValueError as e:
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+            return _error_text_response(e)
         except ConflictError as e:
             # The dashboard offers a re-baseline instead of a dead end, so it
             # has to tell "that name is taken" apart from every other 400.
@@ -6340,6 +6951,8 @@ def _build_routes(
         Route("/api/version", api_version, methods=["GET"]),
         Route("/api/license", api_license, methods=["GET"]),
         Route("/api/license/activate", api_license_activate, methods=["POST"]),
+        Route("/api/license/refresh", api_license_refresh, methods=["POST"]),
+        Route("/api/license/checkout", api_license_checkout, methods=["POST"]),
         Route("/api/feedback/link", api_feedback_link, methods=["POST"]),
         Route("/api/templates", api_templates, methods=["GET"]),
         Route("/import-odoo.sh", import_odoo_script, methods=["GET"]),
@@ -6379,6 +6992,7 @@ def _build_routes(
         *production_routes,
         Route("/healthz", healthz, methods=["GET"]),
         Route("/api/stats", api_stats, methods=["GET"]),
+        Route("/api/cleanup", api_cleanup, methods=["POST"]),
         Route("/api/usage", api_usage, methods=["GET"]),
         Route("/api/usage/refresh", api_usage_refresh, methods=["POST"]),
         Route(
@@ -6543,7 +7157,28 @@ def _build_routes(
         Route("/api/volumes/{name}/delete", api_volume_delete, methods=["POST"]),
         Route("/api/extra-repos", api_extra_repos, methods=["GET"]),
         Route("/api/extra-repos/add", api_extra_repo_add, methods=["POST"]),
+        Route("/api/extra-repos/ls-remote", api_extra_repo_ls_remote, methods=["POST"]),
         Route("/api/extra-repos/{name}/pull", api_extra_repo_pull, methods=["POST"]),
+        Route(
+            "/api/extra-repos/{name}/branches",
+            api_extra_repo_branches,
+            methods=["GET"],
+        ),
+        Route(
+            "/api/extra-repos/{name}/branches",
+            api_extra_repo_add_branches,
+            methods=["POST"],
+        ),
+        Route(
+            "/api/extra-repos/{name}/branches/remove",
+            api_extra_repo_remove_branch,
+            methods=["POST"],
+        ),
+        Route(
+            "/api/extra-repos/{name}/remote-branches",
+            api_extra_repo_remote_branches,
+            methods=["POST"],
+        ),
         Route(
             "/api/extra-repos/{name}/protect", api_extra_repo_protect, methods=["POST"]
         ),
@@ -6566,6 +7201,9 @@ def _build_routes(
         # the ui_scope allowlist, so scoped share sessions cannot touch them.
         Route("/api/secrets", api_secrets, methods=["GET"]),
         Route("/api/secrets/{name}/set", api_secret_set, methods=["POST"]),
+        Route(
+            "/api/secrets/{name}/update-json", api_secret_update_json, methods=["POST"]
+        ),
         Route("/api/secrets/{name}/delete", api_secret_delete, methods=["POST"]),
         Route("/api/environments/{branch:path}/logs", api_logs, methods=["GET"]),
         WebSocketRoute("/api/environments/{branch:path}/terminal", ws_terminal),
@@ -6579,10 +7217,13 @@ def mount_web_ui(
     app: Starlette,
     get_settings: Callable[[], Settings],
     locks: LockManager,
+    config_runtime: ConfigRuntime | None = None,
 ) -> None:
     from starlette.routing import Router
 
-    routes = _build_routes(get_settings, locks)
+    branding.configure(get_settings)
+    routes = admin_ui.build_admin_routes(get_settings, config_runtime)
+    routes += _build_routes(get_settings, locks)
     sub_app: ASGIApp = Router(routes=routes)
 
     settings = get_settings()

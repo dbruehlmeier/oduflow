@@ -16,7 +16,7 @@ from __future__ import annotations
 import threading
 import time
 from contextlib import contextmanager
-from typing import Iterator
+from typing import Iterator, cast
 
 from oduflow.errors import BusyError
 
@@ -119,6 +119,11 @@ def image_publish_lock_key(team_id: str, name: str) -> str:
     return f"imgpublish:{team_id}:{name}"
 
 
+def image_cleanup_lock_key() -> str:
+    """Removal of unused Docker images — server-wide, so not team-scoped."""
+    return "images:cleanup"
+
+
 def env_wake_key(team_id: str, env_name: str) -> str:
     """Auto-start of one environment (see :func:`keyed_mutex`)."""
     return f"wake:{team_id}:{env_name}"
@@ -162,18 +167,131 @@ def _format_age(seconds: float) -> str:
     return f"{total // 3600}h{(total % 3600) // 60:02d}m"
 
 
+# -- progress of a lock holder -------------------------------------------------
+#
+# The holder of a long operation (a production deploy: fetch, a snapshot that
+# can run for many minutes, module upgrades, health checks) reports its current
+# step under the lock key it holds. A rejected caller's BusyError and the
+# dashboard both read it, so "still working on the snapshot" is
+# distinguishable from "hung". Module-level because the reporting code
+# (docker_ops) has no handle on the LockManager instance; keys are unique per
+# resource anyway.
+
+_progress: dict[str, dict[str, object]] = {}
+_progress_guard = threading.Lock()
+
+
+def report_progress(key: str, phase: str, detail: str = "") -> None:
+    """Record what the holder of *key* is doing now.
+
+    *phase* is the step ("pre-update snapshot"); its timer restarts only when
+    the phase changes. *detail* is free-form progress within the phase
+    ("filestore 1200/12340 files") and may be updated as often as needed.
+    """
+    now = time.monotonic()
+    with _progress_guard:
+        current = _progress.get(key)
+        if current is None:
+            _progress[key] = {
+                "phase": phase,
+                "detail": detail,
+                "phase_since": now,
+                "started": now,
+            }
+            return
+        if current["phase"] != phase:
+            current["phase"] = phase
+            current["phase_since"] = now
+        current["detail"] = detail
+
+
+def clear_progress(key: str) -> None:
+    with _progress_guard:
+        _progress.pop(key, None)
+
+
+def current_progress(key: str) -> dict[str, object] | None:
+    """``{"phase", "detail", "phase_seconds", "seconds"}`` of *key*'s holder,
+    or None when it reported nothing."""
+    now = time.monotonic()
+    with _progress_guard:
+        current = _progress.get(key)
+        if current is None:
+            return None
+        return {
+            "phase": current["phase"],
+            "detail": current["detail"],
+            "phase_seconds": int(now - cast(float, current["phase_since"])),
+            "seconds": int(now - cast(float, current["started"])),
+        }
+
+
+def describe_progress(key: str) -> str:
+    """'pre-update snapshot (filestore 1200/12340 files) for 1m40s' — empty
+    when the holder reported nothing."""
+    progress = current_progress(key)
+    if progress is None:
+        return ""
+    text = str(progress["phase"])
+    if progress["detail"]:
+        text += f" ({progress['detail']})"
+    return f"{text} for {_format_age(cast(int, progress['phase_seconds']))}"
+
+
+# Callers queued in acquire_env_blocking (dashboard and webhook deploys wait
+# for a production's lock instead of failing). Until they get the lock they
+# report nothing, so without this a queued deploy is invisible — and one that
+# gives up on its timeout vanishes without a trace.
+_waiters: dict[str, list[dict[str, object]]] = {}
+
+
+def current_waiters(key: str) -> list[dict[str, object]]:
+    """``[{"operation", "seconds"}]`` of the callers queued for *key*, oldest
+    first."""
+    now = time.monotonic()
+    with _progress_guard:
+        return [
+            {
+                "operation": waiter["operation"],
+                "seconds": int(now - cast(float, waiter["since"])),
+            }
+            for waiter in _waiters.get(key, [])
+        ]
+
+
+def _describe_key(key: str, with_team: bool = False) -> str:
+    """How a lock key reads in a message: "production 'erp'" for production
+    keys (the raw 'prod:<team>:<name>' means nothing to the reader),
+    "environment 'main'" otherwise. *with_team* names the team for messages
+    that span teams."""
+    if _is_prod_key(key):
+        _prefix, team_id, name = key.split(":", 2)
+        suffix = f" of team '{team_id}'" if with_team else ""
+        return f"production '{name}'{suffix}"
+    return f"environment '{key}'"
+
+
 class _Holder:
     """Which operation took a lock, and when."""
 
-    __slots__ = ("operation", "acquired_at")
+    __slots__ = ("operation", "acquired_at", "key")
 
-    def __init__(self, operation: str) -> None:
+    def __init__(self, operation: str, key: str = "") -> None:
         self.operation = operation
         self.acquired_at = time.monotonic()
+        self.key = key
 
     def describe(self) -> str:
-        """' (pull_and_apply, running for 4m12s)' — empty when unknown."""
+        """' (pull_and_apply, running for 4m12s)' — empty when unknown.
+
+        With a reported progress: ' (update_production: pre-update snapshot
+        for 1m40s; running for 2m15s)'.
+        """
         age = _format_age(time.monotonic() - self.acquired_at)
+        progress = describe_progress(self.key) if self.key else ""
+        if progress:
+            label = f"{self.operation}: {progress}" if self.operation else progress
+            return f" ({label}; running for {age})"
         if self.operation:
             return f" ({self.operation}, running for {age})"
         return f" (running for {age})"
@@ -239,12 +357,12 @@ class LockManager:
             lock = self._env_locks[env_name]
             if not lock.acquire(blocking=False):
                 raise BusyError(
-                    f"Another operation on environment '{env_name}'"
+                    f"Another operation on {_describe_key(env_name)}"
                     f"{self._env_holder_hint(env_name)} is in progress. "
                     "It is still running server-side — wait for it to finish "
-                    "rather than restarting the environment."
+                    "rather than restarting it."
                 )
-            self._env_holders[env_name] = _Holder(operation)
+            self._env_holders[env_name] = _Holder(operation, env_name)
             if _is_prod_key(env_name):
                 self._active_prod_keys.add(env_name)
             if team_id is not None:
@@ -258,9 +376,21 @@ class LockManager:
     ) -> bool:
         """Blocking acquire with a timeout — webhook-triggered production
         deploys queue behind a running one instead of dropping the push.
-        Returns False when the timeout expires (caller skips the run)."""
+        Returns False when the timeout expires (caller skips the run).
+        While waiting, the caller is listed by :func:`current_waiters`."""
         lock = self._get_env_lock(env_name)
-        acquired = lock.acquire(blocking=True, timeout=timeout)
+        waiter: dict[str, object] = {"operation": operation, "since": time.monotonic()}
+        with _progress_guard:
+            _waiters.setdefault(env_name, []).append(waiter)
+        try:
+            acquired = lock.acquire(blocking=True, timeout=timeout)
+        finally:
+            with _progress_guard:
+                queue = [w for w in _waiters.get(env_name, []) if w is not waiter]
+                if queue:
+                    _waiters[env_name] = queue
+                else:
+                    _waiters.pop(env_name, None)
         if not acquired:
             return False
         with self._map_lock:
@@ -270,7 +400,7 @@ class LockManager:
                 # as it would on a timeout.
                 lock.release()
                 return False
-            self._env_holders[env_name] = _Holder(operation)
+            self._env_holders[env_name] = _Holder(operation, env_name)
             if _is_prod_key(env_name):
                 self._active_prod_keys.add(env_name)
         return True
@@ -302,6 +432,7 @@ class LockManager:
             except RuntimeError:
                 return
             self._env_holders.pop(env_name, None)
+            clear_progress(env_name)
             self._active_prod_keys.discard(env_name)
             team_id = self._env_lock_teams.pop(env_name, None)
             if team_id is not None:
@@ -427,7 +558,7 @@ class LockManager:
                 )
             if self._active_prod_keys:
                 busy = ", ".join(
-                    f"'{key}'{self._env_holder_hint(key)}"
+                    f"{_describe_key(key, with_team=True)}{self._env_holder_hint(key)}"
                     for key in sorted(self._active_prod_keys)
                 )
                 raise BusyError(
@@ -438,3 +569,22 @@ class LockManager:
     def release_system(self) -> None:
         with self._map_lock:
             self._system_holder = None
+
+    def active_operations(self) -> list[str]:
+        """Human-readable list of operations holding a lock right now.
+
+        A restart of the server would kill them half-way, so the Server
+        settings console refuses to restart while this is non-empty.
+        """
+        with self._map_lock:
+            busy = [
+                f"{_describe_key(name, with_team=True)}{holder.describe()}"
+                for name, holder in sorted(self._env_holders.items())
+            ]
+            busy += [
+                f"team '{team_id}'{holder.describe()}"
+                for team_id, holder in sorted(self._team_holders.items())
+            ]
+            if self._system_holder is not None:
+                busy.append(f"system{self._system_holder.describe()}")
+        return busy

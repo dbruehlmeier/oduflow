@@ -36,6 +36,7 @@
 #
 # Expected environment (injected by _ensure_agent_container; team-wide):
 #   ODUFLOW_GIT_USER    credential username to match in the store (optional)
+#   ODUFLOW_BRAND_SLUG  white-label brand for the default commit identity (optional)
 # Provider auth (subscription takes precedence over key, per provider):
 #   CLAUDE_CODE_OAUTH_TOKEN | ANTHROPIC_API_KEY   (+ optional ANTHROPIC_MODEL)
 #   OPENAI_API_KEY                                 (+ optional CODEX_MODEL)
@@ -55,8 +56,10 @@ CRED_SRC="/run/oduflow/git-credentials"
 CRED_FILE="$HOME/.git-credentials"
 
 # --- 1. git credentials ------------------------------------------------------
-git config --global user.name  "${ODUFLOW_GIT_USER:-oduflow-coder}"
-git config --global user.email "${ODUFLOW_GIT_USER:-agent}@oduflow.local"
+# ODUFLOW_BRAND_SLUG is set only under a white-label brand; stock stays oduflow.
+BRAND_SLUG="${ODUFLOW_BRAND_SLUG:-oduflow}"
+git config --global user.name  "${ODUFLOW_GIT_USER:-${BRAND_SLUG}-coder}"
+git config --global user.email "${ODUFLOW_GIT_USER:-agent}@${BRAND_SLUG}.local"
 if [ -r "$CRED_SRC" ]; then
     # Copy so refresh/rotation never writes back to the shared store.
     cp "$CRED_SRC" "$CRED_FILE"
@@ -96,7 +99,7 @@ fi
 # Streamable-HTTP MCP needs the rmcp client. The Oduflow MCP server itself is
 # deliberately NOT configured here: its URL and token are per environment and
 # per session (scoped tokens, ADR 0028) and are supplied by the web console as
-# `codex -c mcp_servers.oduflow.*` overrides + the session's exec env. Keeping
+# `codex -c mcp_servers.development.*` overrides + the session's exec env. Keeping
 # them out of the global config means no session can see another environment's
 # credentials — and the container itself holds no MCP secret at all. Agent
 # Browser is safe to configure globally because it is local and credentialless;

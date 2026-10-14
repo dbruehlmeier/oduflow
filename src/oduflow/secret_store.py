@@ -21,6 +21,7 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import re
 from typing import Any
 
 from oduflow.errors import NotFoundError, PrerequisiteNotMetError
@@ -70,7 +71,7 @@ def _load(team: TeamSettings) -> dict[str, Any]:
             data = json.load(handle)
     except FileNotFoundError:
         return {"version": _VERSION, "secrets": {}}
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, ValueError, RecursionError) as exc:
         raise PrerequisiteNotMetError(
             "The team secrets store cannot be read safely."
         ) from exc
@@ -91,12 +92,53 @@ def _save(team: TeamSettings, data: dict[str, Any]) -> None:
     atomic_write_private_json(path, data)
 
 
+def _reject_json_constant(value: str) -> None:
+    raise ValueError("Invalid JSON value.")
+
+
+def _parse_json(value: Any) -> Any:
+    """Strictly parse a JSON secret value; raise ValueError without its content.
+
+    The single definition of an acceptable JSON secret: NaN and Infinity are
+    rejected, and parser errors are reduced to a position so no fragment of
+    the value reaches an error message.
+    """
+    try:
+        return json.loads(value, parse_constant=_reject_json_constant)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"Invalid JSON value at line {exc.lineno}, column {exc.colno}."
+        ) from None
+    except (ValueError, TypeError, RecursionError):
+        raise ValueError("Invalid JSON value.") from None
+
+
+def _value_type(record: dict[str, Any]) -> str:
+    """A record's stored type, or the type of an untyped legacy record.
+
+    Records written before value_type existed carry none. Reading them as
+    ``text`` would leave a JSON document stored then without element updates,
+    and being write-only its value cannot be read back to re-save it as JSON.
+    So a value that strictly parses as a JSON object or array is ``json``;
+    anything else, including scalars such as ``12345`` or ``true`` that happen
+    to be valid JSON, is a plain token and ``text``.
+    """
+    if "value_type" in record:
+        return str(record["value_type"])
+    try:
+        document = _parse_json(record.get("value"))
+    except ValueError:
+        return "text"
+    return "json" if isinstance(document, (dict, list)) else "text"
+
+
 def list_secrets(team: TeamSettings) -> list[dict[str, str]]:
-    """Names and timestamps only — the values never leave this module."""
+    """Names, types and timestamps only — never secret values."""
     records = _load(team)["secrets"]
     return [
         {
             "name": name,
+            "value_type": _value_type(record),
             "created_at": record.get("created_at", ""),
             "updated_at": record.get("updated_at", ""),
         }
@@ -104,21 +146,133 @@ def list_secrets(team: TeamSettings) -> list[dict[str, str]]:
     ]
 
 
-def set_secret(team: TeamSettings, name: str, value: str) -> dict[str, Any]:
+def set_secret(
+    team: TeamSettings, name: str, value: str, value_type: str | None = None
+) -> dict[str, Any]:
     validate_secret_name(name)
     if not isinstance(value, str) or not value:
         raise ValueError("A secret value must be a non-empty string.")
+    if value_type is not None and value_type not in ("text", "json"):
+        raise ValueError("value_type must be 'text' or 'json'.")
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
     with keyed_mutex(team_secrets_lock_key(team.team_id)):
         data = _load(team)
         existing = data["secrets"].get(name)
+        if value_type is None:
+            value_type = _value_type(existing) if existing else "text"
+        if value_type == "json":
+            _parse_json(value)
         data["secrets"][name] = {
             "value": value,
+            "value_type": value_type,
             "created_at": existing.get("created_at", now) if existing else now,
             "updated_at": now,
         }
         _save(team, data)
     return {"name": name, "created": existing is None}
+
+
+def backfill_value_types(team: TeamSettings) -> list[str]:
+    """Persist the type of every untyped legacy record; return JSON names.
+
+    Reads already type such records on the fly (see _value_type); this only
+    records that type, so the store no longer depends on the inference.
+    Values are never rewritten, and records that already carry a type are an
+    operator's explicit choice and are left alone, so a rerun changes nothing.
+    Returns names only.
+    """
+    promoted: list[str] = []
+    with keyed_mutex(team_secrets_lock_key(team.team_id)):
+        data = _load(team)
+        changed = False
+        for name, record in sorted(data["secrets"].items()):
+            if not isinstance(record, dict) or "value_type" in record:
+                continue
+            record["value_type"] = _value_type(record)
+            if record["value_type"] == "json":
+                promoted.append(name)
+            changed = True
+        if changed:
+            _save(team, data)
+    return promoted
+
+
+def _json_element_key(container: Any, token: str) -> str | int:
+    """Resolve an existing object key or canonical, in-bounds array index."""
+    if isinstance(container, dict) and token in container:
+        return token
+    if (
+        isinstance(container, list)
+        and re.fullmatch(r"0|[1-9][0-9]*", token)
+        and len(token) <= len(str(len(container)))
+    ):
+        index = int(token)
+        if index < len(container):
+            return index
+    raise ValueError("The JSON path does not identify an existing element.")
+
+
+def update_secret_json(
+    team: TeamSettings, name: str, path: str, value: Any
+) -> dict[str, Any]:
+    """Create or replace a key using JSON Pointer or dot notation, write-only.
+
+    The read/modify/write shares the set/delete mutex so concurrent changes to
+    other elements or secrets cannot be lost. An empty pointer (whole-document
+    replacement) is deliberately excluded; use set_secret for that operation.
+    """
+    validate_secret_name(name)
+    if not isinstance(path, str) or not path:
+        raise ValueError("path must be a non-empty JSON Pointer or dot-separated path.")
+    if path.startswith("/"):
+        if re.search(r"~(?:[^01]|$)", path):
+            raise ValueError(
+                "Invalid JSON Pointer escape; use ~0 for '~' and ~1 for '/'."
+            )
+        tokens = [
+            token.replace("~1", "/").replace("~0", "~") for token in path[1:].split("/")
+        ]
+    else:
+        tokens = path.split(".")
+        if "/" in path or any(not token for token in tokens):
+            raise ValueError(
+                "Use non-empty dot-separated keys, or a JSON Pointer starting with '/'."
+            )
+    with keyed_mutex(team_secrets_lock_key(team.team_id)):
+        data = _load(team)
+        record = data["secrets"].get(name)
+        if record is None:
+            raise NotFoundError(f"Secret '{name}' not found.")
+        if _value_type(record) != "json":
+            raise ValueError("Element updates are only supported for JSON secrets.")
+        try:
+            document = _parse_json(record.get("value"))
+        except ValueError:
+            raise PrerequisiteNotMetError(
+                "The stored secret is not valid JSON."
+            ) from None
+        parent = document
+        for token in tokens[:-1]:
+            parent = parent[_json_element_key(parent, token)]
+        created = isinstance(parent, dict) and tokens[-1] not in parent
+        # Only the final object key may be created. Parent containers and
+        # array elements must exist; never guess missing objects or grow arrays.
+        key = (
+            tokens[-1]
+            if isinstance(parent, dict)
+            else _json_element_key(parent, tokens[-1])
+        )
+        parent[key] = value
+        try:
+            updated = json.dumps(document, allow_nan=False, indent=2)
+        except (ValueError, TypeError, RecursionError):
+            raise ValueError(
+                "The updated secret must contain only valid JSON values."
+            ) from None
+        record["value"] = updated
+        record["updated_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        _save(team, data)
+    return {"name": name, "created": created, "updated": not created}
 
 
 def delete_secret(team: TeamSettings, name: str) -> None:
@@ -129,6 +283,36 @@ def delete_secret(team: TeamSettings, name: str) -> None:
             raise NotFoundError(f"Secret '{name}' not found.")
         del data["secrets"][name]
         _save(team, data)
+
+
+def drifted_secret_keys(
+    team: TeamSettings,
+    env_vars: dict[str, str] | None,
+    container_env: dict[str, str],
+) -> list[str]:
+    """Env keys whose secret value changed since the container was created.
+
+    A rotated secret changes neither the reference-form configuration nor the
+    image, and its value is substituted only at container creation, so a
+    running container keeps the old value until it is recreated. Compares the
+    current value of every ``secret:<name>`` reference with what the container
+    runs with. Returns key names only, never values. A dangling or malformed
+    reference is not drift here; resolving it before a recreate reports it.
+    """
+    refs = secret_env_refs(env_vars)
+    if not refs:
+        return []
+    records = _load(team)["secrets"]
+    drifted: list[str] = []
+    for key, reference in refs.items():
+        try:
+            name = secret_ref_name(reference)
+        except ValueError:
+            continue
+        record = records.get(name)
+        if record is not None and container_env.get(key) != str(record["value"]):
+            drifted.append(key)
+    return sorted(drifted)
 
 
 def resolve_env_secrets(

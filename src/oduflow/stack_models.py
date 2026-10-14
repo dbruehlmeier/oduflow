@@ -179,6 +179,7 @@ class Production(StackModel):
     env: dict[EnvironmentVariableName, EnvValue] = Field(default_factory=dict)
     auto_update: bool = False
     allow_copy_to_dev_mcp: bool = True
+    server_mode: Literal["workers", "gevent"] = "workers"
     odoo_conf: dict[str, str] = Field(default_factory=dict)
     template: str | None = None
     adopt_existing: bool = False
@@ -196,19 +197,27 @@ class Production(StackModel):
     @field_validator("odoo_conf")
     @classmethod
     def valid_odoo_conf(cls, value: dict[str, str]) -> dict[str, str]:
-        from oduflow.docker_ops.production_ops import RESERVED_ODOO_CONF_KEYS
+        from oduflow.docker_ops.production_ops import (
+            RESERVED_ODOO_CONF_KEYS,
+            validate_workers_override,
+        )
 
         normalized = {}
         for key, option in value.items():
             key = key.lower()
             if key in normalized:
                 raise ValueError(f"Duplicate odoo.conf option: {key}")
-            if key in RESERVED_ODOO_CONF_KEYS or not re.fullmatch(
-                r"[A-Za-z0-9_.-]+", key
-            ):
-                raise ValueError(f"Invalid or reserved odoo.conf option: {key}")
+            if key in RESERVED_ODOO_CONF_KEYS:
+                raise ValueError(
+                    f"odoo.conf option {key} is reserved: Oduflow manages it "
+                    "(see set_production_odoo_conf for the managed keys)"
+                )
+            if not re.fullmatch(r"[A-Za-z0-9_.-]+", key):
+                raise ValueError(f"Invalid odoo.conf option: {key}")
             if "\n" in option or "\r" in option:
                 raise ValueError(f"odoo.conf option must be a single line: {key}")
+            if key == "workers":
+                validate_workers_override(option)
             normalized[key] = option
         return normalized
 

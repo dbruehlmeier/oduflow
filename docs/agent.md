@@ -35,7 +35,10 @@ The agent never touches host files. It holds one full git checkout per
 environment (at `/workspace/<slug>` in the container), edits its own clone,
 `git push`es, and then drives the environment **only through the Oduflow MCP
 server** (`pull_and_apply`, `run_odoo_tests`, etc.) — the same closed loop a
-remote MCP client uses.
+remote MCP client uses. Inside the agent this server is named `development`, so
+its tools appear as `development_*` in OpenCode and `mcp__development__*` in
+Claude Code and Codex. Checkouts created by earlier releases had it under
+`oduflow`; that entry is replaced before the next session.
 
 The image also includes **Agent Browser MCP** backed by Debian Chromium. It is
 wired automatically into Claude, Codex, and OpenCode with the complete Agent
@@ -50,6 +53,10 @@ injected config as a label and is **recreated automatically** when the config
 changes. The only runtime state is a durable ACP conversation-history file in
 the team's data directory; transcripts remain owned by the agent adapters.
 
+The coder image includes OpenSSH client tools for Git remotes authenticated
+with a team SSH deploy key. Use an SSH repository URL for deploy-key access;
+HTTPS remotes still require HTTPS credentials.
+
 ## Enabling it
 
 Configuration lives entirely in `oduflow.toml` — there is no runtime editing.
@@ -59,7 +66,7 @@ enablement and credentials live in the `[team.*]` sections:
 ```toml
 # Deployment-wide (optional)
 [agent]
-image = "oduist/oduflow-coder:0.3.2"
+image = "oduist/oduflow-coder:0.3.4"
 # claude_model = ""     # optional Claude model override; empty = CLI default
 # codex_model = ""      # optional Codex model override; empty = CLI default
 # opencode_model = ""   # optional provider/model override; empty = OpenCode default
@@ -106,6 +113,64 @@ the resulting provider credentials live on the team's persistent HOME volume
 and survive container recreation. OpenCode's runtime self-update is disabled,
 so its executable changes only when Oduflow moves to a new immutable coder
 image.
+
+### OpenAI-compatible gateway for OpenCode
+
+OpenCode's built-in `openai` provider uses the OpenAI Responses API. Many
+OpenAI-compatible gateways (LiteLLM, vLLM, self-hosted proxies) accept only
+Chat Completions. Declare such a gateway once as a custom OpenCode provider:
+
+```toml
+[agent]
+opencode_model = "litellm/glm-5.3"   # "<provider id>/<model>"
+
+[agent.opencode_provider]
+id = "litellm"
+name = "LiteLLM"                     # optional; defaults to id
+models = ["glm-5.3"]
+# base_url_env = "OPENCODE_PROVIDER_BASE_URL"   # default; the URL must include /v1
+# api_key_env = "OPENCODE_PROVIDER_API_KEY"     # default
+
+[team.1.agent_env]
+OPENCODE_PROVIDER_BASE_URL = "https://llm.example.com/v1"
+OPENCODE_PROVIDER_API_KEY = "sk-…"
+```
+
+The default variable names are deliberately not `OPENAI_BASE_URL` and
+`OPENAI_API_KEY`: Codex and OpenCode's built-in `openai` provider read those
+from the same agent container, so pointing them at the gateway would break
+Codex and send the real OpenAI key to the gateway.
+
+Every OpenCode session that Oduflow starts, in both Agent CLI and Agent Chat,
+gets the provider through OpenCode's bundled `@ai-sdk/openai-compatible`
+package. Requests go to `POST <base URL>/chat/completions`, and OpenCode's
+session-title requests use the same gateway. Agent Chat's model picker lists
+the declared models.
+
+The section holds only the *names* of the variables. Their values stay in
+each team's `[team.X.agent_env]`, and OpenCode receives `{env:…}` placeholders
+that resolve inside the agent container, so no URL or key is written into the
+OpenCode config. The settings are validated when Oduflow starts and when you
+save in the settings console:
+
+- `id` must be lowercase and must not be `anthropic`, `google`, `openai`,
+  `opencode` or `openrouter`. Other ids from OpenCode's provider catalog are
+  allowed: Oduflow pins the provider to the declared models and variables, so
+  the catalog adds no models or keys of its own.
+- The two `*_env` values must be variable names.
+- `models` must be a non-empty list.
+- Keys such as `api_key` are rejected.
+- If `opencode_model` names this provider, it must have the form
+  `<id>/<model>` and the model must be listed in `models`.
+
+When `opencode_model` selects this provider and a team's agent environment
+lacks either variable, Agent Chat shows a warning and Agent CLI waits for
+Enter before it starts OpenCode. The variables come only from
+`[team.X.agent_env]`; the server environment is forwarded only for the known
+provider keys of a single-team server. Changes to the section apply to new
+sessions without a restart. Changes to `agent_env` recreate the agent
+container on the next restart. Without the section, OpenCode behaves exactly
+as before.
 
 See the [`[agent]`](installation.md#agent-settings) and
 [per-team](installation.md#per-team-settings) settings tables for the full

@@ -100,7 +100,7 @@ end to end.
     [`list_templates`](#list_templates)&nbsp;·
     [`rename_template`](#rename_template)&nbsp;·
     [`delete_template`](#delete_template)&nbsp;·
-    [`import_template_from_odoo`](#import_template_from_odoo)&nbsp;·
+    [`import_template`](#import_template)&nbsp;·
     [`refresh_template`](#refresh_template)&nbsp;·
     [`attach_filestore`](#attach_filestore)
 
@@ -264,7 +264,7 @@ are in use. Move it with [`switch_branch`](#switch_branch), pass a different
 :   *str · default empty* — Environment name. Empty defaults to the branch name. Use it to create several environments from the same branch (e.g. `env_name="client-a"` with `branch="19.0"`).
 
 `template_name`
-:   *str · default empty* — Template profile to use as the database template. Pass `"none"` to skip the template and initialise Odoo from scratch with `-i base`. When a template is given, `repo_url` and `odoo_image` are loaded from its metadata (and can still be overridden).
+:   *str · default empty* — Template profile to use as the database template. Pass `"none"` to skip the template and initialise Odoo from scratch with `-i base`. When a template is given, `repo_url` and `odoo_image` are loaded from its metadata (and can still be overridden), and installed modules whose manifest `version` in the checkout is higher than in the template database are upgraded before the environment is reported ready.
 
 `repo_url`
 :   *str · default empty* — Git repository URL. Optional when `template_name` supplies it.
@@ -346,7 +346,8 @@ ownership and operator note.
 
 Full details for one environment: lifecycle and reuse metadata, database name,
 URL, repository, image, template, extra addons, workspace path, container
-status, and CPU/RAM stats.
+status, and CPU/RAM stats. Fails with "does not exist" when the environment
+has neither an Odoo container nor a workspace.
 
 **Parameters**
 
@@ -1492,36 +1493,47 @@ Lock: team + template. Destructive and irreversible.
     be recreated until a new template is set up. Requires explicit user
     permission and confirmation.
 
-### `import_template_from_odoo`
+### `import_template`
 
-Import a template from a running Odoo instance through its database manager
-API. Downloads a full ZIP backup, or a database-only PostgreSQL custom dump,
-and loads it into PostgreSQL as a template database.
+Import or refresh a template from an Odoo database manager, an S3 prefix,
+a local directory, or a local dump file. See [Templates](templates.md)
+for the raw dump plus `filestore/` layout and migration examples.
 
-Lock: template. Does not take the team lock: the imported template is always new, so nothing is remounted and other environments keep running.
+Lock: template; overwrite and refresh also take the team lock to protect live
+filestore overlays. Fresh imports can run alongside environment operations.
 { .odu-tool-meta }
 
 **Parameters**
 
-`odoo_url`
-:   *str · required* — Base URL of the Odoo instance (e.g. `https://my-odoo.example.com`).
+`source`
+:   *str · default empty* — An http(s) Odoo URL, `s3://bucket/prefix`, or an absolute local path. Omit with `refresh=True`.
 
 `master_pwd`
-:   *str · required* — Odoo master password (database manager password).
+:   *str · default empty* — Required only for the Odoo database-manager source.
 
 `db_name`
-:   *str · default empty* — Database to back up. Empty auto-detects, and fails if several databases exist.
+:   *str · default empty* — Odoo database to back up. Empty auto-detects, and fails if several databases exist.
 
 `template_name`
-:   *str · default `"default"`* — Template profile to create.
+:   *str · default `"default"`* — Template profile to create or update.
 
 `without_filestore`
-:   *bool · default `False`* — Request a database-only PostgreSQL custom dump instead of the full ZIP.
+:   *bool · default `False`* — Import only the dump. Existing attachments are preserved on overwrite; a single local dump file also preserves them.
+
+`overwrite`
+:   *bool · default `False`* — S3/local only: incrementally replace template data. Unchanged dumps skip restore; deleted source attachments are removed, including when the source tree becomes empty. Requires explicit permission.
+
+`refresh`
+:   *bool · default `False`* — With no source, restore from the template's own files and refresh metadata and overlays. Requires explicit permission.
+
+`s3_endpoint`, `s3_access_key`, `s3_secret_key`, `s3_region`
+:   *str · default empty* — S3 source connection settings. Credentials fall back to matching `[backup]` settings, then anonymous access. Supply access and secret keys together.
 
 **Use it when**
 
 - Onboarding a customer whose Odoo runs elsewhere.
-- Seeding a first template without shell access to the source server.
+- Importing a raw backup without building an archive.
+- Periodically synchronizing a backup into a development template.
 
 ### `refresh_template`
 
@@ -1578,7 +1590,7 @@ Lock: template throughout; the team lock only for the remount-and-swap, so stagi
 
 **Use it when**
 
-- A database-only import ([`import_template_from_odoo`](#import_template_from_odoo) with `without_filestore=True`) needs its attachments.
+- A database-only import ([`import_template`](#import_template) with `without_filestore=True`) needs its attachments.
 - The filestore arrives separately, e.g. rsynced from the customer's server.
 
 ## Auxiliary Services
@@ -1603,7 +1615,7 @@ Lock: service.
 :   *str · required* — Short service name (e.g. `redis`, `meilisearch`).
 
 `image`
-:   *str · required* — Docker image with tag (e.g. `redis:7`, `getmeili/meilisearch:v1.6`).
+:   *str · required* — Docker image with tag (e.g. `redis:7`, `getmeili/meilisearch:v1.6`). A staging tag from [`start_image_build`](#start_image_build) (`oduflow-build/team-<id>:<build-id>`) is taken from the local Docker daemon without a pull — see [Container Image Builds](#container-image-builds).
 
 `port`
 :   *int · default `0`* — Catch-all exposure: forward every path to this one container port. Required outside Traefik. Mutually exclusive with `routes`.
@@ -1675,7 +1687,7 @@ Lock: service.
 :   *str · default empty* — `KEY=VALUE` pairs that **fully replace** existing variables. Empty keeps them.
 
 `image`
-:   *str · default empty* — New image with tag (e.g. `redis:8`). Empty keeps the current image.
+:   *str · default empty* — New image with tag (e.g. `redis:8`). Empty keeps the current image. A staging tag from [`start_image_build`](#start_image_build) (`oduflow-build/team-<id>:<build-id>`) is taken from the local Docker daemon without a pull — see [Container Image Builds](#container-image-builds).
 
 `port`
 :   *int · default `0`* — New container port. `0` keeps the current one.
@@ -2182,6 +2194,18 @@ configuration keeps the reference.
 
 Requires a `[team.X.image_registry]` section in `oduflow.toml`.
 
+A succeeded build is kept in the host's Docker daemon under a **staging tag**,
+`oduflow-build/team-<id>:<build-id>` (reported by
+[`get_image_build`](#get_image_build)). That tag can be passed directly as the
+`image` of [`create_service`](#create_service) or
+[`update_service`](#update_service): it is resolved from the local daemon, not
+pulled from a registry, so a build can be run and checked as an auxiliary
+service *before* [`publish_image_build`](#publish_image_build) pushes it
+anywhere. These service operations accept only the team's own staging images.
+Automatic build retention preserves tags referenced by running or stopped
+containers. Unused staging tags remain temporary and can be pruned; use a
+published tag to restore a service after pruning or move it to a new host.
+
 ### `start_image_build`
 
 Build a container image from the environment checkout's **current HEAD commit**
@@ -2368,10 +2392,10 @@ once and mounted into environments. See
 
 ### `add_extra_repo`
 
-Clone an extra addons repository. It is cloned as a **shallow bare** repo (only
-the latest commit of each branch, no history) into the shared repos directory,
-so large repositories like Odoo Enterprise clone quickly. All branches are
-kept, so one clone serves any Odoo version.
+Register an extra addons repository. Registration checks access and reads the
+remote branch list; **no code is downloaded**. The first environment that uses a
+branch downloads only that branch's latest commit (no history), so a large
+multi-version repository costs only the versions in use.
 
 **Parameters**
 
@@ -2381,6 +2405,9 @@ kept, so one clone serves any Odoo version.
 `repo_url`
 :   *str · required* — HTTPS (`https://github.com/owner/repo.git`) or SSH (`git@github.com:owner/repo.git`, needs the team deploy key — see [`get_ssh_public_key`](#get_ssh_public_key)).
 
+`branches`
+:   *str · default empty* — Comma-separated branch names to download now instead of on first use. Empty downloads nothing yet. The dashboard provides a remote branch picker; REST accepts a list.
+
 **Use it when**
 
 - Making Odoo Enterprise available to environments.
@@ -2388,7 +2415,8 @@ kept, so one clone serves any Odoo version.
 
 ### `list_extra_repos`
 
-List all cloned extra addons repositories.
+List extra addons repositories with their downloaded branches and the branch
+list last read from the remote.
 
 **Parameters**
 
@@ -2396,26 +2424,31 @@ List all cloned extra addons repositories.
 
 **Use it when**
 
-- Finding the exact name to use in an `extra_addons` argument.
+- Finding the exact name and branch to use in an `extra_addons` argument.
 
 ### `update_extra_repo`
 
-Fetch the latest changes from the remote, fetching all branches and pruning
-deleted remote refs.
+Refresh the remote branch list and fetch the latest changes of every downloaded
+branch, pruning branches deleted on the remote. Branches never used stay
+undownloaded (repositories added by older Oduflow versions still fetch all
+branches).
 
 **Parameters**
 
 `name`
 :   *str · required* — The extra repo to update (e.g. `enterprise`).
 
+`add_branch`
+:   *str or list of str · default empty* — A branch, or a list of branches, to download now and keep updated (e.g. `17.0` or `["17.0", "18.0"]`), instead of waiting for their first use. A branch missing on the remote fails the call before anything is downloaded; a failed fetch leaves the tracked set unchanged.
+
 **Use it when**
 
-- A new Odoo version branch appeared upstream.
+- Warming up a branch before the first environment needs it.
 - An environment needs a fix that landed in the shared addons repo.
 
 ### `delete_extra_repo`
 
-Delete a cloned extra addons repository.
+Delete an extra addons repository.
 
 **Parameters**
 
@@ -2485,6 +2518,9 @@ Lock: production.
 
 `env_vars`
 :   *dict · default none* — User environment variables; values may be `secret:<name>` references. Omit to inherit the source environment's variables; pass `{}` to inherit none. Managed `HOST`/`PORT`/`USER`/`PASSWORD` cannot be overridden. References survive reconfiguration.
+
+`server_mode`
+:   *str · default `workers`* — How Odoo serves HTTP. `workers` (sync): worker processes on port 8069 serve the pages and Traefik sends only the live bus (`/websocket`, `/longpolling`) to the gevent port 8072. `gevent` (async): Traefik sends **all** traffic to the single gevent process on 8072 — suits many long-lived or I/O-bound requests, but one CPU-heavy request slows everyone. Crons run in both modes. See [Server mode](production.md#server-mode).
 
 **Use it when**
 
@@ -2581,7 +2617,8 @@ Lock: production. **Takes the production offline.**
 
 ### `restart_production`
 
-Restart a production's Odoo container — brief downtime.
+Restart a production's Odoo container — brief downtime. A container whose
+Traefik routing is outdated is recreated instead (same downtime).
 
 Lock: production.
 { .odu-tool-meta }
@@ -2605,7 +2642,11 @@ replaced.
 
 Changeable: the public domain (Traefik host rule + Let's Encrypt), the extra
 domains, the Odoo image, the deployed branch or repository URL, the git
-credential user, the extra addon repos, and the user environment variables.
+credential user, the extra addon repos, the user environment variables, and
+the server mode. A call that changes nothing still recreates a container whose
+state drifted from the record (missing container or checkout, outdated
+Traefik routing, or a team secret whose value changed since the container was
+created).
 
 Lock: production.
 { .odu-tool-meta }
@@ -2639,8 +2680,19 @@ Lock: production.
 `env_vars`
 :   *dict · default none* — **Full replacement** user environment variables, including `secret:<name>` references. Omit to preserve; `{}` clears them.
 
+`server_mode`
+:   *str · default empty* — `workers` (sync: pages on 8069, bus on 8072) or `gevent` (async: everything on 8072). Re-tunes the `odoo.conf` workers and re-points Traefik. Omit to leave unchanged.
+
+`recreate`
+:   *bool · default false* — Recreate the container even when no setting, secret value or runtime state differs from the record.
+
 **Use it when**
 
+- A team secret used by the production got a new value: call it with just the
+  name. Secret values reach the container only when it is created, so
+  [`restart_production`](#restart_production) keeps the old value; this call
+  detects the changed value, recreates the container and lists the affected
+  variables (names only).
 - A customer's domain changes, or they bring their own.
 - Moving production onto a release branch.
 - Adding an addons repository production now depends on.
@@ -2811,7 +2863,7 @@ Lock: production.
 ### `production_deploys`
 
 Deploy history, newest last: commits, actions, modules, status
-(`success` / `rolled_back` / `rollback_failed`) and errors.
+(`success` / `rolled_back` / `rollback_failed` / `skipped`) and errors.
 
 **Parameters**
 

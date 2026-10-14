@@ -122,6 +122,29 @@ class TestCLIInitDestroy:
 
 
 class TestCLIUpgrade:
+    @pytest.fixture(autouse=True)
+    def _no_postgres_preflight(self, monkeypatch):
+        # The PostgreSQL preflight inspects Docker; these tests cover files.
+        monkeypatch.setattr("oduflow.postgres_migration.preflight", lambda _: None)
+
+    def test_upgrade_refuses_before_reconciling_when_postgres_would_block(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        server, settings, deployed_guide = self._settings_with_changed_guide(
+            tmp_path, monkeypatch
+        )
+
+        from oduflow.errors import PrerequisiteNotMetError
+
+        def refuse(_settings):
+            raise PrerequisiteNotMetError("Delete these before upgrading PostgreSQL")
+
+        monkeypatch.setattr("oduflow.postgres_migration.preflight", refuse)
+
+        assert server._run_upgrade(settings, force=True) is False
+        assert "Delete these before upgrading" in capsys.readouterr().err
+        assert deployed_guide.read_text(encoding="utf-8") == "bundled v1\n"
+
     @staticmethod
     def _settings_with_changed_guide(tmp_path, monkeypatch):
         from oduflow import server
@@ -254,7 +277,7 @@ class TestCLIUpgrade:
         assert deployed.read_text(encoding="utf-8") == "custom\n"
 
 
-class TestImportTemplateFromOdoo:
+class TestImportTemplate:
     def _result(self, includes_filestore: bool = False):
         return {
             "template_name": "prod",
@@ -270,7 +293,7 @@ class TestImportTemplateFromOdoo:
             "remount_failures": [],
         }
 
-    @patch("oduflow.docker_ops.system_ops.import_from_odoo")
+    @patch("oduflow.docker_ops.system_ops.import_template")
     def test_cli_import_passes_without_filestore(self, mock_import, capsys):
         from oduflow.server import _run_import_template
 
@@ -279,7 +302,7 @@ class TestImportTemplateFromOdoo:
         _run_import_template(
             TEST_SETTINGS,
             TEST_TEAM,
-            odoo_url="https://odoo.example.com",
+            source="https://odoo.example.com",
             master_pwd="master",
             db_name="db",
             template_name="prod",
@@ -289,13 +312,13 @@ class TestImportTemplateFromOdoo:
         assert mock_import.call_args.kwargs["without_filestore"] is True
         assert "Filestore: not included" in capsys.readouterr().out
 
-    @patch("oduflow.docker_ops.system_ops.import_from_odoo")
+    @patch("oduflow.docker_ops.system_ops.import_template")
     def test_mcp_import_passes_without_filestore(self, mock_import):
         mock_import.return_value = self._result(includes_filestore=False)
 
         result = _call_tool(
-            "import_template_from_odoo",
-            odoo_url="https://odoo.example.com",
+            "import_template",
+            source="https://odoo.example.com",
             master_pwd="master",
             db_name="db",
             template_name="prod",
@@ -304,6 +327,57 @@ class TestImportTemplateFromOdoo:
 
         assert mock_import.call_args.kwargs["without_filestore"] is True
         assert "Filestore: not included" in result
+
+    def _s3_result(self, dump_reloaded: bool = True):
+        return {
+            "status": "synced",
+            "template_name": "prod",
+            "source_url": "s3://bucket/backups/prod",
+            "source_db": "dump.pgdump",
+            "odoo_version": "19.0",
+            "odoo_image": "odoo:19.0",
+            "template_db": "oduflow_template_1_prod",
+            "restore_seconds": 42,
+            "dump_reloaded": dump_reloaded,
+            "includes_filestore": True,
+            "downloaded_files": 12,
+            "downloaded_mb": 340.5,
+            "reused_files": 8800,
+            "removed_files": 3,
+            "affected_envs": [],
+            "remount_failures": [],
+        }
+
+    @patch("oduflow.docker_ops.system_ops.import_template")
+    def test_mcp_import_s3_without_master_pwd(self, mock_import):
+        mock_import.return_value = self._s3_result()
+
+        result = _call_tool(
+            "import_template",
+            source="s3://bucket/backups/prod",
+            template_name="prod",
+            overwrite=True,
+        )
+
+        kwargs = mock_import.call_args.kwargs
+        assert kwargs["master_pwd"] == ""
+        assert kwargs["overwrite"] is True
+        assert "synced successfully" in result
+        assert "12 fetched (340.5 MB), 8800 reused, 3 removed" in result
+        assert "DB restore time: 42s" in result
+
+    @patch("oduflow.docker_ops.system_ops.import_template")
+    def test_mcp_import_s3_reports_skipped_reload(self, mock_import):
+        mock_import.return_value = self._s3_result(dump_reloaded=False)
+
+        result = _call_tool(
+            "import_template",
+            source="s3://bucket/backups/prod",
+            template_name="prod",
+            overwrite=True,
+        )
+
+        assert "template DB reload skipped" in result
 
 
 class TestCreateEnvironmentTool:
@@ -1870,7 +1944,7 @@ class TestTemplateLocks:
 
         return oduflow.server._locks
 
-    @patch("oduflow.docker_ops.system_ops.import_from_odoo")
+    @patch("oduflow.docker_ops.system_ops.import_template")
     def test_import_runs_during_a_team_operation(self, mock_import):
         # An import refuses to touch an existing template, so the template it
         # builds is brand new and remounts nothing. It used to hold the team
@@ -1889,8 +1963,8 @@ class TestTemplateLocks:
         locks = self._locks()
         locks.acquire_team("1", operation="save_as_template")
         try:
-            _get_tool_fn("import_template_from_odoo")(
-                odoo_url="http://odoo.example.com",
+            _get_tool_fn("import_template")(
+                source="http://odoo.example.com",
                 master_pwd="secret",
                 template_name="fresh",
             )
@@ -1898,7 +1972,7 @@ class TestTemplateLocks:
             locks.release_team("1")
         mock_import.assert_called_once()
 
-    @patch("oduflow.docker_ops.system_ops.import_from_odoo")
+    @patch("oduflow.docker_ops.system_ops.import_template")
     def test_import_waits_for_the_same_template(self, mock_import):
         from oduflow.locking import template_lock_key
 
@@ -1907,8 +1981,8 @@ class TestTemplateLocks:
         locks.acquire_env(key, operation="attach_filestore")
         try:
             with pytest.raises(ToolError, match="attach_filestore"):
-                _get_tool_fn("import_template_from_odoo")(
-                    odoo_url="http://odoo.example.com",
+                _get_tool_fn("import_template")(
+                    source="http://odoo.example.com",
                     master_pwd="secret",
                     template_name="fresh",
                 )
@@ -2538,10 +2612,12 @@ class TestHttpFailClosed:
             patch("fastmcp.server.http.create_streamable_http_app"),
             patch("oduflow.web_ui.mount_web_ui"),
             patch("oduflow.reaper.start_reaper"),
-            patch("uvicorn.run") as mock_uvicorn,
+            patch("uvicorn.Config") as mock_uvicorn,
+            patch("uvicorn.Server") as mock_server,
         ):
             server._start_http()
             mock_uvicorn.assert_called_once()
+            mock_server.return_value.run.assert_called_once()
 
     def test_start_http_refuses_empty_team_map(self):
         from oduflow import server
@@ -2577,7 +2653,8 @@ class TestHttpFailClosed:
             patch("fastmcp.server.http.create_streamable_http_app"),
             patch("oduflow.web_ui.mount_web_ui"),
             patch("oduflow.reaper.start_reaper"),
-            patch("uvicorn.run") as mock_uvicorn,
+            patch("uvicorn.Config") as mock_uvicorn,
+            patch("uvicorn.Server"),
         ):
             server._start_http()
             _, kwargs = mock_uvicorn.call_args
@@ -2608,7 +2685,8 @@ class TestHttpFailClosed:
                 "_traefik_forwarded_allow_ips",
                 return_value=["127.0.0.1", "172.18.0.0/16"],
             ),
-            patch("uvicorn.run") as mock_uvicorn,
+            patch("uvicorn.Config") as mock_uvicorn,
+            patch("uvicorn.Server"),
         ):
             server._start_http()
             _, kwargs = mock_uvicorn.call_args
