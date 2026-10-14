@@ -2652,6 +2652,7 @@ def _create_environment_impl(
         odoo_conf_to_copy,
         extra_conf_paths,
         resolve_main_addons_path(repo_path),
+        odoo_image=odoo_image,
     )
 
     template_upgrades: dict[str, tuple[str, str]] = {}
@@ -4372,6 +4373,7 @@ def _reapply_odoo_conf(
         generated_conf,
         extra_container_paths,
         main_addons_path,
+        odoo_image=labels.get(settings.image_label, ""),
     )
     _copy_file_to_container(container, generated_conf, "/etc/odoo")
     return True

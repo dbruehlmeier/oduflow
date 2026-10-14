@@ -19,7 +19,7 @@ logger = logging.getLogger("oduflow")
 
 TRACE: bool = False
 
-DEFAULT_AGENT_IMAGE = "oduist/oduflow-coder:0.3.3"
+DEFAULT_AGENT_IMAGE = "oduist/oduflow-coder:0.3.4"
 DEFAULT_POSTGRES_IMAGE = "postgres:16"
 _LEGACY_AGENT_IMAGE = "oduist/oduflow-coder:latest"
 
