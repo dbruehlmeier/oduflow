@@ -265,7 +265,13 @@ def _describe_key(key: str, with_team: bool = False) -> str:
     "environment 'main'" otherwise. *with_team* names the team for messages
     that span teams."""
     if _is_prod_key(key):
-        _prefix, team_id, name = key.split(":", 2)
+        parts = key.split(":", 2)
+        if len(parts) < 3:
+            # The cluster-wide key ("prod:__cluster__") has no team/name parts;
+            # crashing here turned every contended scheduled base backup into a
+            # ValueError instead of a clean BusyError.
+            return "the production cluster"
+        _prefix, team_id, name = parts
         suffix = f" of team '{team_id}'" if with_team else ""
         return f"production '{name}'{suffix}"
     return f"environment '{key}'"
