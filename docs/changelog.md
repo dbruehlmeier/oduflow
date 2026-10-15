@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Fixes
+
+- **Share links open from email** — a share link opened from another site, such
+  as a button in a webmail message, landed on "This link is missing its key":
+  the browser kept the other site as initiator across the redirect and withheld
+  the SameSite=Strict share cookie. The link now answers with a small landing
+  page that navigates to `/env/<name>` itself, so the cookie stays Strict and
+  the key still leaves the address bar.
+
 ## v1.88.0
 
 ### Features
