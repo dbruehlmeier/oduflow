@@ -197,8 +197,12 @@ https://your-server.com/env/<env>?key=<share-secret>
 ```
 
 Opening it trades the key for a signed, HTTP-only, SameSite=Strict cookie and
-redirects to the clean `/env/<env>`, so the key does not linger in the address
-bar or browser history. The same modal regenerates or revokes the link; both
+moves on to the clean `/env/<env>`, so the key does not linger in the address
+bar or browser history. The move is a navigation started by a small landing
+page rather than an HTTP redirect: when the link is opened from another site,
+such as a webmail button, the browser treats a redirect chain as cross-site and
+withholds the Strict cookie, while a navigation started by the landing page is
+same-site. The same modal regenerates or revokes the link; both
 take effect immediately, including for sessions already opened with it, because
 the cookie carries a fingerprint of the secret it was minted from. Links have no
 expiry of their own; a session cookie lasts seven days and re-opening the link

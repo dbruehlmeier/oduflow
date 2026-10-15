@@ -1124,6 +1124,17 @@ def _build_routes(
                 return team
         return None
 
+    def _share_landing_page(target: str) -> str:
+        url = html.escape(target, quote=True)
+        return (
+            '<!doctype html><html><head><meta charset="utf-8">'
+            f'<meta http-equiv="refresh" content="0;url={url}">'
+            "<title>Opening environment</title></head>"
+            f'<body><p><a href="{url}">Open the environment</a></p>'
+            f"<script>location.replace({json.dumps(target)});</script>"
+            "</body></html>"
+        )
+
     def _share_link_error(message: str, status_code: int) -> Response:
         return Response(message, status_code=status_code, media_type="text/plain")
 
@@ -1156,7 +1167,14 @@ def _build_routes(
             # Land on the clean URL so the key leaves the address bar, browser
             # history, and any Referer sent by the page's own requests.
             target = ui_scope.PAGE_PREFIX + quote(env_name, safe="/")
-            response: Response = RedirectResponse(target, status_code=303)
+            # Not an HTTP redirect: a link opened from another site (a webmail
+            # button) keeps that site as the initiator across redirects, so the
+            # browser withholds the SameSite=Strict cookie on the landing
+            # request. A navigation started by this page is same-site.
+            response: Response = HTMLResponse(
+                _share_landing_page(target),
+                headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"},
+            )
             response.set_cookie(
                 ui_scope.SHARE_COOKIE,
                 _make_share_token(settings, team, env_name, key),
