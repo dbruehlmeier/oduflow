@@ -203,6 +203,19 @@ aws s3 sync ~/.local/share/Odoo/filestore/mydb/ s3://mybucket/backups/mydb/files
 oduflow import-template s3://mybucket/backups/mydb/ --template-name prod
 ```
 
+### In the dashboard
+
+**Templates → Import from S3** fills the same request in a form. Enter the
+connection (endpoint — empty for AWS — region, access key ID, secret key),
+type a bucket or leave it empty, and **Browse**: the dialog walks the bucket
+one folder at a time, newest files first, and marks the folder that holds a
+recognized dump. **Use this folder** fills in the source and suggests a
+template name. You can also type the prefix directly.
+
+A template imported this way is tagged **S3** in the list and gains a **Sync**
+button — the same incremental re-sync as `--overwrite`, with the connection
+and the stored secret already filled in.
+
 How it behaves, in the order it matters at scale:
 
 - **Parallel + resumable.** Filestore files download on several connections;
@@ -216,15 +229,55 @@ How it behaves, in the order it matters at scale:
   if the dump's S3 ETag is unchanged since the last sync — skips the dump
   download *and* the template DB reload. This makes a periodic
   "pull the latest production backup into dev" job cheap.
-- **Credentials.** `--s3-access-key`/`--s3-secret-key` (with `--s3-endpoint`
-  for MinIO or other S3-compatible stores, and `--s3-region` when required)
-  win; otherwise the `[backup]` settings are reused when the bucket matches;
+- **Credentials, remembered.** `--s3-access-key`/`--s3-secret-key` (with
+  `--s3-endpoint` for MinIO or other S3-compatible stores, and `--s3-region`
+  when required) win; otherwise the secret remembered for this template is
+  reused; otherwise the `[backup]` settings when the bucket matches;
   otherwise the bucket is read anonymously (public bucket).
+
+    **The secret key is never written into template metadata.** A raw value is
+    stored as the team secret `s3-template-<template>` (visible under
+    **Credentials → Secrets** in the dashboard, where it can be rotated) and
+    the metadata records only a `secret:<name>` reference, so no template
+    listing, metadata editor or MCP tool can echo it back. Pass
+    `secret:<name>` yourself to sign with an existing team secret instead —
+    Oduflow then leaves that secret alone.
+
+    So a re-sync of a private bucket needs **no key at all**: omit
+    `--s3-secret-key` and the stored one signs the request. It is required
+    again when the endpoint or the access key changes, so a stored secret is
+    never sent to a different endpoint or key pair. To keep the key out of
+    `~/.bash_history`, `--s3-secret-key` defaults to `$ODUFLOW_S3_SECRET_KEY`.
+
+    A secret Oduflow created is deleted together with the template, and
+    released when the template is re-published from an environment or a
+    production (its data no longer comes from the bucket).
 - **Metadata.** The Odoo version, image, and installed modules are read from
   the restored database; `snapshot_at` records the dump's upload time, so
   template freshness reflects the data, not the import.
 
 `--without-filestore` skips the `filestore/` tree for a database-only import.
+
+### An Odoo backup `.zip` already in the bucket
+
+If what you have is a backup `.zip` — written by Odoo's own database manager,
+or downloaded from Odoo.sh — point the import straight at that object instead
+of a folder:
+
+```bash
+oduflow import-template s3://mybucket/backups/acme-2026-10-13.zip --template-name prod
+```
+
+A key ending in `.zip` is unpacked as an Odoo backup (`dump.sql` plus
+`filestore/`); anything else is read as a prefix holding the raw layout. A
+re-sync with `--overwrite` still costs nothing while the object's ETag is
+unchanged.
+
+Prefer the raw layout for a large database when you can choose. A zip has to
+be fetched whole every time it changes, its filestore replaces the template's
+wholesale instead of syncing file by file, and an interrupted download starts
+over — all of which the raw layout avoids. The `.zip` shape exists for the
+archive you already have, not as the recommended way to make one.
 
 ## Importing from a Local Path
 
