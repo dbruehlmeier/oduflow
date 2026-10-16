@@ -30,7 +30,7 @@
 
 FROM node:24-bookworm-slim
 
-ARG CODER_VERSION=0.3.4
+ARG CODER_VERSION=0.3.5
 LABEL org.opencontainers.image.title="oduflow-coder" \
       org.opencontainers.image.version="${CODER_VERSION}" \
       org.opencontainers.image.source="https://github.com/oduflow/oduflow"
@@ -88,12 +88,12 @@ RUN usermod --login agent --home /home/agent --move-home --shell /bin/bash node 
 # MIT component:
 #   - OpenCode, including its native `opencode acp` server. The coder image is
 #     immutable, and Oduflow disables OpenCode's runtime self-update per session.
-# NOTE: the Codex ACP bridge package is still settling (published
-# `@agentclientprotocol/codex-acp`, `@zed-industries/codex-acp` on GitHub, and an
-# emerging native `codex --acp`). Confirm the working one at build time.
+# Codex and its ACP adapter are pinned like agent-browser: the image is immutable
+# and Agent CLI disables Codex's own update check, so a new Codex arrives only with
+# a new coder image (bump both versions deliberately and re-check Agent Chat).
 RUN npm install -g \
-        @openai/codex \
-        @agentclientprotocol/codex-acp \
+        @openai/codex@0.162.1 \
+        @agentclientprotocol/codex-acp@2.2.2 \
         opencode-ai \
         agent-browser@0.32.3 \
     && npm cache clean --force
