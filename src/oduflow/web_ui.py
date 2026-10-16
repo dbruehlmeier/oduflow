@@ -683,6 +683,11 @@ def _acp_adapter_cmd(agent_type: str) -> list[str]:
 
 _CLAUDE_AUTH_GUIDANCE_MARKER = "Oduflow authentication guidance:"
 _OPENCODE_AUTH_GUIDANCE_MARKER = "Oduflow OpenCode authentication guidance:"
+_CODEX_AUTH_GUIDANCE_MARKER = "Oduflow Codex authentication guidance:"
+# ACP's ``auth_required`` error code. codex-acp answers session/new with it
+# when Codex has no sign-in, and session/prompt when the provider rejects the
+# credential (HTTP 401); quota and rate-limit failures use other codes.
+_ACP_AUTH_REQUIRED_CODE = -32000
 
 
 def _annotate_acp_auth_error(
@@ -696,11 +701,14 @@ def _annotate_acp_auth_error(
     failures must remain untouched: silently trying a different credential
     could switch accounts or billing modes.
 
+    ``auth_mode`` is the agent's effective credential mode
+    (``env_ops._claude_auth_mode`` or ``env_ops._codex_auth_mode``).
+
     The guidance and the marker that makes this idempotent are rebranded
     together: the marker is what the next frame is checked against, so a brand
     in one but not the other would append the guidance again on every frame.
     """
-    if agent_type not in {"claude", "opencode"}:
+    if agent_type not in {"claude", "codex", "opencode"}:
         return frame
     try:
         message = json.loads(frame)
@@ -728,6 +736,37 @@ def _annotate_acp_auth_error(
             "then restart Oduflow."
         )
         error["message"] = f"{error_message}\n\n{guidance_marker} {guidance}"
+        return json.dumps(message, separators=(",", ":"), ensure_ascii=False)
+
+    if agent_type == "codex":
+        if error.get("code") != _ACP_AUTH_REQUIRED_CODE or not lowered.startswith(
+            "authentication required"
+        ):
+            return frame
+        guidance_marker = brand.rebrand(_CODEX_AUTH_GUIDANCE_MARKER)
+        if guidance_marker in error_message:
+            return frame
+        if auth_mode == "api_key":
+            guidance = (
+                "Codex is using OPENAI_API_KEY: the agent container signs in "
+                "with it on every start, replacing any ChatGPT sign-in. Update "
+                "or remove that key in "
+                f"[team.{team_id}.agent_env] (or the single-team server "
+                "environment), then restart Oduflow."
+            )
+        else:
+            guidance = (
+                "Codex is not signed in, or its sign-in has expired. Open Agent "
+                'CLI for this environment, choose "Sign in with Device Code" '
+                '(the "Sign in with ChatGPT" browser callback cannot reach the '
+                "container), then reopen Agent Chat. If Codex opens without "
+                "offering a sign-in, run /logout there and reopen Agent CLI. "
+                f"Alternatively set OPENAI_API_KEY in [team.{team_id}.agent_env] "
+                "(or the single-team server environment) and restart Oduflow."
+            )
+        error["message"] = (
+            f"{error_message}\n\n{guidance_marker} {brand.rebrand(guidance)}"
+        )
         return json.dumps(message, separators=(",", ":"), ensure_ascii=False)
 
     specific_markers = (
@@ -779,10 +818,17 @@ def _codex_cli_cmd(mcp_url: str, model: str = "") -> list[str]:
     per-team and runs as the unprivileged ``agent`` user. Disabling Codex's
     nested Linux sandbox avoids requiring user namespaces (bubblewrap), which
     Docker's default seccomp profile intentionally blocks.
+
+    The startup update check is off, like OpenCode's self-update: an
+    in-container ``npm install -g`` would not survive container recreation, and
+    the immutable coder image pins the agent versions. Only the TUI checks;
+    the ACP adapter (Agent Chat) has no update prompt.
     """
     cmd = [
         "codex",
         "--dangerously-bypass-approvals-and-sandbox",
+        "-c",
+        "check_for_update_on_startup=false",
         "-c",
         f'mcp_servers.{env_ops.AGENT_MCP_SERVER}.url="{mcp_url}"',
         "-c",
@@ -919,16 +965,27 @@ def _confirm_before_start(cmd: list[str], warning: str) -> list[str]:
 
 
 def _wire_client_acp_mcp(
-    frame: str, mcp_url: str, mcp_token: str, browser_session: str
+    frame: str,
+    mcp_url: str,
+    mcp_token: str,
+    browser_session: str,
+    *,
+    include_browser: bool = True,
 ) -> str:
     """Inject built-in MCP servers into client-configurable ACP sessions.
 
     The browser intentionally knows neither URL nor token. The WebSocket relay
     augments only ``session/new``/``session/load``/``session/resume`` frames on
-    their way to Codex/OpenCode, using ACP's client-provided MCP contract. Agent
-    Browser is a local credentialless stdio server. Oduflow is added only when a
-    scoped token exists; that credential lives only in this exec's environment
-    and stdio and is never returned to the browser or disk.
+    their way to Codex/OpenCode, using ACP's client-provided MCP contract.
+    Client-supplied entries under the built-in names are always dropped. Oduflow
+    is added only when a scoped token exists; that credential lives only in this
+    exec's environment and stdio and is never returned to the browser or disk.
+
+    Agent Browser, a local credentialless stdio server, is added only when
+    ``include_browser`` is set (OpenCode). Codex must not receive it: the coder
+    image's Codex config already defines ``agent_browser`` (forwarding
+    ``AGENT_BROWSER_SESSION`` from the exec environment), and codex-acp reports
+    a same-named client server as a failed startup in every new chat.
     """
     try:
         message = json.loads(frame)
@@ -956,20 +1013,21 @@ def _wire_client_acp_mcp(
             env_ops.LEGACY_AGENT_MCP_SERVER,
         }
     ]
-    servers.append(
-        {
-            "name": "agent_browser",
-            "command": "agent-browser",
-            "args": ["mcp", "--tools", "all"],
-            "env": [
-                {"name": "AGENT_BROWSER_SESSION", "value": browser_session},
-                {
-                    "name": "AGENT_BROWSER_EXECUTABLE_PATH",
-                    "value": "/usr/bin/chromium",
-                },
-            ],
-        }
-    )
+    if include_browser:
+        servers.append(
+            {
+                "name": "agent_browser",
+                "command": "agent-browser",
+                "args": ["mcp", "--tools", "all"],
+                "env": [
+                    {"name": "AGENT_BROWSER_SESSION", "value": browser_session},
+                    {
+                        "name": "AGENT_BROWSER_EXECUTABLE_PATH",
+                        "value": "/usr/bin/chromium",
+                    },
+                ],
+            }
+        )
     if mcp_token:
         servers.append(
             {
@@ -5986,7 +6044,11 @@ def _build_routes(
             agent_type = agent_config.resolve_agent_type(
                 websocket.query_params.get("type"), team
             )
-            claude_auth_mode = env_ops._claude_auth_mode(settings, team)
+            auth_mode = (
+                env_ops._codex_auth_mode(settings, team)
+                if agent_type == "codex"
+                else env_ops._claude_auth_mode(settings, team)
+            )
 
             container_name = get_agent_container_name(team.team_id, settings.prefix)
             try:
@@ -6130,7 +6192,7 @@ def _build_routes(
                                 frame = _annotate_acp_auth_error(
                                     frame,
                                     agent_type,
-                                    claude_auth_mode,
+                                    auth_mode,
                                     team.team_id,
                                 )
                                 await websocket.send_text(frame)
@@ -6146,11 +6208,14 @@ def _build_routes(
                         if not text:
                             continue
                         if agent_type in {"codex", "opencode"}:
+                            # Codex gets Agent Browser from its config.toml;
+                            # a second copy here is reported as a failure.
                             text = _wire_client_acp_mcp(
                                 text,
                                 mcp_url,
                                 mcp_token or "",
                                 os.path.basename(checkout),
+                                include_browser=agent_type == "opencode",
                             )
                         frame = text if text.endswith("\n") else text + "\n"
                         await loop.run_in_executor(
