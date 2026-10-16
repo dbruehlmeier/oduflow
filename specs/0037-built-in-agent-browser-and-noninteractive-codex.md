@@ -76,7 +76,9 @@ blocks; Oduflow does not weaken that outer profile to make a nested sandbox run.
   session-open frames: codex-acp 2.2.2 skipped the duplicate of the HOME-config
   entry and reported it as a failed tool call in every new Agent Chat. The
   config entry forwards `AGENT_BROWSER_SESSION`, so per-environment profiles
-  are unchanged.
+  are unchanged. The image now pins Codex to the version codex-acp itself
+  depends on (the adapter runs that package, not the `codex` on PATH), so
+  Agent CLI and Agent Chat run one Codex.
 - 2026-07-24 — extended the same browser and container-boundary trust model to
   OpenCode: Agent CLI uses auto approval, native ACP uses `permission = allow`,
   and both receive the environment-specific Agent Browser profile.

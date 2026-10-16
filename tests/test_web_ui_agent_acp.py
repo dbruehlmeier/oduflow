@@ -382,6 +382,8 @@ def test_codex_auth_error_with_a_key_says_the_key_is_in_use():
 
     assert "Codex is using OPENAI_API_KEY" in message
     assert "[team.9.agent_env]" in message
+    # A valid key whose start-up `codex login` failed is not the key's fault.
+    assert "agent container's log" in message
     assert "Device Code" not in message
 
 

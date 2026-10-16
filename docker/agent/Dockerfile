@@ -90,13 +90,22 @@ RUN usermod --login agent --home /home/agent --move-home --shell /bin/bash node 
 #     immutable, and Oduflow disables OpenCode's runtime self-update per session.
 # Codex and its ACP adapter are pinned like agent-browser: the image is immutable
 # and Agent CLI disables Codex's own update check, so a new Codex arrives only with
-# a new coder image (bump both versions deliberately and re-check Agent Chat).
+# a new coder image. codex-acp does not run the `codex` on PATH: it resolves the
+# @openai/codex package it depends on, so the adapter version decides Agent Chat's
+# Codex. Pin the CLI to that same version so Agent CLI and Agent Chat run one
+# Codex over one ~/.codex; the build fails when a bump moves only one of them.
 RUN npm install -g \
-        @openai/codex@0.162.1 \
+        @openai/codex@0.160.1 \
         @agentclientprotocol/codex-acp@2.2.2 \
         opencode-ai \
         agent-browser@0.32.3 \
-    && npm cache clean --force
+    && npm cache clean --force \
+    && root="$(npm root -g)" \
+    && cli="$(node -p "require('$root/@openai/codex/package.json').version")" \
+    && chat="$(node -p "require(require.resolve('@openai/codex/package.json', {paths: ['$root/@agentclientprotocol/codex-acp/dist']})).version")" \
+    && if [ "$cli" != "$chat" ]; then \
+           echo "Codex CLI $cli differs from codex-acp's Codex $chat" >&2; exit 1; \
+       fi
 
 # Agent auth + sessions live under HOME (mounted from the persistent home
 # volume: ~/.claude.json, ~/.claude/ incl. projects/ = sessions, ~/.codex/,

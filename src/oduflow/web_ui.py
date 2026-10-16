@@ -752,7 +752,9 @@ def _annotate_acp_auth_error(
                 "with it on every start, replacing any ChatGPT sign-in. Update "
                 "or remove that key in "
                 f"[team.{team_id}.agent_env] (or the single-team server "
-                "environment), then restart Oduflow."
+                "environment), then restart Oduflow. If the key is valid, the "
+                "agent container's log shows whether that start-up sign-in "
+                "failed."
             )
         else:
             guidance = (
@@ -760,7 +762,8 @@ def _annotate_acp_auth_error(
                 'CLI for this environment, choose "Sign in with Device Code" '
                 '(the "Sign in with ChatGPT" browser callback cannot reach the '
                 "container), then reopen Agent Chat. If Codex opens without "
-                "offering a sign-in, run /logout there and reopen Agent CLI. "
+                "offering a sign-in (for example, still signed in with a removed "
+                "OPENAI_API_KEY), run /logout there and reopen Agent CLI. "
                 f"Alternatively set OPENAI_API_KEY in [team.{team_id}.agent_env] "
                 "(or the single-team server environment) and restart Oduflow."
             )
@@ -968,9 +971,7 @@ def _wire_client_acp_mcp(
     frame: str,
     mcp_url: str,
     mcp_token: str,
-    browser_session: str,
-    *,
-    include_browser: bool = True,
+    browser_session: str | None,
 ) -> str:
     """Inject built-in MCP servers into client-configurable ACP sessions.
 
@@ -981,11 +982,12 @@ def _wire_client_acp_mcp(
     is added only when a scoped token exists; that credential lives only in this
     exec's environment and stdio and is never returned to the browser or disk.
 
-    Agent Browser, a local credentialless stdio server, is added only when
-    ``include_browser`` is set (OpenCode). Codex must not receive it: the coder
-    image's Codex config already defines ``agent_browser`` (forwarding
-    ``AGENT_BROWSER_SESSION`` from the exec environment), and codex-acp reports
-    a same-named client server as a failed startup in every new chat.
+    Agent Browser, a local credentialless stdio server, is added only when a
+    ``browser_session`` profile name is given (OpenCode). Codex passes None and
+    must not receive it: the coder image's Codex config already defines
+    ``agent_browser`` (forwarding ``AGENT_BROWSER_SESSION`` from the exec
+    environment), and codex-acp reports a same-named client server as a failed
+    startup in every new chat.
     """
     try:
         message = json.loads(frame)
@@ -1013,7 +1015,7 @@ def _wire_client_acp_mcp(
             env_ops.LEGACY_AGENT_MCP_SERVER,
         }
     ]
-    if include_browser:
+    if browser_session is not None:
         servers.append(
             {
                 "name": "agent_browser",
@@ -6044,11 +6046,12 @@ def _build_routes(
             agent_type = agent_config.resolve_agent_type(
                 websocket.query_params.get("type"), team
             )
-            auth_mode = (
-                env_ops._codex_auth_mode(settings, team)
-                if agent_type == "codex"
-                else env_ops._claude_auth_mode(settings, team)
-            )
+            # Only Claude and Codex guidance depends on the credential mode.
+            auth_mode_of = {
+                "claude": env_ops._claude_auth_mode,
+                "codex": env_ops._codex_auth_mode,
+            }.get(agent_type)
+            auth_mode = auth_mode_of(settings, team) if auth_mode_of else ""
 
             container_name = get_agent_container_name(team.team_id, settings.prefix)
             try:
@@ -6214,8 +6217,9 @@ def _build_routes(
                                 text,
                                 mcp_url,
                                 mcp_token or "",
-                                os.path.basename(checkout),
-                                include_browser=agent_type == "opencode",
+                                os.path.basename(checkout)
+                                if agent_type == "opencode"
+                                else None,
                             )
                         frame = text if text.endswith("\n") else text + "\n"
                         await loop.run_in_executor(

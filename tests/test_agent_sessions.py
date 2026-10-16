@@ -466,8 +466,7 @@ def test_wire_client_acp_mcp_without_browser_for_codex():
             frame,
             "http://scoped/mcp/env",
             "scoped-token",
-            "environment-x",
-            include_browser=False,
+            None,
         )
     )
     assert wired["params"]["mcpServers"] == [
@@ -488,9 +487,7 @@ def test_wire_client_acp_mcp_without_browser_for_codex():
             "params": {"sessionId": "sid", "cwd": "/workspace", "mcpServers": []},
         }
     )
-    no_token = json.loads(
-        _wire_client_acp_mcp(load, "http://scoped", "", "env", include_browser=False)
-    )
+    no_token = json.loads(_wire_client_acp_mcp(load, "http://scoped", "", None))
     assert no_token["params"]["mcpServers"] == []
 
 
