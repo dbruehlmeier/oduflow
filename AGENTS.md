@@ -49,11 +49,8 @@ ruff format src/oduflow tests
 # Type check
 mypy src/oduflow
 
-# Tests (default: excludes heavyweight)
+# Tests (default: unit tests only, no Docker; integration and heavyweight are opt-in)
 pytest
-
-# Run only unit tests (no Docker required)
-pytest -m "not integration and not heavyweight"
 
 # Run integration tests (requires Docker)
 pytest -m integration
@@ -126,7 +123,9 @@ MCP Clients (Cursor, Claude, etc.)
 ## Testing
 
 - Test markers: `integration` (needs Docker), `heavyweight` (slow full cycles)
-- Default `addopts` in `pyproject.toml` excludes heavyweight tests
+- Default `addopts` in `pyproject.toml` excludes integration and heavyweight tests; select them
+  explicitly with `-m integration` / `-m heavyweight`. They create and destroy real Docker
+  resources, so do not run them on a machine whose live Oduflow server must stay untouched
 - Mocking pattern: patch `oduflow.docker_ops.*` functions, not Docker SDK directly
 - `conftest.py` at root ignores `src/**` for collection (tests live in `tests/`)
 - When you launch Oduflow itself for testing (starting the server, `stack apply`), always pass the global `--no-telemetry` flag before any subcommand — e.g. `oduflow --no-telemetry --transport http` — so test runs are not counted in usage telemetry
