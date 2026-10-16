@@ -5466,7 +5466,9 @@ def create_production(
 
     Args:
         name: Production name, e.g. "erp" (lowercase letters/digits/dashes).
-        repo_url: HTTPS git repository URL. Required unless from_environment
+        repo_url: Repository URL — HTTPS (https://github.com/owner/repo.git)
+                or SSH (git@github.com:owner/repo.git, needs the team deploy
+                key, see get_ssh_public_key). Required unless from_environment
                 is given (then it defaults to the environment's).
         branch: Git branch to deploy (full history is kept). Required unless
                 from_environment is given.
@@ -5582,8 +5584,10 @@ def sync_production_mcp(name: str = "", ctx: Context | None = None) -> str:
 
     Empty name processes every production of this team, reporting failures
     separately. Use after changing production_token in TOML and restarting
-    Oduflow. No secret is accepted or returned. Stopped productions must be
-    started first. Adding the managed addon mount recreates the container.
+    Oduflow, or after moving a production to another Odoo version. No secret
+    is accepted or returned. Stopped productions must be started first. Adding
+    the managed addon mount, or replacing a checkout made for another Odoo
+    version, recreates the container.
     """
     from oduflow import production_mcp
 

@@ -380,10 +380,10 @@ def _build_prod_odoo_conf(
                 logger.warning("Ignoring odoo.conf override for '%s': %s", name, exc)
                 continue
         overrides[key] = str(value)
-    from oduflow.production_mcp import MOUNT, addon_checkout
+    from oduflow.production_mcp import MOUNT, managed_module
 
     extra_container_paths = list(extra_container_paths)
-    if (addon_checkout(team, name) / "addons/odumcp/__manifest__.py").is_file():
+    if (managed_module(team, name) / "__manifest__.py").is_file():
         extra_container_paths.append(MOUNT)
     generated = output_path or os.path.join(_workspace(team, name), "odoo.conf")
     generate_odoo_conf(
@@ -975,9 +975,9 @@ def _container_spec(
     odoo_volumes: dict[str, dict[str, str]] = {
         repo_path: {"bind": "/mnt/extra-addons", "mode": "rw"}
     }
-    from oduflow.production_mcp import MOUNT, addon_checkout
+    from oduflow.production_mcp import MOUNT, managed_module
 
-    connector = addon_checkout(team, name) / "addons/odumcp"
+    connector = managed_module(team, name)
     if (connector / "__manifest__.py").is_file():
         odoo_volumes[str(connector)] = {"bind": MOUNT + "/odumcp", "mode": "ro"}
     for host_path, container_path in extra_mount_paths:
@@ -1259,11 +1259,35 @@ def create_production(
                 extra_mount_paths.append((wt_path, f"/mnt/extra-addons-{repo_name}"))
                 extra_conf_paths.append(resolve_extra_addons_path(wt_path, repo_name))
 
+        # Pulled before the OduMCP addon is chosen: an unversioned custom tag
+        # is asked for its Odoo version, and a stale local copy of a moving tag
+        # would pick the wrong addon series.
+        image_cleanup.note_image_requested(odoo_image)
+        try:
+            logger.info("Pulling image %s", odoo_image)
+            client.images.pull(odoo_image)
+        except Exception as exc:
+            logger.warning(
+                "Could not pull image %s, using local copy: %s", odoo_image, exc
+            )
+
         from oduflow import production_mcp
 
         mcp_warning = ""
+        mcp_status = "sync_failed"
         try:
-            production_mcp.prepare_addon(settings, team, name, extra_mount_paths)
+            production_mcp.prepare_addon(
+                settings, team, name, extra_mount_paths, odoo_image
+            )
+        except PrerequisiteNotMetError as exc:
+            # Our own explanation (unsupported or undetectable Odoo version,
+            # repository without odumcp) says more than the generic warning.
+            if isinstance(exc, production_mcp.UnsupportedOdooVersion):
+                mcp_status = "unsupported"
+            mcp_warning = (
+                f"Production created, but Odoo MCP tools are unavailable: {exc} "
+                "Production infrastructure tools work."
+            )
         except Exception:
             mcp_warning = (
                 "Production created, but OduMCP addon source preparation failed. "
@@ -1350,15 +1374,6 @@ def create_production(
             odoo_image=odoo_image,
         )
 
-        image_cleanup.note_image_requested(odoo_image)
-        try:
-            logger.info("Pulling image %s", odoo_image)
-            client.images.pull(odoo_image)
-        except Exception as exc:
-            logger.warning(
-                "Could not pull image %s, using local copy: %s", odoo_image, exc
-            )
-
         setup_logs: list[str] = []
         if template_name is None and source_env is None:
             setup_logs.append(
@@ -1399,7 +1414,7 @@ def create_production(
                 )
         if mcp_warning:
             production_registry.update_production(
-                team, name, {"mcp": {"status": "sync_failed"}}
+                team, name, {"mcp": {"status": mcp_status}}
             )
             logger.warning("%s: %s", name, mcp_warning)
             promo_notes.append(mcp_warning)
@@ -1580,6 +1595,40 @@ def set_production_odoo_conf(
         "restarted": restarted,
         "notes": notes,
     }
+
+
+def _refresh_odumcp_for_image(
+    settings: Settings,
+    team: TeamSettings,
+    name: str,
+    extra_mount_paths: list[tuple[str, str]],
+    odoo_image: str,
+) -> None:
+    """Point the managed OduMCP checkout at a changed image's Odoo series.
+
+    Only an existing managed checkout is refreshed; adopting a production that
+    never had one stays with sync_production_mcp. Optional like the rest of
+    OduMCP: a failure is recorded on the production (and logged), never fails
+    the reconfiguration.
+    """
+    from oduflow import production_mcp, production_registry
+
+    if not production_mcp.addon_checkout(team, name).exists():
+        return
+    try:
+        production_mcp.prepare_addon(
+            settings, team, name, extra_mount_paths, odoo_image
+        )
+    except Exception as exc:
+        status = (
+            "unsupported"
+            if isinstance(exc, production_mcp.UnsupportedOdooVersion)
+            else "sync_failed"
+        )
+        production_registry.update_production(team, name, {"mcp": {"status": status}})
+        logger.warning(
+            "%s: OduMCP addon not updated for image %s: %s", name, odoo_image, exc
+        )
 
 
 def reconfigure_production(
@@ -1807,20 +1856,6 @@ def reconfigure_production(
         extra_conf_paths.append(resolve_extra_addons_path(wt_path, repo_name))
 
     # --- Prepare everything, then swap the container (minimal downtime). ---
-    env_creds = load_credentials(
-        env_name, team.workspaces_dir, settings.db_user, settings.db_password
-    )
-    generated_conf = _build_prod_odoo_conf(
-        settings,
-        team,
-        name,
-        repo_path,
-        extra_conf_paths,
-        odoo_image=record["odoo_image"],
-    )
-    odoo_env, odoo_volumes, labels = _container_spec(
-        settings, team, name, record, env_creds, extra_mount_paths
-    )
     odoo_image_new = record["odoo_image"]
     image_cleanup.note_image_requested(odoo_image_new)
     # Pull only when the image actually changed (or is absent locally) — an
@@ -1854,6 +1889,25 @@ def reconfigure_production(
             chown_recursive(
                 sessions_path, int(uid_str), int(gid_str), client, odoo_image_new
             )
+        _refresh_odumcp_for_image(
+            settings, team, name, extra_mount_paths, odoo_image_new
+        )
+
+    # Built after the addon refresh above: both mount the managed checkout.
+    env_creds = load_credentials(
+        env_name, team.workspaces_dir, settings.db_user, settings.db_password
+    )
+    generated_conf = _build_prod_odoo_conf(
+        settings,
+        team,
+        name,
+        repo_path,
+        extra_conf_paths,
+        odoo_image=odoo_image_new,
+    )
+    odoo_env, odoo_volumes, labels = _container_spec(
+        settings, team, name, record, env_creds, extra_mount_paths
+    )
 
     container = _get_container(client, settings, team, name)
     if container is not None:
@@ -2876,6 +2930,9 @@ def list_productions(settings: Settings, team: TeamSettings) -> list[dict[str, A
                 "allow_copy_to_dev_mcp": bool(
                     record.get("allow_copy_to_dev_mcp", True)
                 ),
+                # "ready" / "sync_failed"; empty for records from before
+                # OduMCP provisioning. The dashboard flags "sync_failed".
+                "mcp_status": (record.get("mcp") or {}).get("status", ""),
                 "commit": head,
                 "commit_short": head[:10],
                 "created_at": record.get("created_at", ""),

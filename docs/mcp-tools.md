@@ -2484,7 +2484,7 @@ Lock: production.
 :   *str · required* — Production name, e.g. `erp` (lowercase letters, digits, dashes).
 
 `repo_url`
-:   *str · default empty* — HTTPS git repository URL. Required unless `from_environment` supplies it.
+:   *str · default empty* — HTTPS (`https://github.com/owner/repo.git`) or SSH (`git@github.com:owner/repo.git`, needs the team deploy key — see [`get_ssh_public_key`](#get_ssh_public_key)). Required unless `from_environment` supplies it.
 
 `branch`
 :   *str · default empty* — Git branch to deploy (full history is kept). Required unless `from_environment` supplies it.
@@ -3110,8 +3110,9 @@ rest.
 New productions are provisioned automatically; this tool is for existing ones,
 for retrying a failed setup, and for rotating the key after `production_token`
 changes in `oduflow.toml` (change the value, restart Oduflow, then run this).
-No secret is accepted or returned. Stopped productions must be started first,
-and adding the managed addon mount recreates the container.
+No secret is accepted or returned. Stopped productions must be started first.
+Adding the managed addon mount, or replacing a checkout made for another Odoo
+version, recreates the container.
 
 Lock: production (each one in turn).
 { .odu-tool-meta }
@@ -3125,6 +3126,7 @@ Lock: production (each one in turn).
 
 - Adopting a production that predates automatic provisioning.
 - The connector reports itself unavailable after a failed setup.
+- The production moved to another Odoo version.
 - Rotating `production_token`.
 
 ### `production_odoo_info`

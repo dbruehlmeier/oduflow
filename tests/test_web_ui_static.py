@@ -1490,6 +1490,8 @@ def test_production_env_vars_forms():
             "_parseKvLines",
             "prodApplySettings",
             "submitCreateProduction",
+            "isAmbiguousGatewayStatus",
+            "_fmtElapsed",
             "_prodSettingsHtml",
             "_prodServerModeSelect",
             "esc",
@@ -1513,11 +1515,18 @@ var sent = [], errors = [];
 function showToast(msg, error) { if (error) errors.push(msg); }
 async function confirmDialog() { return true; }
 async function _prodPost(url, body) { sent.push(body); return null; }
+// Creation posts with its own fetch so the dialog can show progress.
+async function fetch(url, options) { sent.push(JSON.parse(options.body)); return {ok: false, status: 400}; }
+async function readResult() { return {ok: false, error: 'refused'}; }
+async function loadProductions() {}
+global.document.body = {contains: () => true};
 ['cp-name', 'cp-repo', 'cp-branch', 'cp-domain', 'cp-xdomains', 'cp-image',
  'cp-template', 'cp-fromenv', 'cp-auto', 'cp-mode', 'cp-set-envvars', 'cp-envvars',
+ 'cp-error', 'cp-submit', 'cp-cancel', 'cp-progress', 'cp-elapsed',
  'ps-domain-erp', 'ps-xdomains-erp', 'ps-image-erp', 'ps-repo-erp',
  'ps-branch-erp', 'ps-gituser-erp', 'ps-extras-erp', 'ps-envvars-erp'].forEach(
- id => fields[id] = {value: '', defaultValue: '', checked: false, disabled: false});
+ id => fields[id] = {value: '', defaultValue: '', checked: false, disabled: false,
+                    style: {}, scrollIntoView() {}});
 fields['cp-name'].value = 'erp';
 fields['cp-fromenv'].value = 'dev';
 (async () => {
@@ -1587,3 +1596,143 @@ fields['cp-fromenv'].value = 'dev';
     assert (
         ".form-group textarea.mono-input { font-family: var(--font-mono);" in dashboard
     )
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")
+def test_create_production_shows_progress_and_reports_in_the_dialog():
+    """Creation pulls an image and initializes a database for minutes: the
+    dialog must show that it is working, refuse a second submit, and keep the
+    outcome where the operator is looking."""
+    dashboard = _DASHBOARD.read_text(encoding="utf-8")
+    functions = "\n".join(
+        _js_function(dashboard, name)
+        for name in (
+            "submitCreateProduction",
+            "isAmbiguousGatewayStatus",
+            "_fmtElapsed",
+            "parseEnvLines",
+            "_parseProductionEnvLines",
+        )
+    )
+    result = _run_node(
+        functions
+        + r"""
+var fields = {}, attached = true, toasts = [], reloads = 0, pending = [];
+['cp-name', 'cp-repo', 'cp-branch', 'cp-domain', 'cp-xdomains', 'cp-image',
+ 'cp-template', 'cp-fromenv', 'cp-auto', 'cp-mode', 'cp-set-envvars', 'cp-envvars',
+ 'cp-error', 'cp-submit', 'cp-cancel', 'cp-progress', 'cp-elapsed'].forEach(
+ id => fields[id] = {value: '', checked: false, disabled: false, textContent: '',
+                     style: {}, scrollIntoView() {}});
+fields['create-prod-modal'] = {remove() { attached = false; }};
+global.document = {
+  getElementById: id => (id === 'create-prod-modal' && !attached) ? null : fields[id],
+  body: {contains: () => attached}
+};
+global.window = {_teamBaseDomain: ''};
+var API_PRODUCTIONS = '/api/productions';
+function showToast(msg, error) { toasts.push({msg: msg, error: !!error}); }
+async function loadProductions() { reloads += 1; }
+function fetch() { return new Promise(resolve => pending.push(resolve)); }
+async function readResult(r) { return r.body; }
+function state() {
+  return {
+    disabled: fields['cp-submit'].disabled,
+    label: fields['cp-submit'].textContent,
+    cancel: fields['cp-cancel'].textContent,
+    progress: fields['cp-progress'].style.display || '',
+    error: fields['cp-error'].style.display === 'block' ? fields['cp-error'].textContent : ''
+  };
+}
+(async () => {
+  var out = {};
+  fields['cp-name'].value = 'erp';
+  await submitCreateProduction();
+  out.missingDomain = state();
+  out.requestsAfterInvalid = pending.length;
+
+  fields['cp-domain'].value = 'erp.example.com';
+  fields['cp-repo'].value = 'git@github.com:acme/erp.git';
+  fields['cp-branch'].value = 'production';
+  fields['cp-image'].value = 'odoo:19.0';
+  var running = submitCreateProduction();
+  out.running = state();
+  pending.shift()({ok: false, status: 409, body: {ok: false, error: 'Production busy'}});
+  await running;
+  out.failed = state();
+
+  running = submitCreateProduction();
+  pending.shift()({ok: true, status: 200, body: {ok: true, notes: ['OduMCP setup failed.']}});
+  await running;
+  out.created = {attached: attached, reloads: reloads, toast: toasts[toasts.length - 1]};
+
+  attached = true;
+  running = submitCreateProduction();
+  attached = false;  // closed while the request ran
+  pending.shift()({ok: false, status: 400, body: {ok: false, error: 'Domain taken'}});
+  await running;
+  out.closedThenFailed = toasts[toasts.length - 1];
+
+  // Closed mid-flight, then reopened for another production: the first
+  // request's success must not remove the new dialog.
+  attached = true;
+  var first = fields['create-prod-modal'];
+  running = submitCreateProduction();
+  var reopened = {removed: false, remove() { this.removed = true; }};
+  fields['create-prod-modal'] = reopened;
+  pending.shift()({ok: true, status: 200, body: {ok: true, notes: []}});
+  await running;
+  out.reopenedKept = !reopened.removed && !attached;
+  process.stdout.write(JSON.stringify(out));
+})();
+"""
+    )
+
+    assert result == {
+        "missingDomain": {
+            "disabled": False,
+            "label": "",
+            "cancel": "",
+            "progress": "",
+            "error": "Name and domain are required.",
+        },
+        "requestsAfterInvalid": 0,
+        "running": {
+            "disabled": True,
+            "label": "Creating…",
+            "cancel": "Close",
+            "progress": "block",
+            "error": "",
+        },
+        "failed": {
+            "disabled": False,
+            "label": "Create production",
+            "cancel": "Cancel",
+            "progress": "none",
+            "error": "Production busy",
+        },
+        "created": {
+            "attached": False,
+            "reloads": 1,
+            # A creation note (a failed OduMCP setup) persists like an error.
+            "toast": {
+                "msg": 'Production "erp" created. OduMCP setup failed.',
+                "error": True,
+            },
+        },
+        "closedThenFailed": {"msg": "Domain taken", "error": True},
+        "reopenedKept": True,
+    }
+
+
+def test_create_production_explains_ssh_urls_and_mcp_failures(tmp_path):
+    dashboard = _client(tmp_path).get("/").text
+
+    assert (
+        "HTTPS or SSH (<code>git@github.com:owner/repo.git</code>). For a private "
+        "repository, use the SSH URL with the team deploy key" in dashboard
+    )
+    assert 'id="cp-progress" role="status" aria-live="polite"' in dashboard
+    # Status is never color alone: the badge names the failure.
+    assert "p.mcp_status === 'sync_failed'" in dashboard
+    assert 'run sync_production_mcp.">MCP failed</span>' in dashboard
+    assert 'Infrastructure tools work.">MCP n/a</span>' in dashboard

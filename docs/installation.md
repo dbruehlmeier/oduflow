@@ -441,8 +441,7 @@ hosting at call time.
 |---|---|---|
 | `[production].enabled` | `false` | Enable long-lived production environments and their dedicated PostgreSQL cluster. Requires Traefik routing |
 | `[production].walg_version` | *(empty)* | WAL-G release override. Empty uses the version pinned by Oduflow |
-| `[production].odumcp_repo_url` | `https://github.com/oduflow/oduflow-client-addons.git` | Fallback source for automatic OduMCP installation when production repositories do not provide the addon |
-| `[production].odumcp_ref` | `19.0` | Connector branch or tag; must contain Odoo 19 addon version 19.0.1.1.0 or later with managed-key support |
+| `[production].odumcp_repo_url` | `https://github.com/oduflow/oduflow-client-addons.git` | Fallback source for automatic OduMCP installation when production repositories do not provide the addon. Needs one branch per Odoo version (`16.0` … `20.0`); each production uses the branch of its own Odoo version |
 | `[production].workers_cap` | `8` | Upper bound for automatically calculated Odoo workers; must be at least `1` |
 | `[production].wal` | *(defaults below)* | Nested `[production.wal]` table for cluster-wide WAL timeouts and disk protection; active whenever production hosting is enabled |
 | `[production.wal].upload_timeout` | `120` | Seconds per WAL upload before termination; forced kill follows after 5 seconds |
