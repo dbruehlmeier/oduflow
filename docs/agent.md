@@ -66,7 +66,7 @@ enablement and credentials live in the `[team.*]` sections:
 ```toml
 # Deployment-wide (optional)
 [agent]
-image = "oduist/oduflow-coder:0.3.4"
+image = "oduist/oduflow-coder:0.3.5"
 # claude_model = ""     # optional Claude model override; empty = CLI default
 # codex_model = ""      # optional Codex model override; empty = CLI default
 # opencode_model = ""   # optional provider/model override; empty = OpenCode default
@@ -81,7 +81,7 @@ agent_default = "claude"  # "claude" | "codex" | "opencode"
 [team.1.agent_env]
 CLAUDE_CODE_OAUTH_TOKEN = ""   # Claude subscription token (`claude setup-token`); outranks the API key
 ANTHROPIC_API_KEY = ""         # Claude API key (used when no OAuth token)
-OPENAI_API_KEY = ""            # Codex API key
+OPENAI_API_KEY = ""            # Codex API key; replaces a ChatGPT sign-in
 OPENCODE_API_KEY = ""          # OpenCode Zen; other providers use their own variables
 ```
 
@@ -112,7 +112,46 @@ deployments. Alternatively, open **Agent CLI** and run `opencode auth login`;
 the resulting provider credentials live on the team's persistent HOME volume
 and survive container recreation. OpenCode's runtime self-update is disabled,
 so its executable changes only when Oduflow moves to a new immutable coder
-image.
+image. The same applies to Codex: Agent CLI starts it with the startup update
+check turned off.
+
+### Codex with a ChatGPT subscription
+
+Instead of `OPENAI_API_KEY`, Codex can use a ChatGPT plan (Plus, Pro, Business
+or Enterprise). Sign in once per team:
+
+1. With Codex as the team's default agent (`agent_default = "codex"`), open
+   **More ▾ → Agent CLI** on any environment of the team.
+2. Choose **2. Sign in with Device Code**. Option 1, **Sign in with ChatGPT**,
+   does not work here: its callback goes to `localhost` inside the agent
+   container, which your browser cannot reach.
+3. Open <https://auth.openai.com/codex/device> in any browser, sign in to
+   ChatGPT and enter the one-time code that Codex shows. The code expires after
+   15 minutes.
+4. Codex reports **Signed in to Codex**. Agent CLI and Agent Chat now use the
+   subscription in every environment of the team.
+
+Business and Enterprise workspaces may need a workspace admin to enable
+device-code sign-in for Codex first.
+
+The sign-in is stored on the team's persistent agent home volume and survives
+container recreation. A configured `OPENAI_API_KEY` overrides it: the container
+signs in with the key (`codex login --with-api-key`) on every start. The key's
+sign-in stays on the volume after the key is removed, so to switch to the
+subscription, remove the key, restart Oduflow, log out and sign in again. To
+check or reset the sign-in from the host (the container is
+`<prefix><team>-agent`):
+
+```bash
+docker exec oduflow-1-agent codex login status
+docker exec oduflow-1-agent codex logout
+docker exec -it oduflow-1-agent codex login --device-auth   # sign in without Agent CLI
+```
+
+One subscription shared by many concurrent sessions can fail a token refresh
+with `refresh_token_reused`; run `/logout` in Agent CLI and sign in again, or
+use an API key for a busy team. When Codex is not signed in, Agent Chat's error
+message includes these recovery steps.
 
 ### OpenAI-compatible gateway for OpenCode
 

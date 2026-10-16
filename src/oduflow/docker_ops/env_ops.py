@@ -2916,6 +2916,18 @@ def _claude_auth_mode(settings: Settings, team: TeamSettings) -> str:
     return "interactive"
 
 
+def _codex_auth_mode(settings: Settings, team: TeamSettings) -> str:
+    """Return the effective Codex credential mode, without secrets.
+
+    A non-empty OPENAI_API_KEY is signed in by the agent container on every
+    start (``codex login --with-api-key``), replacing any ChatGPT sign-in made
+    from Agent CLI; otherwise Codex uses that persisted interactive sign-in.
+    """
+    if _agent_env_vars(settings, team).get("OPENAI_API_KEY"):
+        return "api_key"
+    return "interactive"
+
+
 def get_agent_mcp_url(settings: Settings, team: TeamSettings, env_name: str) -> str:
     """This environment's SCOPED MCP endpoint as seen from the agent container.
 

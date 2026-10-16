@@ -4529,6 +4529,28 @@ class TestAgentContainer:
         assert env_ops._agent_env_vars(settings, team1) == {}
         assert env_ops._claude_auth_mode(settings, team1) == "interactive"
 
+    def test_codex_auth_mode(self, monkeypatch):
+        for key in env_ops._AGENT_PROVIDER_CREDENTIALS:
+            monkeypatch.delenv(key, raising=False)
+
+        team = self._team()
+        assert env_ops._codex_auth_mode(self._settings(team=team), team) == (
+            "interactive"
+        )
+
+        keyed = self._team(agent_env={"OPENAI_API_KEY": "  sk-oai  "})
+        assert env_ops._codex_auth_mode(self._settings(team=keyed), keyed) == (
+            "api_key"
+        )
+
+        # A blank team value masks a server key, as for the container env.
+        monkeypatch.setenv("OPENAI_API_KEY", "server-key")
+        assert env_ops._codex_auth_mode(self._settings(team=team), team) == "api_key"
+        blank = self._team(agent_env={"OPENAI_API_KEY": "  "})
+        assert env_ops._codex_auth_mode(self._settings(team=blank), blank) == (
+            "interactive"
+        )
+
     @patch("oduflow.docker_ops.env_ops.os.path.isfile", return_value=True)
     def test_ensure_creates_single_container_with_volumes(
         self, mock_isfile, monkeypatch, mock_docker_client
