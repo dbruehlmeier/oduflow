@@ -184,6 +184,40 @@ class TestCreateProduction:
         assert record["mcp"]["status"] == "sync_failed"
         assert client.containers.run.called
 
+    def test_unsupported_odoo_version_explains_missing_odumcp(self, settings, team):
+        from oduflow.production_mcp import UnsupportedOdooVersion
+
+        client = _mock_client()
+        order: list[str] = []
+        client.images.pull.side_effect = lambda *a, **k: order.append("pull")
+        with _PatchAll(_patch_create_stack(client)) as mocks:
+
+            def unsupported(*args, **kwargs):
+                order.append("prepare")
+                raise UnsupportedOdooVersion(
+                    "Automatic OduMCP provisioning supports Odoo 16 and later; "
+                    "this production runs Odoo 15."
+                )
+
+            mocks["prepare_odumcp"].side_effect = unsupported
+            result = production_ops.create_production(
+                settings,
+                team,
+                "erp",
+                "https://github.com/o/r.git",
+                "main",
+                "erp.example.com",
+                "odoo:15.0",
+            )
+            mocks["provision_odumcp"].assert_not_called()
+            assert mocks["prepare_odumcp"].call_args.args[4] == "odoo:15.0"
+        assert "supports Odoo 16 and later" in result["notes"][0]
+        # Retrying cannot help, so the card must not suggest it.
+        record = production_registry.get_production(team, "erp")
+        assert record["mcp"]["status"] == "unsupported"
+        # The addon series is chosen from the freshly pulled image.
+        assert order == ["pull", "prepare"]
+
     def test_requires_traefik_mode(self, settings, team):
         port_settings = Settings(
             routing_mode="port",
@@ -2007,3 +2041,56 @@ def test_production_info_returns_persisted_env_references(settings, team, env_va
         info = production_ops.get_production_info(settings, team, "erp")
     assert info["env_vars"] == (env_vars or {})
     resolve.assert_not_called()
+
+
+class TestRefreshOdumcpForImage:
+    """reconfigure_production moves the managed addon with the Odoo series."""
+
+    def _checkout(self, team):
+        from oduflow.production_mcp import addon_checkout
+
+        addon_checkout(team, "erp").mkdir(parents=True)
+
+    def test_production_without_managed_checkout_is_left_alone(self, settings, team):
+        with patch("oduflow.production_mcp.prepare_addon") as prepare:
+            production_ops._refresh_odumcp_for_image(
+                settings, team, "erp", [], "odoo:19.0"
+            )
+        prepare.assert_not_called()
+
+    def test_changed_image_refreshes_the_checkout(self, settings, team):
+        self._checkout(team)
+        with patch("oduflow.production_mcp.prepare_addon") as prepare:
+            production_ops._refresh_odumcp_for_image(
+                settings, team, "erp", [("/x", "/mnt/x")], "odoo:20.0"
+            )
+        prepare.assert_called_once_with(
+            settings, team, "erp", [("/x", "/mnt/x")], "odoo:20.0"
+        )
+
+    @pytest.mark.parametrize(
+        ("error", "status"),
+        [
+            ("unsupported", "unsupported"),
+            ("download", "sync_failed"),
+        ],
+    )
+    def test_failure_is_recorded_not_raised(self, settings, team, error, status):
+        from oduflow.production_mcp import UnsupportedOdooVersion
+
+        production_registry.create_production(
+            team, "erp", {"domain": "erp.example.com"}
+        )
+        self._checkout(team)
+        exc = (
+            UnsupportedOdooVersion("Odoo 15")
+            if error == "unsupported"
+            else RuntimeError("clone failed")
+        )
+        with patch("oduflow.production_mcp.prepare_addon", side_effect=exc):
+            production_ops._refresh_odumcp_for_image(
+                settings, team, "erp", [], "odoo:15.0"
+            )
+        assert (
+            production_registry.get_production(team, "erp")["mcp"]["status"] == status
+        )

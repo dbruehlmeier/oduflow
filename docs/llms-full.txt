@@ -1100,8 +1100,7 @@ hosting at call time.
 |---|---|---|
 | `[production].enabled` | `false` | Enable long-lived production environments and their dedicated PostgreSQL cluster. Requires Traefik routing |
 | `[production].walg_version` | *(empty)* | WAL-G release override. Empty uses the version pinned by Oduflow |
-| `[production].odumcp_repo_url` | `https://github.com/oduflow/oduflow-client-addons.git` | Fallback source for automatic OduMCP installation when production repositories do not provide the addon |
-| `[production].odumcp_ref` | `19.0` | Connector branch or tag; must contain Odoo 19 addon version 19.0.1.1.0 or later with managed-key support |
+| `[production].odumcp_repo_url` | `https://github.com/oduflow/oduflow-client-addons.git` | Fallback source for automatic OduMCP installation when production repositories do not provide the addon. Needs one branch per Odoo version (`16.0` … `20.0`); each production uses the branch of its own Odoo version |
 | `[production].workers_cap` | `8` | Upper bound for automatically calculated Odoo workers; must be at least `1` |
 | `[production].wal` | *(defaults below)* | Nested `[production.wal]` table for cluster-wide WAL timeouts and disk protection; active whenever production hosting is enabled |
 | `[production.wal].upload_timeout` | `120` | Seconds per WAL upload before termination; forced kill follows after 5 seconds |
@@ -2312,17 +2311,15 @@ Both folders support `.sql` and `.py` files, executed in alphabetical order (fir
 
 ### Team-level sanitization
 
-On startup, the folder `{team_data_dir}/odoo_sanitize/` is created and seeded with a default script:
-
-**`01_disable_mail.sql`** — disables incoming and outgoing mail servers:
+On startup, the folder `{team_data_dir}/odoo_sanitize/` is created and seeded with an example script, **`01_disable_mail.sql`**. All of its statements are commented out, so it runs without changing anything. On Odoo 16+, the native neutralization already deactivates outgoing and incoming mail servers. The example shows the format:
 
 ```sql
--- Disable incoming mail servers (fetchmail)
-UPDATE fetchmail_server SET active = false WHERE active = true;
-
--- Disable outgoing mail servers
-UPDATE ir_mail_server SET active = false WHERE active = true;
+-- Examples:
+-- UPDATE ir_mail_server SET active = false WHERE active = true;
+-- UPDATE fetchmail_server SET active = false WHERE active = true;
 ```
+
+Each `.sql` file runs as one transaction. If any statement fails, for example on a table whose module is not installed (`fetchmail_server` is absent until `mail` is installed), the whole file is rolled back.
 
 The team administrator can add, modify, or remove scripts in this folder to control sanitization for all environments in the team.
 
@@ -2891,29 +2888,40 @@ all productions in its team; it does not identify individual administrators.
 
 ### Automatic OduMCP installation
 
-New production creation requires a configured production token and automatically
-attempts to install `odumcp` if it is absent. The supported addon release currently targets
-**Odoo 19**. Existing older productions can still be managed with infrastructure
-tools; automatic OduMCP provisioning requires a compatible Odoo 19 deployment.
+New production creation requires a configured production token. Until one is set,
+the dashboard's Production tab and its Create Production dialog show a setup
+notice, and the dialog cannot be submitted. Creation automatically
+attempts to install `odumcp` if it is absent. Automatic provisioning supports
+**Odoo 16 and later**. Older productions can still be managed with infrastructure
+tools.
 
 Oduflow uses addon code in the main or extra repositories when available. Otherwise
-it clones the configured connector repository and mounts **only** its `odumcp`
-addon read-only. This managed checkout survives container recreation and is not
-silently updated by unrelated deployments:
+it clones the connector repository at the branch of the production's own Odoo
+version (`18.0` for `odoo:18.0`) and mounts **only** its `odumcp` addon read-only.
+The version comes from the image tag; for a custom image without a version in its
+tag, Oduflow asks the image's `odoo --version`. This managed checkout survives
+container recreation and is not silently updated by unrelated deployments. When
+`reconfigure_production` moves a production to another Odoo version, the checkout
+is replaced with the new version's branch before the container is recreated; run
+`sync_production_mcp` afterwards to upgrade the installed module. A synchronization
+also replaces a checkout made for another version, and recreates the container
+whenever the container does not see the current checkout, which repairs an
+earlier synchronization whose recreation failed. Provisioning refuses to install
+an addon built for a different Odoo version than the one running:
 
 ```toml
 [production]
 enabled = true
 odumcp_repo_url = "https://github.com/oduflow/oduflow-client-addons.git"
-odumcp_ref = "19.0"  # branch or tag containing odumcp >= 19.0.1.1.0
 ```
 
-Deploy the accompanying addon changes before enabling this feature. The addon
-must implement `_set_oduflow_key`; an older release cannot synchronize credentials.
-For reproducible installations, select a released immutable tag. Source checkout
-failures, unavailable or incompatible modules and failed key provisioning do not
-fail production creation. Production remains available with a warning and an
-OduMCP status of `sync_failed`. Infrastructure tools continue to work. The
+The addon must implement `_set_oduflow_key`; an older release cannot synchronize
+credentials. Source checkout failures, unsupported Odoo versions, unavailable or
+incompatible modules and failed key provisioning do not fail production creation.
+Production remains available with a warning and an OduMCP status of `sync_failed`,
+which the dashboard shows as an **MCP FAILED** badge on the production card. A
+production on Odoo 15 or older gets the status `unsupported` instead, shown as
+**MCP N/A**: no synchronization can help there. Infrastructure tools continue to work. The
 `production_odoo_*` tools remain listed but return a configuration error until
 `sync_production_mcp` succeeds. Fix the addon source or compatibility issue and
 retry synchronization; recreating production is unnecessary.
@@ -5001,7 +5009,7 @@ and delete operations require explicit confirmation in their JSON body.
 
 | Method | Endpoint | Description |
 |---|---|---|
-| `GET` | `/api/productions` | List productions and return webhook/backup state |
+| `GET` | `/api/productions` | List productions (each with its OduMCP `mcp_status`: `ready`, `sync_failed`, `unsupported`, or empty) and return webhook/backup state and whether the team's `production_token` is set (`production_token_set`) |
 | `POST` | `/api/productions/create` | Create a production from repository/image/domain settings, optionally seeded from a template, or promote a dev environment via body `from_environment` (inherits its repo/branch/image). Optional `server_mode`: `workers` (default) or `gevent`. Optional body `env_vars` (object mapping names to values, or a `KEY=VALUE` string separated by newlines or commas) overrides the inherited/template variables; an absent key inherits them, an empty object/string means none. `HOST`, `PORT`, `USER` and `PASSWORD` are reserved |
 | `GET` | `/api/productions/backup-status` | Team backup, WAL-G, base-backup, and S3 health |
 | `GET` | `/api/productions/wal-status` | Cached shared-cluster WAL queue, progress, disk headroom, sample age and protection latch; does not probe Docker or S3 on request |
@@ -7527,7 +7535,7 @@ Lock: production.
 :   *str · required* — Production name, e.g. `erp` (lowercase letters, digits, dashes).
 
 `repo_url`
-:   *str · default empty* — HTTPS git repository URL. Required unless `from_environment` supplies it.
+:   *str · default empty* — HTTPS (`https://github.com/owner/repo.git`) or SSH (`git@github.com:owner/repo.git`, needs the team deploy key — see [`get_ssh_public_key`](#get_ssh_public_key)). Required unless `from_environment` supplies it.
 
 `branch`
 :   *str · default empty* — Git branch to deploy (full history is kept). Required unless `from_environment` supplies it.
@@ -8153,8 +8161,9 @@ rest.
 New productions are provisioned automatically; this tool is for existing ones,
 for retrying a failed setup, and for rotating the key after `production_token`
 changes in `oduflow.toml` (change the value, restart Oduflow, then run this).
-No secret is accepted or returned. Stopped productions must be started first,
-and adding the managed addon mount recreates the container.
+No secret is accepted or returned. Stopped productions must be started first.
+Adding the managed addon mount, or replacing a checkout made for another Odoo
+version, recreates the container.
 
 Lock: production (each one in turn).
 { .odu-tool-meta }
@@ -8168,6 +8177,7 @@ Lock: production (each one in turn).
 
 - Adopting a production that predates automatic provisioning.
 - The connector reports itself unavailable after a failed setup.
+- The production moved to another Odoo version.
 - Rotating `production_token`.
 
 ### `production_odoo_info`

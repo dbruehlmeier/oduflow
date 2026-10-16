@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import io
 import json
 import logging
@@ -37,11 +38,21 @@ READ_OPERATIONS = frozenset(
 )
 
 
+# Where the connector repository keeps the addon, relative to its root.
+_MODULE = Path("addons", "odumcp")
+_MANIFEST = _MODULE / "__manifest__.py"
+
+
 def addon_checkout(team: TeamSettings, name: str) -> Path:
     return (
         Path(get_workspace_path(prod_env_name(name), team.workspaces_dir))
         / "odumcp-addons"
     )
+
+
+def managed_module(team: TeamSettings, name: str) -> Path:
+    """The managed checkout's odumcp module, mounted read-only at MOUNT."""
+    return addon_checkout(team, name) / _MODULE
 
 
 def _addons_root(repo: Path) -> Path:
@@ -55,57 +66,184 @@ def _addons_root(repo: Path) -> Path:
     return nested if nested.is_dir() else repo
 
 
+# Oldest Odoo series the connector repository publishes odumcp for.
+MIN_ODOO_MAJOR = 16
+
+
+class UnsupportedOdooVersion(PrerequisiteNotMetError):
+    """No odumcp exists for this Odoo version; synchronizing cannot help."""
+
+
+def odoo_major(
+    settings: Settings, odoo_image: str, container: Any | None = None
+) -> int:
+    """The production's Odoo series, which selects the odumcp branch.
+
+    The image reference answers for official and versioned tags. A custom tag
+    without a version is asked directly: the running container when there is
+    one, otherwise a throwaway container of the same (already pulled) image.
+    """
+    from oduflow.docker_ops.client import get_client, run_for_output
+    from oduflow.odoo_version import (
+        detect_odoo_major,
+        major_from_image_reference,
+        major_from_version_output,
+    )
+
+    major = major_from_image_reference(odoo_image)
+    if major is None and container is not None:
+        major = detect_odoo_major(container, settings.image_label)
+    if major is None and odoo_image:
+        try:
+            output = run_for_output(
+                get_client(),
+                odoo_image,
+                ["--version"],
+                entrypoint="odoo",
+                network_disabled=True,
+            )
+            major = major_from_version_output(output.decode("utf-8", "replace"))
+        except Exception:
+            logger.warning(
+                "Could not read the Odoo version of image %s", odoo_image, exc_info=True
+            )
+    if major is None:
+        raise PrerequisiteNotMetError(
+            f"Cannot determine the Odoo version of image '{odoo_image}', so the "
+            "matching OduMCP addon cannot be selected."
+        )
+    if major < MIN_ODOO_MAJOR:
+        raise UnsupportedOdooVersion(
+            f"Automatic OduMCP provisioning supports Odoo {MIN_ODOO_MAJOR} and "
+            f"later; this production runs Odoo {major}."
+        )
+    return major
+
+
+def _series_major(version: Any) -> int | None:
+    """``19.0.1.4.2`` → 19; ``None`` for a version without a series prefix."""
+    from oduflow.module_versions import odoo_series
+
+    series = odoo_series(str(version or ""))
+    return int(series.split(".")[0]) if series else None
+
+
+def _checkout_major(checkout: Path) -> int | None:
+    """Odoo series of a managed checkout, from its odumcp manifest version."""
+    from oduflow.git_ops import parse_manifest
+
+    try:
+        return _series_major(parse_manifest(str(checkout / _MANIFEST)).get("version"))
+    except Exception:
+        return None
+
+
+def _mounted_major(container: Any) -> int | None:
+    """Odoo series of the odumcp the container actually sees at MOUNT.
+
+    ``None`` when nothing readable is mounted there, e.g. the bind mount still
+    points at a checkout that was replaced and removed on the host.
+    """
+    try:
+        code, output = container.exec_run(
+            ["cat", f"{MOUNT}/odumcp/__manifest__.py"], user="root"
+        )
+        if code != 0:
+            return None
+        text = output.decode("utf-8", "replace") if isinstance(output, bytes) else ""
+        return _series_major(ast.literal_eval(text).get("version"))
+    except Exception:
+        return None
+
+
+def _has_managed_mount(container: Any) -> bool:
+    mounts = (getattr(container, "attrs", None) or {}).get("Mounts") or []
+    return any(mount.get("Destination") == MOUNT + "/odumcp" for mount in mounts)
+
+
+def _record_status(team: TeamSettings, name: str, status: str) -> None:
+    try:
+        production_registry.update_production(team, name, {"mcp": {"status": status}})
+    except Exception:
+        # Bookkeeping must never replace the real failure: the production
+        # can disappear between the call and this handler.
+        logger.warning(
+            "Could not record OduMCP status '%s' for '%s'", status, name, exc_info=True
+        )
+
+
 def prepare_addon(
     settings: Settings,
     team: TeamSettings,
     name: str,
     extra_paths: list[tuple[str, str]],
-) -> None:
-    """Use existing addon code when provided; otherwise fetch the configured release.
+    odoo_image: str,
+    container: Any | None = None,
+) -> bool:
+    """Use existing addon code when provided; otherwise fetch the release for
+    the production's Odoo series (branch ``<major>.0``, see :func:`odoo_major`).
 
     Only odumcp is mounted from the fallback repository, not its other addons.
     Reconfiguration reuses this checkout; it never silently pulls newer code.
+    A checkout made for another Odoo series (the production was upgraded since)
+    is replaced. Returns True when a new checkout was published, so a running
+    container must be recreated to mount it. Raises UnsupportedOdooVersion
+    before Odoo 16.
     """
     main = Path(get_repo_path(prod_env_name(name), team.workspaces_dir))
     roots = [main, *(Path(host) for host, _ in extra_paths)]
     if any(
         (_addons_root(root) / "odumcp" / "__manifest__.py").is_file() for root in roots
     ):
-        return
+        return False
     from oduflow.docker_ops.env_ops import _clone_repo
 
     checkout = addon_checkout(team, name)
-    if not checkout.exists():
-        checkout.parent.mkdir(parents=True, exist_ok=True)
-        # Publish only a complete checkout: a failed download must not poison
-        # production's addons path or prevent a subsequent synchronization.
-        with tempfile.TemporaryDirectory(
-            prefix=".odumcp-download-", dir=checkout.parent
-        ) as temporary:
-            source = Path(temporary) / "repo"
-            _clone_repo(
-                settings.prod_odumcp_repo_url,
-                settings.prod_odumcp_ref,
-                str(source),
-                team,
-                depth=1,
-                timeout=300,
-            )
-            if not (source / "addons/odumcp/__manifest__.py").is_file():
-                raise PrerequisiteNotMetError(
-                    "Configured OduMCP repository does not contain addons/odumcp."
-                )
-            source.rename(checkout)
-    if not (checkout / "addons/odumcp/__manifest__.py").is_file():
-        raise PrerequisiteNotMetError(
-            "Configured OduMCP repository does not contain addons/odumcp."
+    current = (checkout / _MANIFEST).is_file()
+    try:
+        major = odoo_major(settings, odoo_image, container)
+    except UnsupportedOdooVersion:
+        raise
+    except PrerequisiteNotMetError:
+        if not current:
+            raise
+        # Without a readable version the existing checkout keeps serving.
+        logger.warning(
+            "Keeping the OduMCP checkout of '%s': the Odoo version of image %s "
+            "is unknown",
+            name,
+            odoo_image,
         )
+        return False
+    if current and _checkout_major(checkout) in (None, major):
+        return False
+    checkout.parent.mkdir(parents=True, exist_ok=True)
+    # Publish only a complete checkout: a failed download must not poison
+    # production's addons path or prevent a subsequent synchronization.
+    with tempfile.TemporaryDirectory(
+        prefix=".odumcp-download-", dir=checkout.parent
+    ) as temporary:
+        source = Path(temporary) / "repo"
+        _clone_repo(
+            settings.prod_odumcp_repo_url,
+            f"{major}.0",
+            str(source),
+            team,
+            depth=1,
+            timeout=300,
+        )
+        if not (source / _MANIFEST).is_file():
+            raise PrerequisiteNotMetError(
+                "Configured OduMCP repository does not contain addons/odumcp."
+            )
+        if checkout.exists():
+            # Retired with the temporary directory.
+            checkout.rename(Path(temporary) / "previous")
+        source.rename(checkout)
+    return True
 
 
 _INSTALL = """
-import odoo
-if odoo.release.version_info[0] != 19:
-    raise RuntimeError("Automatic OduMCP provisioning currently supports Odoo 19 only")
 Module = env["ir.module.module"]
 Module.update_list()
 module = Module.search([("name", "=", "odumcp")], limit=1)
@@ -207,7 +345,7 @@ def _shell(
                         return result
         # Do not expose arbitrary Odoo logs: custom addons can print payloads.
         raise PrerequisiteNotMetError(
-            "OduMCP provisioning failed. Check production logs, Odoo 19 compatibility, "
+            "OduMCP provisioning failed. Check production logs, addon compatibility, "
             "and that the deployed odumcp supports managed Oduflow keys."
         )
     finally:
@@ -236,6 +374,19 @@ def provision(settings: Settings, team: TeamSettings, name: str) -> dict[str, An
             "Start the production before synchronizing OduMCP."
         )
     try:
+        if _has_managed_mount(container):
+            # Never install an addon built for another Odoo series, e.g.
+            # after the image changed without a synchronization.
+            from oduflow.odoo_version import detect_odoo_major
+
+            mounted = _mounted_major(container)
+            running = detect_odoo_major(container, settings.image_label)
+            if mounted and running and mounted != running:
+                raise PrerequisiteNotMetError(
+                    f"The mounted OduMCP addon is for Odoo {mounted}, but this "
+                    f"production runs Odoo {running}. Run sync_production_mcp "
+                    "to fetch the matching addon."
+                )
         installed = _shell(settings, team, name, container, _INSTALL, {})
         if installed["module_changed"]:
             container.restart()
@@ -245,16 +396,7 @@ def provision(settings: Settings, team: TeamSettings, name: str) -> dict[str, An
         production_registry.update_production(team, name, {"mcp": {"status": "ready"}})
         return {"name": name, "status": "ready", **installed, **result}
     except Exception:
-        try:
-            production_registry.update_production(
-                team, name, {"mcp": {"status": "sync_failed"}}
-            )
-        except Exception:
-            # Bookkeeping must never replace the real failure: the production
-            # can disappear between the call and this handler.
-            logger.warning(
-                "Could not record OduMCP sync failure for '%s'", name, exc_info=True
-            )
+        _record_status(team, name, "sync_failed")
         raise
 
 
@@ -273,7 +415,14 @@ def execute(
             "Production MCP is not configured: set production_token."
         )
     record = production_registry.get_production(team, name)
-    if record.get("mcp", {}).get("status") == "sync_failed":
+    status = (record.get("mcp") or {}).get("status")
+    if status == "unsupported":
+        raise PrerequisiteNotMetError(
+            "Production OduMCP is not available: automatic provisioning supports "
+            f"Odoo {MIN_ODOO_MAJOR} and later. Production infrastructure tools "
+            "remain available."
+        )
+    if status == "sync_failed":
         raise PrerequisiteNotMetError(
             "Production OduMCP is unavailable: addon installation or key setup "
             "did not complete. Retry sync_production_mcp for this production. "
@@ -358,10 +507,24 @@ def synchronize(settings: Settings, team: TeamSettings, name: str) -> dict[str, 
     extras = [
         (str(workspace / "extra" / repo), "") for repo in record.get("extra_addons", {})
     ]
-    prepare_addon(settings, team, name, extras)
-    if addon_checkout(team, name).is_dir():
-        mounts = container.attrs.get("Mounts", [])
-        if not any(mount.get("Destination") == MOUNT + "/odumcp" for mount in mounts):
+    try:
+        replaced = prepare_addon(
+            settings, team, name, extras, record.get("odoo_image", ""), container
+        )
+    except UnsupportedOdooVersion:
+        _record_status(team, name, "unsupported")
+        raise
+    checkout = addon_checkout(team, name)
+    if checkout.is_dir():
+        # A replaced checkout (Odoo series changed) is a new directory: the
+        # running container still sees the old one through its bind mount.
+        # Comparing what the container sees also repairs a previous
+        # synchronization whose container recreation failed.
+        if (
+            replaced
+            or not _has_managed_mount(container)
+            or _mounted_major(container) != _checkout_major(checkout)
+        ):
             production_ops.reconfigure_production(
                 settings, team, name, force_recreate=True
             )

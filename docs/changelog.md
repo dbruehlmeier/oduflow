@@ -10,6 +10,42 @@
   the SameSite=Strict share cookie. The link now answers with a small landing
   page that navigates to `/env/<name>` itself, so the cookie stays Strict and
   the key still leaves the address bar.
+- **Production setup is clear from the start** — when the team's
+  `production_token` is not set, the Production tab and the Create Production
+  dialog now say so up front, and the dialog cannot be submitted, instead of
+  failing after the whole form was filled. While a production is being created,
+  the dialog shows the elapsed time and disables its submit button, so a
+  multi-minute image pull and database initialization can no longer be
+  submitted twice. Errors appear inside the dialog.
+- **OduMCP for Odoo 16–20** — automatic OduMCP provisioning was hard-wired to
+  Odoo 19. A production on another version, for example `odoo:20.0`, was created
+  with "OduMCP installation or key setup failed" and had no Odoo MCP tools. The
+  connector branch now follows each production's Odoo version: the image tag, or
+  `odoo --version` for an unversioned custom image. The `[production].odumcp_ref`
+  setting is retired; a leftover value is ignored with a warning.
+  `reconfigure_production` switches the checkout when the image moves to another
+  Odoo version, and `sync_production_mcp` replaces a checkout made for another
+  version and recreates the container whenever it does not see the current
+  checkout. This repairs existing productions, including after a failed
+  recreation. Provisioning refuses an addon built for another Odoo version. Odoo
+  15 and older get a clear explanation and an **MCP N/A** badge instead of a
+  retry hint that cannot help.
+- **OduMCP setup failures are visible** — a production whose OduMCP addon
+  installation or key setup failed now shows an **MCP FAILED** badge on its card.
+  The creation warning is also shown in the dashboard, not only in the server
+  log.
+- **SSH repository URLs for productions** — the Create Production dialog and the
+  `create_production` tool description now say that SSH URLs
+  (`git@github.com:owner/repo.git`) work with the team deploy key, which private
+  repositories need.
+- **Quiet default sanitize script** — the seeded team script
+  `odoo_sanitize/01_disable_mail.sql` failed with
+  `relation "fetchmail_server" does not exist` on every environment created from a
+  template without the `mail` module. Because the file runs as one transaction,
+  the failure also rolled back its `ir_mail_server` update. The script is now a
+  commented-out example: on Odoo 16+, the native neutralization already
+  deactivates mail servers. Run `oduflow upgrade` to update an existing,
+  unmodified copy.
 
 ## v1.88.0
 

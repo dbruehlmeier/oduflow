@@ -185,17 +185,15 @@ Both folders support `.sql` and `.py` files, executed in alphabetical order (fir
 
 ### Team-level sanitization
 
-On startup, the folder `{team_data_dir}/odoo_sanitize/` is created and seeded with a default script:
-
-**`01_disable_mail.sql`** — disables incoming and outgoing mail servers:
+On startup, the folder `{team_data_dir}/odoo_sanitize/` is created and seeded with an example script, **`01_disable_mail.sql`**. All of its statements are commented out, so it runs without changing anything. On Odoo 16+, the native neutralization already deactivates outgoing and incoming mail servers. The example shows the format:
 
 ```sql
--- Disable incoming mail servers (fetchmail)
-UPDATE fetchmail_server SET active = false WHERE active = true;
-
--- Disable outgoing mail servers
-UPDATE ir_mail_server SET active = false WHERE active = true;
+-- Examples:
+-- UPDATE ir_mail_server SET active = false WHERE active = true;
+-- UPDATE fetchmail_server SET active = false WHERE active = true;
 ```
+
+Each `.sql` file runs as one transaction. If any statement fails, for example on a table whose module is not installed (`fetchmail_server` is absent until `mail` is installed), the whole file is rolled back.
 
 The team administrator can add, modify, or remove scripts in this folder to control sanitization for all environments in the team.
 

@@ -1153,6 +1153,18 @@ def _build_routes(
                 "__TEAM_BASE_DOMAIN__",
                 html.escape(team.base_domain if team else "", quote=True),
             )
+            # Production creation refuses without the team's production_token;
+            # say so before the form is filled. Ships with the page because the
+            # create-production modal also opens from environment cards.
+            .replace(
+                "__PROD_TOKEN_NOTICE_HIDDEN__",
+                ""
+                if settings.prod_enabled
+                and not scoped_env
+                and team is not None
+                and not team.production_token
+                else "hidden",
+            )
             # Only a browser already signed in to the Server settings console
             # gets the link; team members never learn the console exists.
             .replace(
@@ -1162,7 +1174,10 @@ def _build_routes(
 
     def dashboard(request: Request) -> HTMLResponse:
         settings = get_settings()
-        team = getattr(request.state, "team", None)
+        # Same resolution as the API: the open (auth-disabled) server sets no
+        # request.state.team, and the team-scoped page data (base domain,
+        # production-token notice) must not silently fall away there.
+        team = _get_ui_team(request)
         page = _render_dashboard(
             settings, team=team, admin=admin_ui.has_admin_session(request, settings)
         )
@@ -6296,6 +6311,7 @@ def _build_routes(
                     "ok": True,
                     "productions": prods,
                     "base_domain": team.base_domain,
+                    "production_token_set": bool(team.production_token),
                     "backup_configured": settings.backup is not None,
                     "webhook": {
                         "path": "/api/webhooks/github",

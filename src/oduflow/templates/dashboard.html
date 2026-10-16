@@ -350,6 +350,17 @@
     margin-bottom: 12px;
     font-size: var(--text-sm);
   }
+  /* A setup prerequisite that blocks production creation: the amber attention
+     channel of a set note, so it reads before the form is filled. */
+  .prod-notice {
+    font-size: var(--text-sm);
+    color: var(--text);
+    background: color-mix(in oklab, var(--yellow) 8%, transparent);
+    border: 1px solid color-mix(in oklab, var(--yellow) 25%, transparent);
+    border-radius: var(--radius);
+    padding: 8px 12px;
+    margin-bottom: 12px;
+  }
   .prod-mono { font-family: var(--font-mono); color: var(--text-dim); }
   .prod-domain { font-size: var(--text-sm); text-decoration: none; }
   .prod-domain:hover { text-decoration: underline; color: var(--accent); }
@@ -1533,6 +1544,10 @@
 <div id="tab-production" class="tab-content">
   <div class="tab-toolbar">
     <button class="btn-create" onclick="openCreateProductionModal()">+ Create Production</button>
+  </div>
+  <div id="prod-token-notice" class="prod-notice" role="note" __PROD_TOKEN_NOTICE_HIDDEN__>
+    <span class="note-label">Setup</span>Creating a production requires this team's Production MCP token (<code>production_token</code>), which is not set. An administrator sets it in Server settings → Teams → Production MCP token, then restarts the server.
+    <a href="/admin" __ADMIN_LINK_HIDDEN__>Open Server settings</a>
   </div>
   <div id="prod-webhook-box" class="prod-webhook" style="display:none">
     <span>GitHub webhook: <code id="prod-webhook-url" class="prod-mono"></code></span>
@@ -10332,6 +10347,12 @@ async function loadProductions() {
     cachedProds = data.productions || [];
     window._prodBackupConfigured = !!data.backup_configured;
     window._teamBaseDomain = data.base_domain || window._teamBaseDomain || '';
+    // The token is set in Server settings and applied on restart; follow the
+    // live state so the setup notice does not outlive it.
+    var tokenNotice = document.getElementById('prod-token-notice');
+    if (tokenNotice && data.production_token_set !== undefined) {
+      tokenNotice.hidden = !!data.production_token_set;
+    }
     _prodWebhookSecret = (data.webhook && data.webhook.secret) || '';
     var box = document.getElementById('prod-webhook-box');
     if (box) {
@@ -10382,6 +10403,11 @@ function renderProductions() {
             return '<a class="prod-domain prod-mono" href="' + escAttr(scheme + '://' + d) + '" target="_blank" rel="noopener">' + esc(d) + '</a>';
           }).join('') +
           '<span class="badge ' + prodBadgeClass(p.status) + '">' + esc(p.status) + '</span>' +
+          (p.mcp_status === 'sync_failed'
+            ? '<span class="badge badge-partial" title="OduMCP addon installation or key setup failed, so the production_odoo_* MCP tools are unavailable. Check the production logs, then run sync_production_mcp.">MCP failed</span>'
+            : p.mcp_status === 'unsupported'
+              ? '<span class="badge badge-neutral" title="OduMCP supports Odoo 16 and later, so the production_odoo_* MCP tools are not available for this production. Infrastructure tools work.">MCP n/a</span>'
+              : '') +
           prodProgressBadge(p) +
           prodQueuedBadge(p) +
           (p.auto_update ? '<span class="badge badge-neutral" title="Deploys automatically on GitHub push">auto</span>' : '') +
@@ -10895,6 +10921,10 @@ function _parseProductionEnvLines(raw) {
 }
 
 function openCreateProductionModal(fromEnv) {
+  // The server refuses creation without the team's production_token; repeat
+  // the Production tab's setup notice here instead of failing after submit.
+  var tokenNotice = document.getElementById('prod-token-notice');
+  var tokenMissing = !!tokenNotice && !tokenNotice.hidden;
   var overlay = document.createElement('div');
   overlay.className = 'modal-overlay show';
   overlay.id = 'create-prod-modal';
@@ -10902,11 +10932,14 @@ function openCreateProductionModal(fromEnv) {
     '<div class="modal" role="dialog" aria-modal="true">' +
       '<div class="modal-header"><h3>Create Production</h3></div>' +
       '<div class="modal-body">' +
+        (tokenMissing ? '<div class="prod-notice" role="note">' + tokenNotice.innerHTML + '</div>' : '') +
+        '<div class="form-error" id="cp-error" role="alert"></div>' +
         '<div class="form-group"><label for="cp-name">Name</label><input type="text" id="cp-name" placeholder="erp"></div>' +
         '<div class="form-group"><label for="cp-fromenv">Promote from environment (optional)</label>' +
           '<input type="text" id="cp-fromenv" value="' + escHtmlAttr(fromEnv || '') + '" placeholder="empty = fresh or template seed">' +
           '<div class="hint">Copies the environment\'s database and filestore (its Odoo briefly stops for a consistent copy); repository, branch and image default to the environment\'s</div></div>' +
-        '<div class="form-group"><label for="cp-repo">Repository URL</label><input type="text" id="cp-repo" placeholder="https://github.com/org/repo.git"></div>' +
+        '<div class="form-group"><label for="cp-repo">Repository URL</label><input type="text" id="cp-repo" placeholder="https://github.com/owner/repo.git">' +
+          '<div class="hint">HTTPS or SSH (<code>git@github.com:owner/repo.git</code>). For a private repository, use the SSH URL with the team deploy key from Credentials → SSH deploy key</div></div>' +
         '<div class="form-group"><label for="cp-branch">Branch</label><input type="text" id="cp-branch" placeholder="production"></div>' +
         '<div class="form-group"><label for="cp-domain">Domain' + (window._teamBaseDomain ? ' (optional)' : '') + '</label>' +
           '<input type="text" id="cp-domain" placeholder="' + escHtmlAttr(window._teamBaseDomain ? 'empty = default under ' + window._teamBaseDomain : 'erp.customer.com') + '">' +
@@ -10923,10 +10956,15 @@ function openCreateProductionModal(fromEnv) {
           '<div class="hint">Unchecked: inherit variables when promoting from an environment. Checked: use only the variables below; empty means none. One KEY=VALUE per line. Manage named secrets in Credentials → Secrets. HOST, USER and PASSWORD are set automatically from the database credentials; those three and PORT are reserved names.</div></div>' +
         '<div class="form-group"><label for="cp-template">Template (optional)</label><input type="text" id="cp-template" placeholder="empty = fresh database"></div>' +
         '<div class="form-group"><label class="select-box"><input type="checkbox" id="cp-auto"> Deploy automatically on GitHub push</label></div>' +
+        '<div class="hint" id="cp-progress" role="status" aria-live="polite" style="display:none">' +
+          '<span>Pulling the image and initializing the database… Closing this dialog does not stop creation.</span> ' +
+          '<span id="cp-elapsed" aria-hidden="true"></span>' +
+        '</div>' +
       '</div>' +
       '<div class="modal-footer">' +
-        '<button class="btn" onclick="document.getElementById(\'create-prod-modal\').remove()">Cancel</button>' +
-        '<button class="btn btn-start" onclick="submitCreateProduction()">Create production</button>' +
+        '<button class="btn" id="cp-cancel" onclick="document.getElementById(\'create-prod-modal\').remove()">Cancel</button>' +
+        '<button class="btn btn-start" id="cp-submit" onclick="submitCreateProduction()"' +
+          (tokenMissing ? ' disabled title="Set this team\'s production_token first"' : '') + '>Create production</button>' +
       '</div>' +
     '</div>';
   document.body.appendChild(overlay);
@@ -10935,6 +10973,15 @@ function openCreateProductionModal(fromEnv) {
 
 async function submitCreateProduction() {
   var v = function(id) { return document.getElementById(id).value.trim(); };
+  var errEl = document.getElementById('cp-error');
+  var fail = function(msg) {
+    // The dialog may have been closed while the request ran: an error then
+    // goes to a persistent toast instead of a detached element.
+    if (!document.body.contains(errEl)) { showToast(msg, true); return; }
+    errEl.textContent = msg;
+    errEl.style.display = 'block';
+    errEl.scrollIntoView({ block: 'nearest' });
+  };
   var body = {
     name: v('cp-name'),
     repo_url: v('cp-repo'),
@@ -10948,27 +10995,77 @@ async function submitCreateProduction() {
     auto_update: document.getElementById('cp-auto').checked
   };
   if (!body.name || (!body.domain && !window._teamBaseDomain)) {
-    showToast(window._teamBaseDomain ? 'Name is required' : 'Name and domain are required', true);
+    fail(window._teamBaseDomain ? 'Name is required.' : 'Name and domain are required.');
     return;
   }
   if (!body.from_environment && (!body.repo_url || !body.branch || !body.odoo_image)) {
-    showToast('Repository, branch and image are required (or promote from an environment)', true);
+    fail('Repository, branch and image are required (or promote from an environment).');
     return;
   }
   if (body.from_environment && body.template_name) {
-    showToast('Pick either a template or an environment to seed from, not both', true);
+    fail('Pick either a template or an environment to seed from, not both.');
     return;
   }
   if (document.getElementById('cp-set-envvars').checked) {
     body.env_vars = _parseProductionEnvLines(document.getElementById('cp-envvars').value);
     if (body.env_vars === null) return;
   }
-  showToast('Creating production "' + body.name + '"… this can take a few minutes');
-  var data = await _prodPost(API_PRODUCTIONS + '/create', body,
-    'Production "' + body.name + '" created');
-  if (data) {
-    var modal = document.getElementById('create-prod-modal');
+  errEl.style.display = 'none';
+  var btn = document.getElementById('cp-submit');
+  var cancel = document.getElementById('cp-cancel');
+  var progress = document.getElementById('cp-progress');
+  var elapsed = document.getElementById('cp-elapsed');
+  var started = Date.now();
+  btn.disabled = true;
+  btn.textContent = 'Creating…';
+  // Closing the dialog does not cancel the request; the label says so.
+  cancel.textContent = 'Close';
+  progress.style.display = 'block';
+  var updateProgress = function() {
+    elapsed.textContent = _fmtElapsed(Date.now() - started);
+  };
+  updateProgress();
+  var progressTimer = setInterval(updateProgress, 1000);
+  // This request's own dialog: after Close, a dialog reopened for another
+  // production carries the same id and must survive this request's outcome.
+  var modal = document.getElementById('create-prod-modal');
+  var closeModal = function() {
     if (modal) modal.remove();
+  };
+  try {
+    var r = await fetch(API_PRODUCTIONS + '/create', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body)
+    });
+    var data = await readResult(r);
+    if (r.ok && data.ok) {
+      closeModal();
+      // Notes report partial failures, such as OduMCP setup, that the
+      // operator has to read, so they persist instead of fading.
+      var notes = data.notes || [];
+      if (notes.length) {
+        showToast('Production "' + body.name + '" created. ' + notes.join(' '), true);
+      } else {
+        showToast('Production "' + body.name + '" created');
+      }
+      await loadProductions();
+    } else if (isAmbiguousGatewayStatus(r.status)) {
+      closeModal();
+      showToast('The proxy stopped waiting, but production "' + body.name +
+        '" may still be being created. Refresh in a moment.');
+      await loadProductions();
+    } else {
+      fail(data.error || ('Creation failed (HTTP ' + r.status + ')'));
+    }
+  } catch (e) {
+    fail('Connection error: ' + e.message);
+  } finally {
+    clearInterval(progressTimer);
+    progress.style.display = 'none';
+    btn.disabled = false;
+    btn.textContent = 'Create production';
+    cancel.textContent = 'Cancel';
   }
 }
 

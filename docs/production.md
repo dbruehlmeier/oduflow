@@ -55,29 +55,40 @@ all productions in its team; it does not identify individual administrators.
 
 ### Automatic OduMCP installation
 
-New production creation requires a configured production token and automatically
-attempts to install `odumcp` if it is absent. The supported addon release currently targets
-**Odoo 19**. Existing older productions can still be managed with infrastructure
-tools; automatic OduMCP provisioning requires a compatible Odoo 19 deployment.
+New production creation requires a configured production token. Until one is set,
+the dashboard's Production tab and its Create Production dialog show a setup
+notice, and the dialog cannot be submitted. Creation automatically
+attempts to install `odumcp` if it is absent. Automatic provisioning supports
+**Odoo 16 and later**. Older productions can still be managed with infrastructure
+tools.
 
 Oduflow uses addon code in the main or extra repositories when available. Otherwise
-it clones the configured connector repository and mounts **only** its `odumcp`
-addon read-only. This managed checkout survives container recreation and is not
-silently updated by unrelated deployments:
+it clones the connector repository at the branch of the production's own Odoo
+version (`18.0` for `odoo:18.0`) and mounts **only** its `odumcp` addon read-only.
+The version comes from the image tag; for a custom image without a version in its
+tag, Oduflow asks the image's `odoo --version`. This managed checkout survives
+container recreation and is not silently updated by unrelated deployments. When
+`reconfigure_production` moves a production to another Odoo version, the checkout
+is replaced with the new version's branch before the container is recreated; run
+`sync_production_mcp` afterwards to upgrade the installed module. A synchronization
+also replaces a checkout made for another version, and recreates the container
+whenever the container does not see the current checkout, which repairs an
+earlier synchronization whose recreation failed. Provisioning refuses to install
+an addon built for a different Odoo version than the one running:
 
 ```toml
 [production]
 enabled = true
 odumcp_repo_url = "https://github.com/oduflow/oduflow-client-addons.git"
-odumcp_ref = "19.0"  # branch or tag containing odumcp >= 19.0.1.1.0
 ```
 
-Deploy the accompanying addon changes before enabling this feature. The addon
-must implement `_set_oduflow_key`; an older release cannot synchronize credentials.
-For reproducible installations, select a released immutable tag. Source checkout
-failures, unavailable or incompatible modules and failed key provisioning do not
-fail production creation. Production remains available with a warning and an
-OduMCP status of `sync_failed`. Infrastructure tools continue to work. The
+The addon must implement `_set_oduflow_key`; an older release cannot synchronize
+credentials. Source checkout failures, unsupported Odoo versions, unavailable or
+incompatible modules and failed key provisioning do not fail production creation.
+Production remains available with a warning and an OduMCP status of `sync_failed`,
+which the dashboard shows as an **MCP FAILED** badge on the production card. A
+production on Odoo 15 or older gets the status `unsupported` instead, shown as
+**MCP N/A**: no synchronization can help there. Infrastructure tools continue to work. The
 `production_odoo_*` tools remain listed but return a configuration error until
 `sync_production_mcp` succeeds. Fix the addon source or compatibility issue and
 retry synchronization; recreating production is unnecessary.
