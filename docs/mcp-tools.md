@@ -2745,9 +2745,8 @@ unless `drop_database=true`.
 Kept leftovers are tombstoned: the reaper purges them `[lifecycle]
 prod_purge_hours` after deletion (`0` = keep forever, the default), and
 `oduflow cleanup --purge-deleted-productions --force` purges them immediately.
-Re-creating a production with the same name revives the leftovers'
-tombstone-free state — the kept database itself must still be dealt with
-explicitly.
+The name stays taken while leftovers are kept: `create_production` refuses it
+until they are purged.
 
 Lock: production. Destructive.
 { .odu-tool-meta }

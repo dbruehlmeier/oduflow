@@ -895,56 +895,110 @@ def _cleanup_partial_production(
     team: TeamSettings,
     name: str,
     *,
-    remove_workspace: bool = True,
+    db_created: bool,
 ) -> None:
-    """Best-effort teardown of a half-created production (rollback path).
+    """Teardown of a half-created production (rollback path), its registry
+    record included. create_production refused any leftovers of the name, so
+    everything here belongs to this attempt.
 
-    ``remove_workspace=False`` preserves a workspace that existed BEFORE this
-    create attempt — e.g. one kept by ``delete_production(drop_database=False)``
-    ("productions are precious"): its filestore and deploy history must survive
-    a failed re-create, which only borrowed the directory via
-    ``makedirs(exist_ok=True)``.
+    The database is dropped only if this attempt issued CREATE DATABASE. If
+    that drop fails, the database would be orphaned once the record goes:
+    nothing could ever reclaim it. The workspace, which holds the PG
+    credentials, is then kept and tombstoned instead, so the purge sweep
+    drops the database, role and workspace later.
     """
-    env_name = prod_env_name(name)
+    from oduflow import production_registry
+
     try:
         container = _get_container(client, settings, team, name)
         if container is not None:
             container.remove(force=True)
     except Exception:
         pass
-    env_db = prod_db_name(team, name)
-    try:
-        if _db_exists(
-            client, settings, env_db, container_name=settings.prod_db_container
-        ):
-            _exec_sql(
-                client,
-                settings,
-                f'DROP DATABASE IF EXISTS "{env_db}" WITH (FORCE);',
-                container_name=settings.prod_db_container,
+    db_left = False
+    if db_created:
+        db_dropped, warnings = _destroy_leftovers(
+            client, settings, team, name, require_db_drop=True
+        )
+        db_left = not db_dropped
+        for warning in warnings:
+            logger.warning("Rollback of production '%s': %s", name, warning)
+    else:
+        # No database means no PG role either: it is created after it.
+        _remove_workspace(team, name)
+    production_registry.delete_production(team, name)
+    if db_left:
+        # Only once the record is gone: the purge sweep clears a tombstone it
+        # finds on a registered production as stale.
+        try:
+            _write_tombstone(team, name, prod_db_name(team, name))
+            logger.warning(
+                "Tombstoned failed create of production '%s'; "
+                "`oduflow cleanup --purge-deleted-productions` reclaims it",
+                name,
             )
-    except Exception:
-        pass
-    try:
-        creds = load_credentials(
-            env_name, team.workspaces_dir, settings.db_user, settings.db_password
-        )
-        _drop_pg_role(
-            client,
-            settings,
-            creds["pg_user"],
-            container_name=settings.prod_db_container,
-        )
-    except Exception:
-        pass
+        except Exception as exc:
+            logger.warning(
+                "Could not tombstone failed create of production '%s': %s",
+                name,
+                exc,
+            )
+
+
+def _refuse_leftovers(
+    client: DockerClient, settings: Settings, team: TeamSettings, name: str
+) -> None:
+    """Refuse a name whose database or workspace is still around with no
+    registered production, naming the remedy that applies: delete_production
+    cannot help, since it needs a registry record.
+
+    A kept workspace is refused too. Creating over it would collide with its
+    repo and worktrees, and would mix the old filestore and deploy history
+    into the new production; so a deleted production's leftovers are purged
+    before its name is reused.
+    """
+    from oduflow import production_registry
+
+    env_db = prod_db_name(team, name)
     workspace = _workspace(team, name)
-    if not remove_workspace:
-        logger.warning(
-            "Leaving pre-existing production workspace intact after failed create: %s",
-            workspace,
+    db_exists = _db_exists(
+        client, settings, env_db, container_name=settings.prod_db_container
+    )
+    workspace_exists = os.path.isdir(workspace)
+    if not db_exists and not workspace_exists:
+        return
+    # A concurrent create may have registered the name since the early
+    # check: its resources are not leftovers.
+    production_registry.ensure_name_free(team, name)
+    kept = []
+    if db_exists:
+        kept.append(f"database '{env_db}'")
+    if workspace_exists:
+        kept.append(f"workspace '{workspace}'")
+    leftovers = " and ".join(kept)
+    if os.path.isfile(_tombstone_path(team, name)):
+        raise ConflictError(
+            f"Leftovers of production '{name}' are still kept: {leftovers}. "
+            "It was deleted without drop_database, or its failed create could "
+            "not drop the database. Copy anything you still need out of the "
+            f"workspace, run `oduflow cleanup --team {team.team_id} "
+            "--purge-deleted-productions` to review the leftovers, then add "
+            "--force to purge them permanently (it also removes the orphaned "
+            "dev resources it lists), and retry."
         )
-    elif os.path.isdir(workspace):
-        shutil.rmtree(workspace, ignore_errors=True)
+    message = (
+        f"No production '{name}' is registered, and nothing marks these "
+        f"leftovers as deleted: {leftovers}. A production deleted before "
+        "deletions were tombstoned, or a failed create, can leave them behind. "
+        "Check that they hold nothing you need, remove them, and retry."
+    )
+    if db_exists:
+        message += (
+            f" Drop the database with: docker exec {settings.prod_db_container} "
+            f"psql -U {settings.db_user} -d postgres -c "
+            f"'DROP DATABASE \"{env_db}\" WITH (FORCE);'"
+        )
+    raise ConflictError(message)
 
 
 def _container_spec(
@@ -1118,6 +1172,10 @@ def create_production(
             'Production hosting requires routing_mode = "traefik" (custom '
             "domains are routed via Traefik Host rules)."
         )
+    # A registered production owns its database and workspace: report the
+    # name as taken before the leftover check below can mistake them for
+    # debris.
+    production_registry.ensure_name_free(team, name)
     if not domain:
         # In a base-domain team the first production defaults to the zone
         # apex, later ones to <name>.<base_domain>.
@@ -1175,15 +1233,10 @@ def create_production(
         client, settings, odoo_image, container_name=settings.prod_db_container
     )
 
-    # Refuse to clobber leftovers: a previous production's database kept by
-    # delete_production(drop_database=False) must be dealt with explicitly.
-    if _db_exists(client, settings, env_db, container_name=settings.prod_db_container):
-        raise ConflictError(
-            f"Database '{env_db}' already exists in the production cluster "
-            f"(left by a previous production '{name}'). Delete it first "
-            "(delete_production with drop_database=true recreates cleanly) "
-            "or drop it manually."
-        )
+    # Refuse to clobber leftovers: a database or workspace with no registered
+    # production (kept by delete_production(drop_database=False), or left by
+    # a failed create) must be dealt with explicitly.
+    _refuse_leftovers(client, settings, team, name)
     try:
         client.containers.get(container_name)
         raise ConflictError(f"Production '{name}' container already exists.")
@@ -1211,18 +1264,11 @@ def create_production(
         },
     )
 
-    # A workspace kept by delete_production(drop_database=False) holds the old
-    # production's filestore and deploy history; the rollback below must not
-    # destroy what this attempt did not create.
-    workspace_preexisted = os.path.isdir(workspace)
-
+    db_created = False
     promo_notes: list[str] = []
     try:
         ensure_team_network(client, settings, team)
         os.makedirs(workspace, exist_ok=True)
-        # Re-creating a soft-deleted name revives it: drop the tombstone so
-        # the purge sweep never eats the new production's bytes.
-        clear_tombstone(team, name)
 
         # Full clone — commit history is the point for production.
         repo_path = get_repo_path(env_name, team.workspaces_dir)
@@ -1295,6 +1341,9 @@ def create_production(
                 "and retry sync_production_mcp."
             )
 
+        # Set before the statement: a database PG created despite an error
+        # (a lost connection, a timeout) is still this attempt's to drop.
+        db_created = True
         _exec_sql(
             client,
             settings,
@@ -1447,14 +1496,7 @@ def create_production(
         logger.error(
             "create_production('%s') failed; rolling back partial resources", name
         )
-        _cleanup_partial_production(
-            client,
-            settings,
-            team,
-            name,
-            remove_workspace=not workspace_preexisted,
-        )
-        production_registry.delete_production(team, name)
+        _cleanup_partial_production(client, settings, team, name, db_created=db_created)
         raise
 
     logger.info(
@@ -2109,7 +2151,6 @@ def _destroy_leftovers(
     sweep retries instead of orphaning the database silently."""
     env_name = prod_env_name(name)
     env_db = prod_db_name(team, name)
-    workspace = _workspace(team, name)
     warnings: list[str] = []
 
     db_dropped = True
@@ -2137,17 +2178,25 @@ def _destroy_leftovers(
         )
     except Exception as exc:
         warnings.append(f"Failed to drop PG role: {exc}")
-    if os.path.isdir(workspace):
-        extra_dir = os.path.join(workspace, "extra")
-        if os.path.isdir(extra_dir):
-            from oduflow.extra_addons import remove_worktree
-
-            for repo_name in os.listdir(extra_dir):
-                wt_path = os.path.join(extra_dir, repo_name)
-                if os.path.isdir(wt_path):
-                    remove_worktree(team, repo_name, wt_path)
-        shutil.rmtree(workspace, ignore_errors=True)
+    _remove_workspace(team, name)
     return db_dropped, warnings
+
+
+def _remove_workspace(team: TeamSettings, name: str) -> None:
+    """Delete a production workspace, unregistering its extra-addons
+    worktrees from their shared bare clones first."""
+    workspace = _workspace(team, name)
+    if not os.path.isdir(workspace):
+        return
+    extra_dir = os.path.join(workspace, "extra")
+    if os.path.isdir(extra_dir):
+        from oduflow.extra_addons import remove_worktree
+
+        for repo_name in os.listdir(extra_dir):
+            wt_path = os.path.join(extra_dir, repo_name)
+            if os.path.isdir(wt_path):
+                remove_worktree(team, repo_name, wt_path)
+    shutil.rmtree(workspace, ignore_errors=True)
 
 
 def purge_deleted_productions(
@@ -2164,8 +2213,8 @@ def purge_deleted_productions(
 
     ``older_than_hours`` keeps leftovers younger than the cutoff (the reaper
     passes ``[lifecycle] prod_purge_hours``); ``0`` purges immediately (the
-    ``cleanup --purge-deleted-productions`` CLI). A tombstone on a production
-    that is back in the registry is stale (the name was re-created): it is
+    ``cleanup --purge-deleted-productions`` CLI). A tombstone on a registered
+    production is stale (create_production refuses a tombstoned name): it is
     removed and the leftovers are NOT touched. Pass the server's LockManager
     as ``locks`` to skip productions busy with another operation.
 

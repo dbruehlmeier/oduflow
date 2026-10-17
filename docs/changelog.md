@@ -46,6 +46,21 @@
   commented-out example: on Odoo 16+, the native neutralization already
   deactivates mail servers. Run `oduflow upgrade` to update an existing,
   unmodified copy.
+- **Production database left by a failed create** — when a failed
+  `create_production` could not drop the database it had created, the
+  rollback ignored the error. The retry then failed with "already exists in
+  the production cluster" and suggested `delete_production`, which cannot find
+  a production with no registry record. The rollback now tombstones such an
+  attempt, so `oduflow cleanup --purge-deleted-productions` reclaims it. The
+  error now names the remedy that applies: purge for tombstoned leftovers, a
+  manual `DROP DATABASE` for an unmarked database. An existing production
+  gets a plain "already exists" error.
+- **Re-creating a deleted production over its kept workspace** — after
+  `delete_production` without `drop_database` and a manual drop of the
+  database, re-creating the name failed at `git clone` on the old repository,
+  and the rollback removed the workspace's purge marker. `create_production`
+  now refuses up front while the workspace is still on disk, and names the
+  purge that frees the name.
 
 ## v1.88.0
 
