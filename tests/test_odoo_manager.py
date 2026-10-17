@@ -1,5 +1,6 @@
 import dataclasses
 import json
+import logging
 import os
 import re
 import tarfile
@@ -4707,7 +4708,7 @@ class TestAgentContainer:
         assert any(v["bind"] == "/run/oduflow/git-credentials" for v in vols.values())
 
     def test_ensure_recreates_when_pinned_image_changes(
-        self, monkeypatch, mock_docker_client
+        self, monkeypatch, mock_docker_client, caplog
     ):
         monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
@@ -4720,17 +4721,45 @@ class TestAgentContainer:
         existing = self._existing_container(old_settings, team, monkeypatch)
         mock_docker_client.volumes.get.return_value = MagicMock()
         mock_docker_client.containers.get.return_value = existing
+        mock_docker_client.api.pull.return_value = [
+            {"status": "Pulling from oduist/oduflow-coder", "id": "0.3.4"}
+        ]
 
-        env_ops._ensure_agent_container(mock_docker_client, new_settings, team)
+        with caplog.at_level(logging.INFO, logger="oduflow"):
+            env_ops._ensure_agent_container(mock_docker_client, new_settings, team)
 
-        mock_docker_client.images.pull.assert_called_once_with(DEFAULT_AGENT_IMAGE)
+        mock_docker_client.api.pull.assert_called_once_with(
+            DEFAULT_AGENT_IMAGE, stream=True, decode=True
+        )
+        # The pull can block startup for a long time: the reason, the daemon's
+        # progress and the duration are all logged.
+        messages = [record.getMessage() for record in caplog.records]
+        assert (
+            f"Agent config changed; pulling agent image {DEFAULT_AGENT_IMAGE}"
+            in messages
+        )
+        assert "Agent image: Pulling from oduist/oduflow-coder 0.3.4" in messages
+        assert any(
+            m.startswith(f"Pulled agent image {DEFAULT_AGENT_IMAGE} in ")
+            for m in messages
+        )
         existing.remove.assert_called_once_with(force=True)
         assert mock_docker_client.containers.run.call_args.kwargs["image"] == (
             DEFAULT_AGENT_IMAGE
         )
 
+    @pytest.mark.parametrize(
+        "pull",
+        [
+            # The request itself fails (registry unreachable, unknown tag).
+            {"side_effect": RuntimeError("registry down")},
+            # The daemon reports a failure mid-stream instead of raising.
+            {"return_value": [{"error": "unexpected EOF"}]},
+        ],
+        ids=["request-error", "stream-error"],
+    )
     def test_failed_image_pull_preserves_existing_container(
-        self, monkeypatch, mock_docker_client
+        self, monkeypatch, mock_docker_client, caplog, pull
     ):
         monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
@@ -4742,12 +4771,21 @@ class TestAgentContainer:
         existing.labels = {"oduflow.agent_config_hash": "stale"}
         mock_docker_client.volumes.get.return_value = MagicMock()
         mock_docker_client.containers.get.return_value = existing
-        mock_docker_client.images.pull.side_effect = RuntimeError("registry down")
+        mock_docker_client.api.pull.configure_mock(**pull)
 
-        env_ops._ensure_agent_container(mock_docker_client, settings, team)
+        with caplog.at_level(logging.WARNING, logger="oduflow"):
+            env_ops._ensure_agent_container(mock_docker_client, settings, team)
 
         existing.remove.assert_not_called()
         mock_docker_client.containers.run.assert_not_called()
+        assert any(
+            re.fullmatch(
+                rf"Could not pull agent image {re.escape(DEFAULT_AGENT_IMAGE)} "
+                r"after \d+\.\ds; keeping existing container",
+                record.getMessage(),
+            )
+            for record in caplog.records
+        )
 
     def test_api_key_when_no_subscription(self, monkeypatch, mock_docker_client):
         monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
