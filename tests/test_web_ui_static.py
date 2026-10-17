@@ -1774,9 +1774,19 @@ var _walStatus = Object.assign({}, base, {
 });
 renderWalStatus();
 var zeros = elements['prod-wal'].innerHTML;
-_walStatus = Object.assign({}, base, {archiver: {}});
+_walStatus = Object.assign({}, base, {
+  archiver: {}, storage: {status: 'ok'}, preflight: {status: 'ok'}
+});
 renderWalStatus();
-process.stdout.write(JSON.stringify({zeros: zeros, missing: elements['prod-wal'].innerHTML}));
+var missing = elements['prod-wal'].innerHTML;
+_walStatus = Object.assign({}, base, {
+  archiver: {last_archived_time: '2026-10-17T11:54:14.5+00:00'}
+});
+renderWalStatus();
+process.stdout.write(JSON.stringify({
+  zeros: zeros, missing: missing, archived: elements['prod-wal'].innerHTML,
+  local: new Date('2026-10-17T11:54:14.5+00:00').toLocaleString()
+}));
 """
     )
 
@@ -1786,3 +1796,8 @@ process.stdout.write(JSON.stringify({zeros: zeros, missing: elements['prod-wal']
         assert f"{label}: <strong>0</strong>" in result["zeros"]
         assert f"{label}: <strong>—</strong>" in result["missing"]
     assert "Queue: <strong>0 segments · 0 B</strong>" in result["zeros"]
+    assert "Storage probe: <strong>—</strong>" in result["missing"]
+    assert "Last startup check: <strong>ok</strong>" in result["missing"]
+    assert "undefined" not in result["missing"]
+    assert "null" not in result["missing"]
+    assert f"Last archive: <strong>{result['local']}</strong>" in result["archived"]

@@ -3451,8 +3451,9 @@ of the WAL-G executable never switch configured archiving to a success no-op.
 
 #### Reading the WAL panel
 
-The badge is `ok`, `warn`, `error`, `off` (archiving not configured) or
-`unknown` (the sample is stale), always with a text summary such as
+The badge is `ok`, `warn`, `error`, `off` (archiving not configured, or
+production PostgreSQL not provisioned) or `unknown` (the sample is stale, or
+the browser could not fetch the status), always with a text summary such as
 *Archiving is idle* (empty queue), *Archiving WAL*, or the reason for a
 warning or error.
 
@@ -3462,23 +3463,24 @@ warning or error.
 | **Queue stop limit** | `stop_queue_gb`. A queue this large trips protection even with ample free disk. A queue above `warn_queue_gb` only warns. |
 | **Oldest waiting** | Age of the oldest segment still waiting for upload. |
 | **No progress** | How long archiving has made no progress while a queue exists. Warns after `warn_after`, errors after `stall_after`. |
-| **WAL on disk** | Total size of `pg_wal`, including already-archived segments that PostgreSQL keeps for reuse. A few hundred MiB with an empty queue is normal. |
-| **Available to PostgreSQL** | Free space on the filesystem holding `PGDATA`, as available to the non-root postgres user. The status warns below 15% of the filesystem. |
+| **WAL on disk** | Total size of `pg_wal`, including already-archived segments that PostgreSQL keeps for reuse. With an empty queue, anything between `min_wal_size` and `max_wal_size` (512 MiB to a few GiB with the default tuning) is normal. |
+| **Available to PostgreSQL** | Free space on the filesystem holding `pg_wal` (the WAL filesystem), as available to the non-root postgres user. The status warns below 15% of the filesystem. |
 | **Safety reserve** | `stop_free_gb`. When free space reaches it, protection stops the cluster. Releasing protection requires `resume_free_gb`. |
 | **Disk consumption** | How fast free space is shrinking: the larger of the five-minute average and the slope since the previous sample. It covers the whole filesystem, not just WAL. |
 | **Estimated time to reserve** | `(available − reserve) / consumption`: how long until the reserve is reached at the current rate. |
 | **Archived** | `pg_stat_archiver.archived_count`: segments archived since the statistics were last reset. |
-| **Last archive** | Time of the last successful upload (UTC). It should keep advancing while WAL is generated. |
+| **Last archive** | Time of the last successful upload, in the browser's local time. It should keep advancing while WAL is generated. |
 | **Failed attempts** | `pg_stat_archiver.failed_count`: failed `archive_command` runs. |
 | **PG restarts** | Docker restart count of the shared PostgreSQL container. |
 | **Current upload** | Shown only while an upload runs: the segment and its elapsed time. |
+| **Last upload failed** | Shown only when the last `wal-push` exited non-zero: its exit code. Details are in the PostgreSQL logs. |
 | **Storage probe** | How storage access was verified: a WAL-G list run inside production PostgreSQL (see above). |
 | **Last startup check** | Result of the deployment preflight, when one has run. |
 | **Sample** | When the shown data was collected, in the browser's local time. |
 
-**Pause archiving**, **Retry upload**, **Start PostgreSQL recovery** and
-**Release protection** correspond to the `pause`, `retry`, `recover` and
-`release` actions below.
+**Pause archiving** / **Resume archiving**, **Retry upload**, **Start
+PostgreSQL recovery** and **Release protection** correspond to the `pause` /
+`resume`, `retry`, `recover` and `release` actions below.
 
 Defaults can be changed in TOML:
 
