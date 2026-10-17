@@ -802,8 +802,7 @@ they can be reclaimed later:
 - **Deferred purge** — set `[lifecycle] prod_purge_hours = N` in
   `oduflow.toml` and the background sweep permanently purges the leftovers
   (database, PostgreSQL role, workspace) N hours after the deletion. `0`
-  (default) keeps them forever. Re-creating a production with the same name
-  clears the tombstone, so a revived production is never purged.
+  (default) keeps them forever.
 - **Immediate purge** — `oduflow cleanup --purge-deleted-productions`
   lists tombstoned leftovers; add `--force` to purge them now, regardless of
   age.
@@ -811,6 +810,20 @@ they can be reclaimed later:
 Only tombstoned leftovers are ever purged: a workspace without the marker is
 presumed alive and is never touched (`oduflow cleanup` skips the whole
 `prod-*` namespace for the same reason).
+
+A deleted production's name stays taken while its leftovers are kept:
+`create_production` refuses a name whose database is still in the production
+cluster, or whose workspace is still on disk. Creating over a kept workspace
+would collide with its repository and mix the old filestore and deploy history
+into the new production. Copy out anything you still need, purge the
+leftovers, and create again.
+
+A failed `create_production` rolls back what it created. If the rollback
+cannot drop the new database, it tombstones the attempt, so the same purge
+reclaims it. The refusal names the remedy that applies: purge for tombstoned
+leftovers; for unmarked ones (a production deleted before tombstones existed,
+for example), a manual `DROP DATABASE` and removal of the workspace, after you
+check that they hold nothing you need.
 
 ## MCP tool reference
 
