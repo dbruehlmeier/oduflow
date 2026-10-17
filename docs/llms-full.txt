@@ -3429,11 +3429,16 @@ emergency recovery.
 
 ### WAL monitoring and automatic disk protection
 
+PostgreSQL records every change in 16 MiB WAL segments, and WAL-G uploads each
+finished segment to S3; that stream is what makes point-in-time recovery
+possible. PostgreSQL cannot delete or recycle a segment until it has been
+archived, so when uploads stop, WAL keeps accumulating on the same disk as the
+production databases. The monitor watches two things: whether archiving is
+making progress, and whether the disk will run out before it does.
+
 The **PostgreSQL WAL** panel in Production is shared by every production and
-team. It shows the queue's segment count and bytes, age of the oldest waiting
-segment, time without archive progress, current upload duration, last upload
-exit status, PostgreSQL restart count, and free space on the actual WAL
-filesystem. Space reserved for root is excluded. A dedicated daemon samples
+team. Free space is measured on the actual WAL filesystem; space reserved for
+root is excluded. A dedicated daemon samples
 locally every 15 seconds, independently of backup jobs and dashboard polling;
 the storage probe runs only after the local protection decision. Missing or
 older-than-60-second samples are errors, never healthy results.
@@ -3443,6 +3448,37 @@ progress triggers warning/error thresholds. A draining but old backlog stays
 visible. WAL upload attempts have a hard timeout and return failure on timeout
 or termination; PostgreSQL retains the segment and retries. Failed downloads
 of the WAL-G executable never switch configured archiving to a success no-op.
+
+#### Reading the WAL panel
+
+The badge is `ok`, `warn`, `error`, `off` (archiving not configured) or
+`unknown` (the sample is stale), always with a text summary such as
+*Archiving is idle* (empty queue), *Archiving WAL*, or the reason for a
+warning or error.
+
+| Field | Meaning |
+| --- | --- |
+| **Queue** | Segments waiting for upload (`.ready` files in `pg_wal/archive_status`) and their total size. |
+| **Queue stop limit** | `stop_queue_gb`. A queue this large trips protection even with ample free disk. A queue above `warn_queue_gb` only warns. |
+| **Oldest waiting** | Age of the oldest segment still waiting for upload. |
+| **No progress** | How long archiving has made no progress while a queue exists. Warns after `warn_after`, errors after `stall_after`. |
+| **WAL on disk** | Total size of `pg_wal`, including already-archived segments that PostgreSQL keeps for reuse. A few hundred MiB with an empty queue is normal. |
+| **Available to PostgreSQL** | Free space on the filesystem holding `PGDATA`, as available to the non-root postgres user. The status warns below 15% of the filesystem. |
+| **Safety reserve** | `stop_free_gb`. When free space reaches it, protection stops the cluster. Releasing protection requires `resume_free_gb`. |
+| **Disk consumption** | How fast free space is shrinking: the larger of the five-minute average and the slope since the previous sample. It covers the whole filesystem, not just WAL. |
+| **Estimated time to reserve** | `(available − reserve) / consumption`: how long until the reserve is reached at the current rate. |
+| **Archived** | `pg_stat_archiver.archived_count`: segments archived since the statistics were last reset. |
+| **Last archive** | Time of the last successful upload (UTC). It should keep advancing while WAL is generated. |
+| **Failed attempts** | `pg_stat_archiver.failed_count`: failed `archive_command` runs. |
+| **PG restarts** | Docker restart count of the shared PostgreSQL container. |
+| **Current upload** | Shown only while an upload runs: the segment and its elapsed time. |
+| **Storage probe** | How storage access was verified: a WAL-G list run inside production PostgreSQL (see above). |
+| **Last startup check** | Result of the deployment preflight, when one has run. |
+| **Sample** | When the shown data was collected, in the browser's local time. |
+
+**Pause archiving**, **Retry upload**, **Start PostgreSQL recovery** and
+**Release protection** correspond to the `pause`, `retry`, `recover` and
+`release` actions below.
 
 Defaults can be changed in TOML:
 

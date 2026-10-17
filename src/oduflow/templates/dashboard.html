@@ -10200,7 +10200,8 @@ function renderWalStatus() {
   var g = s.guard || {};
   var a = s.archiver || {};
   var badge = s.status === 'ok' ? 'badge-running' : s.status === 'warn' ? 'badge-busy' : s.status === 'off' ? 'badge-neutral' : 'badge-exited';
-  function metric(label, value) { return '<span>' + label + ': <strong>' + esc(value) + '</strong></span>'; }
+  // String(): esc() blanks falsy input, which would hide zero counts.
+  function metric(label, value) { return '<span>' + label + ': <strong>' + esc(String(value)) + '</strong></span>'; }
   function button(action, label, disabled) {
     return '<button class="btn"' + ((_walBusy || disabled) ? ' disabled' : '') +
       ' onclick="controlWal(\'' + action + '\')">' + (_walBusy ? 'Working…' : label) + '</button>';
