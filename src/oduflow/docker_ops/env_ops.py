@@ -22,7 +22,12 @@ import docker
 from docker import DockerClient
 from oduflow import activity, branding, env_share, secret_store, settings
 from oduflow.docker_ops import image_cleanup
-from oduflow.docker_ops.client import chown_recursive, get_client, get_odoo_uid_gid
+from oduflow.docker_ops.client import (
+    chown_recursive,
+    get_client,
+    get_odoo_uid_gid,
+    pull_with_progress,
+)
 from oduflow.docker_ops.stats import default_env_limits
 from oduflow.docker_ops.system_ops import (
     _copy_file_to_container,
@@ -3230,8 +3235,30 @@ def _ensure_agent_container(
         # Resolve the exact immutable image before touching a working
         # container. A failed pull therefore leaves the previous agent
         # available and its old config hash ensures a later restart retries.
+        # Any config drift lands here, not only a new image: a tag that is
+        # already local costs one registry round-trip, a new pinned tag a
+        # ~1 GB download that blocks server startup. Hence the reason up
+        # front, periodic progress, and the duration either way.
+        reason = (
+            "Agent container missing"
+            if existing_container is None
+            else "Agent config changed"
+        )
+        logger.info(
+            "%s; pulling agent image %s",
+            reason,
+            settings.agent_image,
+            extra={"container": container_name},
+        )
+        pull_started = time.monotonic()
         try:
-            client.images.pull(settings.agent_image)
+            pull_with_progress(client, settings.agent_image, "Agent image")
+            logger.info(
+                "Pulled agent image %s in %.1fs",
+                settings.agent_image,
+                time.monotonic() - pull_started,
+                extra={"container": container_name},
+            )
         except Exception:
             outcome = (
                 "keeping existing container"
@@ -3239,8 +3266,9 @@ def _ensure_agent_container(
                 else "agent container was not created"
             )
             logger.warning(
-                "Could not pull agent image %s; %s",
+                "Could not pull agent image %s after %.1fs; %s",
                 settings.agent_image,
+                time.monotonic() - pull_started,
                 outcome,
                 extra={"container": container_name},
                 exc_info=True,
@@ -3251,7 +3279,7 @@ def _ensure_agent_container(
             # Config changed — recreate with the already-pulled image. HOME and
             # /workspace are volumes, so auth, sessions and checkouts survive.
             logger.info(
-                "Agent config changed; recreating container",
+                "Recreating agent container",
                 extra={"container": container_name},
             )
             existing_container.remove(force=True)
