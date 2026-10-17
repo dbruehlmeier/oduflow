@@ -1736,3 +1736,68 @@ def test_create_production_explains_ssh_urls_and_mcp_failures(tmp_path):
     assert "p.mcp_status === 'sync_failed'" in dashboard
     assert 'run sync_production_mcp.">MCP failed</span>' in dashboard
     assert 'Infrastructure tools work.">MCP n/a</span>' in dashboard
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")
+def test_wal_panel_renders_zero_counts():
+    dashboard = _DASHBOARD.read_text(encoding="utf-8")
+    functions = "\n".join(
+        _js_function(dashboard, name)
+        for name in ("esc", "walDuration", "renderWalStatus")
+    )
+    harness = (
+        functions
+        + r"""
+var elements = {'prod-wal': {innerHTML: ''}};
+// textContent follows the DOM: null clears it, anything else is stringified.
+var document = {
+  getElementById: function (id) { return elements[id]; },
+  createElement: function () {
+    var text = '';
+    return {
+      set textContent(value) { text = value == null ? '' : String(value); },
+      get innerHTML() {
+        return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      }
+    };
+  }
+};
+function fmtBytes(n) { return n + ' B'; }
+var _walBusy = false;
+var base = {
+  configured: true, status: 'ok', detail: 'Archiving is idle', pg_status: 'running',
+  ready_count: 0, ready_bytes: 0, guard: {}, sampled_at: 0
+};
+var _walStatus = Object.assign({}, base, {
+  restart_count: 0,
+  archiver: {archived_count: 0, failed_count: 0, last_archived_time: null}
+});
+renderWalStatus();
+var zeros = elements['prod-wal'].innerHTML;
+_walStatus = Object.assign({}, base, {
+  archiver: {}, storage: {status: 'ok'}, preflight: {status: 'ok'}
+});
+renderWalStatus();
+var missing = elements['prod-wal'].innerHTML;
+_walStatus = Object.assign({}, base, {
+  archiver: {last_archived_time: '2026-10-17T11:54:14.5+00:00'}
+});
+renderWalStatus();
+process.stdout.write(JSON.stringify({
+  zeros: zeros, missing: missing, archived: elements['prod-wal'].innerHTML,
+  local: new Date('2026-10-17T11:54:14.5+00:00').toLocaleString()
+}));
+"""
+    )
+
+    result = _run_node(harness)
+
+    for label in ("Archived", "Failed attempts", "PG restarts"):
+        assert f"{label}: <strong>0</strong>" in result["zeros"]
+        assert f"{label}: <strong>—</strong>" in result["missing"]
+    assert "Queue: <strong>0 segments · 0 B</strong>" in result["zeros"]
+    assert "Storage probe: <strong>—</strong>" in result["missing"]
+    assert "Last startup check: <strong>ok</strong>" in result["missing"]
+    assert "undefined" not in result["missing"]
+    assert "null" not in result["missing"]
+    assert f"Last archive: <strong>{result['local']}</strong>" in result["archived"]

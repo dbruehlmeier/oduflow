@@ -10200,7 +10200,12 @@ function renderWalStatus() {
   var g = s.guard || {};
   var a = s.archiver || {};
   var badge = s.status === 'ok' ? 'badge-running' : s.status === 'warn' ? 'badge-busy' : s.status === 'off' ? 'badge-neutral' : 'badge-exited';
-  function metric(label, value) { return '<span>' + label + ': <strong>' + esc(value) + '</strong></span>'; }
+  // esc() blanks falsy input, which would hide zero counts; missing values show "—".
+  function metric(label, value) { return '<span>' + label + ': <strong>' + esc(value == null ? '—' : String(value)) + '</strong></span>'; }
+  function localTime(value) {
+    var d = value ? new Date(value) : null;
+    return d && !isNaN(d) ? d.toLocaleString() : value;
+  }
   function button(action, label, disabled) {
     return '<button class="btn"' + ((_walBusy || disabled) ? ' disabled' : '') +
       ' onclick="controlWal(\'' + action + '\')">' + (_walBusy ? 'Working…' : label) + '</button>';
@@ -10213,22 +10218,22 @@ function renderWalStatus() {
     '<div class="env-actions">' + actions + '</div></div>' +
     '<p>' + esc(s.detail || '') + '</p>' +
     '<div class="env-meta">' +
-      metric('Queue', s.ready_count == null ? '—' : s.ready_count + ' segments · ' + fmtBytes(s.ready_bytes)) + ' · ' +
-      metric('Queue stop limit', s.stop_queue_bytes == null ? '—' : fmtBytes(s.stop_queue_bytes)) + ' · ' +
+      metric('Queue', s.ready_count == null ? null : s.ready_count + ' segments · ' + fmtBytes(s.ready_bytes)) + ' · ' +
+      metric('Queue stop limit', s.stop_queue_bytes == null ? null : fmtBytes(s.stop_queue_bytes)) + ' · ' +
       metric('Oldest waiting', walDuration(s.oldest_ready_seconds)) + ' · ' +
       metric('No progress', walDuration(s.no_progress_seconds)) + '</div>' +
-    '<div class="env-meta">' + metric('WAL on disk', s.wal_bytes == null ? '—' : fmtBytes(s.wal_bytes)) + ' · ' +
-      metric('Available to PostgreSQL', s.disk_free_bytes == null ? '—' : fmtBytes(s.disk_free_bytes)) + ' · ' +
-      metric('Safety reserve', s.reserve_bytes == null ? '—' : fmtBytes(s.reserve_bytes)) + ' · ' +
-      metric('Disk consumption', s.disk_growth_bytes_per_second == null ? '—' : fmtBytes(s.disk_growth_bytes_per_second) + '/s') + ' · ' +
+    '<div class="env-meta">' + metric('WAL on disk', s.wal_bytes == null ? null : fmtBytes(s.wal_bytes)) + ' · ' +
+      metric('Available to PostgreSQL', s.disk_free_bytes == null ? null : fmtBytes(s.disk_free_bytes)) + ' · ' +
+      metric('Safety reserve', s.reserve_bytes == null ? null : fmtBytes(s.reserve_bytes)) + ' · ' +
+      metric('Disk consumption', s.disk_growth_bytes_per_second == null ? null : fmtBytes(s.disk_growth_bytes_per_second) + '/s') + ' · ' +
       metric('Estimated time to reserve', walDuration(s.seconds_to_reserve)) + '</div>' +
-    '<div class="env-meta">' + metric('Archived', a.archived_count == null ? '—' : a.archived_count) + ' · ' +
-      metric('Last archive', a.last_archived_time || '—') + ' · ' + metric('Failed attempts', a.failed_count == null ? '—' : a.failed_count) + ' · ' +
-      metric('PG restarts', s.restart_count == null ? '—' : s.restart_count) + '</div>' +
+    '<div class="env-meta">' + metric('Archived', a.archived_count) + ' · ' +
+      metric('Last archive', localTime(a.last_archived_time) || null) + ' · ' + metric('Failed attempts', a.failed_count) + ' · ' +
+      metric('PG restarts', s.restart_count) + '</div>' +
     (s.attempt ? '<div class="env-meta">' + metric('Current upload', s.attempt.segment + ' · ' + walDuration(s.attempt.seconds)) + '</div>' : '') +
     (s.last_attempt && s.last_attempt.exit_code ? '<p>Last upload failed: exit ' + esc(s.last_attempt.exit_code) + '. Check PostgreSQL logs.</p>' : '') +
     (s.storage ? '<div class="env-meta">' + metric('Storage probe', s.storage.detail) + '</div>' : '') +
-    (s.preflight && s.preflight.status ? '<div class="env-meta">' + metric('Last startup check', s.preflight.status + ' · ' + s.preflight.detail) + '</div>' : '') +
+    (s.preflight && s.preflight.status ? '<div class="env-meta">' + metric('Last startup check', [s.preflight.status, s.preflight.detail].filter(Boolean).join(' · ')) + '</div>' : '') +
     '<div class="env-meta">Shared by all productions and teams. ' +
       (g.latched ? 'Applications remain stopped during recovery. ' : '') +
       (g.paused ? 'Paused archiving retains WAL and does not free disk space. ' : '') +
