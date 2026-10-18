@@ -778,6 +778,7 @@ class TestCountingStorage:
         storage = self._counting(tmp_path)
 
         storage.put("k", b"v")
+        storage.put_if_absent("k3", b"v")
         storage.exists("k")
         storage.get("k")
         storage.list("")
@@ -788,6 +789,7 @@ class TestCountingStorage:
             "exists": 1,
             "get": 1,
             "put": 1,
+            "put_if_absent": 1,
             "list": 1,
             "rename": 1,
             "delete": 1,
@@ -1586,3 +1588,40 @@ class TestPruneCounters:
     def test_prune_without_a_policy_is_refused(self, small_config_storage):
         with pytest.raises(ValueError, match="keep or keep_revisions"):
             chunkstore.prune(small_config_storage)
+
+
+class TestEnsureConfigRace:
+    """P-M16: ensure_config used exists-then-put; two concurrent first backups
+    on a fresh store minted different seed/hash/id keys and the loser's
+    revision was permanently unrestorable. Creation is now first-writer-wins
+    and the loser adopts the winner's config."""
+
+    def test_local_put_if_absent_is_create_only(self, tmp_path):
+        storage = LocalStorage(str(tmp_path))
+        assert storage.put_if_absent("k", b"winner") is True
+        assert storage.put_if_absent("k", b"loser") is False
+        assert storage.get("k") == b"winner"
+
+    def test_loser_adopts_the_winners_config(self, tmp_path):
+        storage = LocalStorage(str(tmp_path))
+        winner = ensure_config(storage)
+
+        class RacingStorage:
+            """exists() lies 'no' — the exact TOCTOU window the fix closes."""
+
+            def __init__(self, inner):
+                self.inner = inner
+
+            def exists(self, key):
+                return False
+
+            def __getattr__(self, name):
+                return getattr(self.inner, name)
+
+        loser = ensure_config(RacingStorage(storage))
+
+        # The loser did NOT overwrite the winner's keys — it adopted them, so
+        # revisions written by either caller restore with the same config.
+        assert loser.seed == winner.seed
+        assert loser.hash_key == winner.hash_key
+        assert loser.id_key == winner.id_key
