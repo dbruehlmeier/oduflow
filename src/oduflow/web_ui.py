@@ -1728,6 +1728,10 @@ def _build_routes(
                 target,
                 new_name=new_name or None,
             )
+            # A failed module apply after a completed switch is still a
+            # completed request (the switch persisted): report it via the
+            # result's exit_code/message, exactly like /sync and
+            # /modules/apply do.
             return JSONResponse({"ok": True, "result": result})
         except FlowError as e:
             return _error_response(e)
@@ -1807,6 +1811,11 @@ def _build_routes(
                 if body
                 else None,
             )
+            if result.get("exit_code"):
+                return JSONResponse(
+                    {"ok": False, "error": result["message"], "result": result},
+                    status_code=500,
+                )
             return JSONResponse({"ok": True, "result": result})
         except FlowError as e:
             return _error_response(e)

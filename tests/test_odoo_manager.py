@@ -1300,7 +1300,9 @@ class TestPullEnvironmentLocalAndSharedExtraCheckouts:
                     "changed_files": [],
                 },
             ),
-            patch("oduflow.docker_ops.env_ops.update_environment") as update,
+            patch(
+                "oduflow.docker_ops.env_ops.update_environment", return_value={}
+            ) as update,
             patch("oduflow.docker_ops.env_ops._cleanup_legacy_extra_worktrees"),
         ):
             result = env_ops.pull_environment(settings, team, "env")
@@ -1362,7 +1364,9 @@ class TestPullEnvironmentLocalAndSharedExtraCheckouts:
                     "changed_files": ["sale/models/sale.py"],
                 },
             ),
-            patch("oduflow.docker_ops.env_ops.update_environment") as update,
+            patch(
+                "oduflow.docker_ops.env_ops.update_environment", return_value={}
+            ) as update,
             patch("oduflow.docker_ops.env_ops._cleanup_legacy_extra_worktrees"),
             patch("oduflow.docker_ops.env_ops._apply_actions") as apply_actions,
         ):
@@ -1419,7 +1423,9 @@ class TestPullEnvironmentLocalAndSharedExtraCheckouts:
                 "oduflow.git_analysis.guardrail_warnings",
                 return_value=["upgrade sale is required"],
             ),
-            patch("oduflow.docker_ops.env_ops.update_environment") as update,
+            patch(
+                "oduflow.docker_ops.env_ops.update_environment", return_value={}
+            ) as update,
             patch("oduflow.docker_ops.env_ops._apply_actions") as apply,
         ):
             result = env_ops.pull_environment(
@@ -4563,13 +4569,13 @@ class TestApplyActionsDeps:
             changed_files=["requirements.txt"],
             dep_units=[("/repo", "/mnt/extra-addons")],
         )
-        assert result["action"] == "restart"
+        assert result["action"] == "error"
         assert "FAILED" in result["output"]
         assert result["exit_code"] == 1
         assert result["failed_step"] == "dependencies"
         assert result["dependencies_exit_code"] == 1
         assert "boom" in result["failed_step_output"]
-        container.restart.assert_called_once()
+        container.restart.assert_not_called()
 
     @patch(
         "oduflow.docker_ops.odoo_ops.upgrade_odoo_modules",
@@ -4579,15 +4585,17 @@ class TestApplyActionsDeps:
         "oduflow.docker_ops.env_ops._install_pip_requirements",
         side_effect=[
             (True, "[PIP] Requirements installed successfully:\nfine"),
-            (False, "[PIP] install FAILED (exit 1):\nno boto3 for you"),
+            (True, "[PIP] Requirements installed successfully:\nalso fine"),
         ],
     )
     @patch("oduflow.docker_ops.env_ops._install_apt_packages", return_value="")
     def test_upgrade_failure_keeps_the_dependency_code_visible(
         self, mock_apt, mock_pip, mock_upgrade
     ):
-        # The upgrade's code is the apply's status; the reinstall that failed
-        # before it — the likely cause — stays visible next to it.
+        # The upgrade's code is the apply's status; the reinstall that ran
+        # before it stays visible next to it, so a failed module command can
+        # be told apart from one that failed because a dependency did not
+        # install.
         client, _ = self._client_with_container()
         result = env_ops._apply_actions(
             client,
@@ -4604,7 +4612,40 @@ class TestApplyActionsDeps:
         assert result["exit_code"] == 255
         assert result["failed_step"] == "upgrade"
         assert result["failed_step_output"] == "ModuleNotFoundError: boto3"
-        assert result["dependencies_exit_code"] == 1
+        assert result["dependencies_exit_code"] == 0
+        assert "Module upgrade FAILED (exit 255): sale." in result["message"]
+
+    @patch("oduflow.docker_ops.odoo_ops.upgrade_odoo_modules")
+    @patch(
+        "oduflow.docker_ops.env_ops._install_pip_requirements",
+        return_value=(False, "[PIP] install FAILED (exit 1):\nno boto3 for you"),
+    )
+    @patch("oduflow.docker_ops.env_ops._install_apt_packages", return_value="")
+    def test_dependency_failure_stops_module_actions(
+        self, mock_apt, mock_pip, mock_upgrade
+    ):
+        # A failed reinstall stops the apply before any module command: the
+        # pending plan is returned for a retry instead of running an upgrade
+        # against a container that is missing its dependencies.
+        client, container = self._client_with_container()
+        result = env_ops._apply_actions(
+            client,
+            TEST_SETTINGS,
+            TEST_TEAM,
+            "feature/x",
+            "oduflow-1-feature-x-odoo",
+            to_install=[],
+            to_upgrade=["sale"],
+            do_restart=False,
+            changed_files=["requirements.txt", "sale/models/sale.py"],
+            dep_units=[("/repo", "/mnt/extra-addons")],
+        )
+        mock_upgrade.assert_not_called()
+        container.restart.assert_not_called()
+        assert result["action"] == "error"
+        assert result["exit_code"] == 1
+        assert result["failed_step"] == "dependencies"
+        assert result["pending_actions"]["upgrade"] == ["sale"]
 
     @patch(
         "oduflow.docker_ops.env_ops._install_pip_requirements",

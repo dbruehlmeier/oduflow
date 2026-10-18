@@ -3,7 +3,7 @@ from unittest.mock import patch
 
 import pytest
 
-from oduflow.errors import ConflictError
+from oduflow.errors import ConflictError, ExternalCommandError
 from oduflow.settings import Settings, TeamSettings
 from oduflow.stack_loader import StackValidationError, load_stack, resolve_env_values
 from oduflow.stack_models import ServiceDatabase, ServiceRoute, ValueFrom
@@ -800,3 +800,38 @@ class TestDesiredServiceHostname:
         settings = Settings(routing_mode="port", teams={"1": team})
 
         assert _desired_hostname(settings, team, "meilisearch", None) is None
+
+
+def test_stack_update_dependency_failure_preserves_actionable_error(stack_fixture):
+    settings, team, manifest, path = stack_fixture
+    actions = StackPlan(
+        "acme",
+        (
+            PlanAction("update", "environment"),
+            PlanAction("create", "services.fs"),
+            PlanAction("install", "modules", "acme_base"),
+        ),
+    )
+    with (
+        patch("oduflow.stack_ops.build_plan", return_value=actions),
+        patch(
+            "oduflow.stack_ops.env_ops.update_environment",
+            return_value={
+                "exit_code": 1,
+                "env_name": "acme-dev",
+                "setup_logs": ["[PIP] failed"],
+            },
+        ),
+        patch("oduflow.stack_ops.service_ops.create_service") as service,
+        patch("oduflow.stack_ops.odoo_ops.install_odoo_modules") as install,
+        patch("oduflow.stack_ops.save_state") as save,
+    ):
+        with pytest.raises(ExternalCommandError, match="was recreated") as exc:
+            apply_stack(settings, team, manifest, path)
+    assert "acme-dev" in str(exc.value)
+    assert "[PIP] failed" in str(exc.value)
+    assert "update_environment" in str(exc.value)
+    assert exc.value.exit_code == 1
+    service.assert_not_called()
+    install.assert_not_called()
+    save.assert_not_called()

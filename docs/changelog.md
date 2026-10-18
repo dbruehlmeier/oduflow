@@ -46,6 +46,21 @@
 
 ### Fixes
 
+- **Branch switches restore dependencies after container recreation** —
+  `switch_branch` reinstalls declared APT/PIP dependencies from the target code
+  and all mounted extra-addons repositories, even with unchanged requirements
+  or an empty diff. Same-branch renames restore dependencies too. Strict
+  guardrail refusals still restore the currently mounted code's dependencies;
+  installation failures are reported and stop subsequent module actions.
+  Failures retain the pending module plan and an explicit two-step retry plan
+  (restore dependencies, then replay the module actions) after the Git diff
+  has been consumed. Completed renames keep the agent checkout and MCP
+  configuration synchronized and report the resulting identity even when
+  dependency setup fails. A completed switch whose module apply failed is
+  reported honestly as a partial result instead of success prose. The
+  dashboard shows full failure output. Same-branch renames combine
+  extra-addons mount changes in one recreation; checking repositories without
+  dependency files adds no restart.
 - **Environment creation on development-only hosts with limited disk space** —
   the disk check now reserves max(1 GiB, min(1% of the disk, 2 GiB)) on devices
   that hold no production data, derived from the disk size rather than from

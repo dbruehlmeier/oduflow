@@ -1626,6 +1626,59 @@ fields['cp-fromenv'].value = 'dev';
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")
+@pytest.mark.parametrize("operation", ["switch", "update"])
+def test_partial_environment_failure_opens_result_modal(operation):
+    dashboard = _DASHBOARD.read_text(encoding="utf-8")
+    names = [
+        "showSyncResult",
+        "readResult",
+        "confirmSwitchBranch" if operation == "switch" else "confirmUpdateEnv",
+    ]
+    functions = "\n".join(_js_function(dashboard, name) for name in names)
+    harness = (
+        functions
+        + r"""
+var elements = {};
+var document = {getElementById: id => elements[id] || (elements[id] = {value: '', textContent: '', innerHTML: ''})};
+var _switchBranchEnv = 'old', _updateEnv = 'old', _updateEnvInitial = '', _updateEnvHostnameInitial = '', _updateEnvSeq = 0;
+var API = '/api/environments', modals = [], toasts = [];
+function hideModal() {}
+function showModal(id) { modals.push(id); }
+function showToast(text) { toasts.push(text); }
+function setBusy() {}
+function clearBusy() {}
+function esc(text) { return String(text).replace(/</g, '&lt;'); }
+async function loadEnvironments() {}
+document.getElementById('switch-branch-input').value = 'feature/new';
+document.getElementById('update-env-newname').value = 'renamed';
+var payload = {ok: false, error: 'failed', result: {
+    env_name: 'renamed', renamed_from: 'old', action: 'upgrade', exit_code: 1,
+    message: "Renamed old to renamed. Dependency/module action failed.",
+    output: 'Traceback: missing <dependency>'
+}};
+async function fetch() { return {ok: false, status: 500, text: async () => JSON.stringify(payload)}; }
+"""
+    )
+    if operation == "switch":
+        # The switch route reports a completed switch with a failed apply as
+        # a completed request: 200 with ok:true and the result's exit_code,
+        # unlike /update which keeps 500/ok:false.
+        harness += (
+            "\npayload = {ok: true, result: payload.result};\n"
+            "fetch = async () => ({ok: true, status: 200,"
+            " text: async () => JSON.stringify(payload)});\n"
+        )
+    harness += f"\n(async () => {{ await {'confirmSwitchBranch' if operation == 'switch' else 'confirmUpdateEnv'}(); process.stdout.write(JSON.stringify({{modals, toasts, title: elements['sync-result-title'].textContent, html: elements['sync-result-body'].innerHTML}})); }})();"
+    result = _run_node(harness)
+    assert result["modals"] == ["sync-result-modal"]
+    assert result["toasts"] == []
+    assert "renamed" in result["title"]
+    assert "Failed" in result["html"]
+    assert "Exit code: 1" in result["html"]
+    assert "Traceback: missing &lt;dependency>" in result["html"]
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")
 def test_create_production_shows_progress_and_reports_in_the_dialog():
     """Creation pulls an image and initializes a database for minutes: the
     dialog must show that it is working, refuse a second submit, and keep the
