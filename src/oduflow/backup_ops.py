@@ -126,7 +126,17 @@ def _dump_stream(container: Any, db_user: str, db_name: str) -> Iterator[bytes]:
         if stdout:
             yield stdout
     exit_code = api.exec_inspect(exec_id).get("ExitCode")
-    if exit_code:
+    if exit_code != 0:
+        # None (exec status could not be read) must fail too: `if exit_code:`
+        # treated it as success, recording a possibly-truncated archive as a
+        # healthy snapshot — the exact outcome this inspection exists to prevent.
+        if exit_code is None:
+            raise ExternalCommandError(
+                "pg_dump",
+                -1,
+                f"pg_dump of {db_name}: exec status could not be read "
+                "(ExitCode=None); the dump may be truncated",
+            )
         raise ExternalCommandError(
             "pg_dump", exit_code, f"pg_dump of {db_name} exited with code {exit_code}"
         )
