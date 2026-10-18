@@ -576,7 +576,9 @@ def _synced_container(monkeypatch, manifest):
     monkeypatch.setattr(
         "oduflow.docker_ops.production_ops.reconfigure_production", reconfigure
     )
-    monkeypatch.setattr(connector, "provision", lambda *a: {"status": "ready"})
+    provision = MagicMock(return_value={"status": "ready"})
+    monkeypatch.setattr(connector, "provision", provision)
+    container.provision = provision
     return container, reconfigure
 
 
@@ -672,6 +674,22 @@ def test_client_module_without_a_checkout_leaves_the_container_alone(
     assert result["container_recreated"] is False
 
 
+def test_takeover_of_an_unmounted_checkout_skips_the_recreate(configured, monkeypatch):
+    """The checkout exists but an earlier recreation failed before the
+    container ever mounted it: removing it needs no downtime."""
+    settings, team = configured
+    _managed_checkout(team, "19.0.1.4.2")
+    _repository_module(team)
+    container, reconfigure = _synced_container(monkeypatch, None)
+    container.attrs = {"Mounts": []}
+
+    result = connector.synchronize(settings, team, "erp")
+
+    assert not connector.addon_checkout(team, "erp").exists()
+    reconfigure.assert_not_called()
+    assert (result["checkout"], result["container_recreated"]) == ("removed", False)
+
+
 def test_lingering_managed_mount_is_dropped_after_a_takeover(configured, monkeypatch):
     """The checkout was removed by a sync whose recreation failed: the
     container still mounts it and must be recreated."""
@@ -689,7 +707,7 @@ def test_default_sync_never_refreshes_a_same_series_checkout(configured, monkeyp
     settings, team = configured
     production_registry.update_production(team, "erp", {"odoo_image": "odoo:19.0"})
     _managed_checkout(team, "19.0.1.4.2")
-    _, reconfigure = _synced_container(monkeypatch, {"version": "19.0.1.4.2"})
+    container, reconfigure = _synced_container(monkeypatch, {"version": "19.0.1.4.2"})
     clone = MagicMock()
     monkeypatch.setattr("oduflow.docker_ops.env_ops._clone_repo", clone)
 
@@ -700,17 +718,22 @@ def test_default_sync_never_refreshes_a_same_series_checkout(configured, monkeyp
     assert (result["checkout"], result["refreshed"]) == ("kept", False)
     assert result["connector_branch"] == "19.0"
     assert result["container_recreated"] is False
+    assert container.provision.call_args.kwargs == {"upgrade": False}
 
 
 def test_refresh_reclones_the_same_series_and_recreates(configured, monkeypatch):
     settings, team = configured
     production_registry.update_production(team, "erp", {"odoo_image": "odoo:19.0"})
     _managed_checkout(team, "19.0.1.4.2")
-    _, reconfigure = _synced_container(monkeypatch, {"version": "19.0.1.4.2"})
+    container, reconfigure = _synced_container(monkeypatch, {"version": "19.0.1.4.2"})
     clone = _fake_clone("19.0.1.5.0")
     monkeypatch.setattr("oduflow.docker_ops.env_ops._clone_repo", clone)
 
     result = connector.synchronize(settings, team, "erp", refresh=True)
+
+    # Re-cloned code of the same series may change data or views without a
+    # manifest bump: the module upgrade is forced.
+    assert container.provision.call_args.kwargs == {"upgrade": True}
 
     assert clone.call_args.args[0] == settings.prod_odumcp_repo_url
     assert clone.call_args.args[1] == "19.0"

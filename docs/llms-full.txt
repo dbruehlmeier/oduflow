@@ -2917,9 +2917,9 @@ exactly two cases:
   for another version.
 - **Explicit refresh.** `sync_production_mcp(name, refresh=true)` re-clones the
   same version's branch from `odumcp_repo_url`, recreates the container and
-  upgrades the module when its version changed. This is the only way the
-  managed module is updated, and it is an operator action — nothing refreshes
-  it automatically.
+  upgrades the module (even at an unchanged manifest version, so data and view
+  changes land). This is the only way the managed module is updated, and it is
+  an operator action — nothing refreshes it automatically.
 
 **A client takes the module over by committing `odumcp` into their own
 repository** (main or extra, where Odoo scans it). From then on the module is

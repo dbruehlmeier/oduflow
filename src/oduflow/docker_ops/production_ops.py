@@ -78,6 +78,7 @@ from oduflow.env_credentials import create_credentials, load_credentials
 from oduflow.errors import (
     ConflictError,
     ExternalCommandError,
+    FlowError,
     NotFoundError,
     PrerequisiteNotMetError,
 )
@@ -2049,8 +2050,14 @@ def _refresh_odumcp_for_image(
             else "sync_failed"
         )
         production_registry.update_production(team, name, {"mcp": {"status": status}})
+        # Our own errors explain themselves; anything else (an OSError while
+        # retiring the checkout, a clone failure) keeps its traceback.
         logger.warning(
-            "%s: OduMCP addon not updated for image %s: %s", name, odoo_image, exc
+            "%s: OduMCP addon not updated for image %s: %s",
+            name,
+            odoo_image,
+            exc,
+            exc_info=not isinstance(exc, FlowError),
         )
 
 

@@ -207,8 +207,11 @@ def _retire_checkout(checkout: Path, temporary: Path) -> None:
     """Take *checkout* out of the addons path atomically; *temporary* (a
     directory deleted by the caller) takes it away.
 
-    A rename is what the running container's bind mount survives; deleting
-    the files in place would hollow out the module Odoo has loaded.
+    The rename makes the removal atomic for the host: no half-deleted module
+    is ever visible at the checkout path. It does not shield a running
+    container: its bind mount follows the inode, so the files vanish from the
+    mount when the temporary directory is deleted. Every caller therefore
+    recreates the container (or has it recreated) afterwards.
     """
     checkout.rename(temporary / "previous")
 
@@ -332,7 +335,8 @@ changed = False
 if module.state != "installed":
     module.button_immediate_install()
     changed = True
-elif module.installed_version != module.latest_version:
+elif payload.get("upgrade") or module.installed_version != module.latest_version:
+    # A refreshed checkout may carry data/view changes without a version bump.
     module.button_immediate_upgrade()
     changed = True
 env.cr.commit()
@@ -431,7 +435,14 @@ def _shell(
         container.exec_run(["rm", "-f", script_path, payload_path], user="root")
 
 
-def provision(settings: Settings, team: TeamSettings, name: str) -> dict[str, Any]:
+def provision(
+    settings: Settings, team: TeamSettings, name: str, *, upgrade: bool = False
+) -> dict[str, Any]:
+    """Install odumcp when missing, upgrade it when its version changed, and
+    set the production key. ``upgrade`` forces the module upgrade even at an
+    unchanged version: after a refreshed checkout, the code on disk changed
+    without a manifest bump being guaranteed.
+    """
     from oduflow.docker_ops import production_ops
     from oduflow.docker_ops.client import get_client
     from oduflow.wal_monitor import assert_writable
@@ -466,7 +477,9 @@ def provision(settings: Settings, team: TeamSettings, name: str) -> dict[str, An
                     f"production runs Odoo {running}. Run sync_production_mcp "
                     "to fetch the matching addon."
                 )
-        installed = _shell(settings, team, name, container, _INSTALL, {})
+        installed = _shell(
+            settings, team, name, container, _INSTALL, {"upgrade": upgrade}
+        )
         if installed["module_changed"]:
             container.restart()
         result = _shell(
@@ -622,11 +635,15 @@ def synchronize(
     elif not prepared.managed:
         # The client repository provides odumcp: a managed mount (of the
         # checkout removed just now, or by a synchronization whose recreation
-        # failed) must disappear from the container.
-        recreate = prepared.recreate or _has_managed_mount(container)
+        # failed) must disappear from the container. What the container
+        # mounts decides, not the removal itself: a checkout the container
+        # never mounted (its recreation failed) needs no downtime now.
+        recreate = _has_managed_mount(container)
     if recreate:
         production_ops.reconfigure_production(settings, team, name, force_recreate=True)
-    result = provision(settings, team, name)
+    # A refreshed checkout is re-cloned code of the same series; the manifest
+    # version need not have moved, so the upgrade is forced.
+    result = provision(settings, team, name, upgrade=prepared.action == "refreshed")
     result["addon_source"] = "managed" if prepared.managed else "repository"
     result["checkout"] = prepared.action
     result["refreshed"] = prepared.action == "refreshed"
