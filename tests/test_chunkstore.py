@@ -681,6 +681,32 @@ class TestPruneKeepRevisions:
             dst = tmp_path / f"erp-dst{rev}"
             chunkstore.restore(storage, "erp", rev, str(dst))
 
+    def test_corrupt_revision_does_not_wedge_prune(self, small_config_storage, tmp_path):
+        """A corrupt revision file must be kept and skipped — the old fallback
+        re-read the same broken object inside its own `except`, so one bad
+        revision made every future prune raise and retention never ran again."""
+        rng = random.Random(23)
+        storage = small_config_storage
+        src = tmp_path / "src"
+        _make_tree(str(src), {"a.bin": rng.randbytes(20_000)})
+        for _ in range(3):
+            with open(src / "a.bin", "wb") as f:
+                f.write(rng.randbytes(20_000))
+            chunkstore.backup(str(src), storage, "erp")
+        assert list_revisions(storage, "erp") == [1, 2, 3]
+
+        # Corrupt revision 2's metadata on storage.
+        storage.put("snapshots/erp/2", b"\x00garbage not json")
+
+        # Prune must complete: rev 1 is pruned, the corrupt rev 2 is kept
+        # (never delete blindly), rev 3 stays as the latest baseline.
+        chunkstore.prune(storage, keep_revisions={"erp": set()})
+        assert list_revisions(storage, "erp") == [2, 3]
+
+        # The healthy latest revision still restores.
+        dst = tmp_path / "dst"
+        chunkstore.restore(storage, "erp", 3, str(dst))
+
     def test_prune_requires_a_policy(self, small_config_storage):
         with pytest.raises(ValueError, match="keep"):
             chunkstore.prune(small_config_storage)
