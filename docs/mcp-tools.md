@@ -3130,8 +3130,16 @@ New productions are provisioned automatically; this tool is for existing ones,
 for retrying a failed setup, and for rotating the key after `production_token`
 changes in `oduflow.toml` (change the value, restart Oduflow, then run this).
 No secret is accepted or returned. Stopped productions must be started first.
-Adding the managed addon mount, or replacing a checkout made for another Odoo
-version, recreates the container.
+
+Oduflow ships `odumcp` as a managed checkout unless the production's own
+repositories (main or extra) contain the module. Once they do, the next
+synchronization removes the managed checkout and Oduflow never touches the
+module again; the client's deployments own it from then on. Adding or removing
+the managed mount, or replacing/refreshing the checkout, recreates the
+container. Each result reports `addon_source` (`managed` or `repository`),
+`checkout` (`kept`, `cloned`, `replaced`, `refreshed`, `removed` or
+`repository`), `container_recreated` and, for a managed checkout,
+`connector_branch` and `connector_commit`.
 
 Lock: production (each one in turn).
 { .odu-tool-meta }
@@ -3141,12 +3149,22 @@ Lock: production (each one in turn).
 `name`
 :   *str · default empty* — One production, or empty for every production of the team.
 
+`refresh`
+:   *bool · default false* — Re-clone the managed checkout from
+    `[production].odumcp_repo_url` at the production's Odoo version even when
+    that version is unchanged, recreate the container and upgrade the module.
+    The only way the managed module is updated; nothing refreshes it
+    automatically. A no-op for a module shipped in the client repository (the
+    result says so in `note`).
+
 **Use it when**
 
 - Adopting a production that predates automatic provisioning.
 - The connector reports itself unavailable after a failed setup.
 - The production moved to another Odoo version.
 - Rotating `production_token`.
+- Picking up a new connector release for a managed module (`refresh=true`).
+- The repository now ships `odumcp` and the managed copy should go.
 
 ### `production_odoo_info`
 

@@ -160,7 +160,7 @@ class _PatchAll:
 
 class TestCreateProduction:
     @pytest.mark.parametrize("stage", ["prepare_odumcp", "provision_odumcp"])
-    def test_odumcp_failure_preserves_production(self, settings, team, stage):
+    def test_odumcp_failure_preserves_production(self, settings, team, stage, caplog):
         client = _mock_client()
         with _PatchAll(_patch_create_stack(client)) as mocks:
             mocks[stage].side_effect = RuntimeError("internal-secret-error")
@@ -181,9 +181,38 @@ class TestCreateProduction:
         assert result["odoo_container"]
         assert "sync_production_mcp" in result["notes"][0]
         assert "internal-secret-error" not in str(result)
+        # The user-facing text stays generic; the cause reaches the server log.
+        assert "internal-secret-error" in caplog.text
+        assert "Traceback" in caplog.text
         record = production_registry.get_production(team, "erp")
         assert record["mcp"]["status"] == "sync_failed"
         assert client.containers.run.called
+
+    def test_provisioning_prerequisite_is_reported_with_its_cause(
+        self, settings, team, caplog
+    ):
+        """A missing production_token must not hide behind the generic warning."""
+        client = _mock_client()
+        with _PatchAll(_patch_create_stack(client)) as mocks:
+            mocks["provision_odumcp"].side_effect = PrerequisiteNotMetError(
+                "Set this team's production_token before provisioning OduMCP."
+            )
+            result = production_ops.create_production(
+                settings,
+                team,
+                "erp",
+                "https://github.com/o/r.git",
+                "main",
+                "erp.example.com",
+                "odoo:19.0",
+            )
+        note = result["notes"][0]
+        assert "Set this team's production_token" in note
+        assert "sync_production_mcp" in note
+        assert "Set this team's production_token" in caplog.text
+        assert team.production_token not in str(result)
+        record = production_registry.get_production(team, "erp")
+        assert record["mcp"]["status"] == "sync_failed"
 
     def test_unsupported_odoo_version_explains_missing_odumcp(self, settings, team):
         from oduflow.production_mcp import UnsupportedOdooVersion
@@ -2677,6 +2706,30 @@ class TestRefreshOdumcpForImage:
         prepare.assert_called_once_with(
             settings, team, "erp", [("/x", "/mnt/x")], "odoo:20.0"
         )
+
+    def test_checkout_taken_over_by_the_repository_is_removed(self, settings, team):
+        """The image changed and the client repository now ships odumcp: the
+        managed copy goes before the caller recreates the container."""
+        from oduflow.naming import get_repo_path, prod_env_name
+        from oduflow.production_mcp import addon_checkout, managed_module
+
+        module = managed_module(team, "erp")
+        module.mkdir(parents=True)
+        (module / "__manifest__.py").write_text("{}")
+        repo_module = os.path.join(
+            get_repo_path(prod_env_name("erp"), team.workspaces_dir),
+            "addons",
+            "odumcp",
+        )
+        os.makedirs(repo_module)
+        with open(os.path.join(repo_module, "__manifest__.py"), "w") as f:
+            f.write("{}")
+        with patch("oduflow.docker_ops.env_ops._clone_repo") as clone:
+            production_ops._refresh_odumcp_for_image(
+                settings, team, "erp", [], "odoo:20.0"
+            )
+        clone.assert_not_called()
+        assert not addon_checkout(team, "erp").exists()
 
     @pytest.mark.parametrize(
         ("error", "status"),

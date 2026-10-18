@@ -10,6 +10,7 @@ import shlex
 import tarfile
 import tempfile
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -172,6 +173,46 @@ def _record_status(team: TeamSettings, name: str, status: str) -> None:
         )
 
 
+@dataclass(frozen=True)
+class AddonPreparation:
+    """Outcome of :func:`prepare_addon`.
+
+    ``managed`` tells where odumcp comes from: Oduflow's managed checkout, or
+    the client's own repositories (main or extra), which Oduflow never touches.
+    ``action`` is what happened to the managed checkout:
+
+    - ``"repository"``: the client repository provides odumcp; no checkout.
+    - ``"removed"``: the client repository provides odumcp now, so the stale
+      managed checkout was removed and its mount must go.
+    - ``"kept"``: the existing checkout still serves (same Odoo series).
+    - ``"cloned"``: a first checkout was published.
+    - ``"replaced"``: the checkout was replaced for another Odoo series.
+    - ``"refreshed"``: the checkout was re-cloned on explicit request.
+
+    ``major`` is the Odoo series the managed checkout targets (``None`` when
+    there is no managed checkout or its version is unknown).
+    """
+
+    managed: bool
+    action: str
+    major: int | None = None
+
+    @property
+    def recreate(self) -> bool:
+        """A running container must be recreated: what it mounts changed."""
+        return self.action in ("cloned", "replaced", "refreshed", "removed")
+
+
+def _retire_checkout(checkout: Path, temporary: Path) -> None:
+    """Take *checkout* out of the addons path atomically; *temporary* (a
+    directory deleted by the caller) takes it away.
+
+    A rename is what the running container's bind mount survives; deleting
+    the files in place would hollow out the module Odoo has loaded.
+    """
+    checkout.rename(temporary / "previous")
+
+
 def prepare_addon(
     settings: Settings,
     team: TeamSettings,
@@ -179,33 +220,57 @@ def prepare_addon(
     extra_paths: list[tuple[str, str]],
     odoo_image: str,
     container: Any | None = None,
-) -> bool:
-    """Use existing addon code when provided; otherwise fetch the release for
-    the production's Odoo series (branch ``<major>.0``, see :func:`odoo_major`).
+    *,
+    refresh: bool = False,
+) -> AddonPreparation:
+    """Make odumcp available to the production, or step aside when the
+    client ships it.
 
-    Only odumcp is mounted from the fallback repository, not its other addons.
-    Reconfiguration reuses this checkout; it never silently pulls newer code.
-    A checkout made for another Odoo series (the production was upgraded since)
-    is replaced. Returns True when a new checkout was published, so a running
-    container must be recreated to mount it. Raises UnsupportedOdooVersion
-    before Odoo 16.
+    Oduflow ships odumcp as a managed component by default: without the
+    module in the main or extra repositories, the connector repository is
+    cloned at the branch of the production's Odoo series (``<major>.0``, see
+    :func:`odoo_major`) and only its odumcp addon is mounted, not the other
+    addons of that repository. A client takes the module over by committing
+    it into their own repository: the managed checkout is then removed and
+    Oduflow never touches the module again.
+
+    The managed checkout is never silently updated. It is replaced when it
+    was made for another Odoo series (the production was upgraded since), or
+    on an explicit ``refresh``, which re-clones the same series. Raises
+    UnsupportedOdooVersion before Odoo 16.
     """
     main = Path(get_repo_path(prod_env_name(name), team.workspaces_dir))
     roots = [main, *(Path(host) for host, _ in extra_paths)]
+    checkout = addon_checkout(team, name)
     if any(
         (_addons_root(root) / "odumcp" / "__manifest__.py").is_file() for root in roots
     ):
-        return False
+        if not checkout.exists():
+            return AddonPreparation(managed=False, action="repository")
+        # The client took the module over. The repository path comes first in
+        # addons_path, so the managed copy shadows nothing, but it must not
+        # linger there nor be mounted into the next container.
+        logger.info(
+            "Removing the managed OduMCP checkout of '%s': the production "
+            "repository provides odumcp",
+            name,
+        )
+        with tempfile.TemporaryDirectory(
+            prefix=".odumcp-retired-", dir=checkout.parent
+        ) as temporary:
+            _retire_checkout(checkout, Path(temporary))
+        return AddonPreparation(managed=False, action="removed")
     from oduflow.docker_ops.env_ops import _clone_repo
 
-    checkout = addon_checkout(team, name)
     current = (checkout / _MANIFEST).is_file()
     try:
         major = odoo_major(settings, odoo_image, container)
     except UnsupportedOdooVersion:
         raise
     except PrerequisiteNotMetError:
-        if not current:
+        if not current or refresh:
+            # Nothing to serve, or an explicit refresh that cannot pick a
+            # connector branch blindly.
             raise
         # Without a readable version the existing checkout keeps serving.
         logger.warning(
@@ -214,9 +279,13 @@ def prepare_addon(
             name,
             odoo_image,
         )
-        return False
-    if current and _checkout_major(checkout) in (None, major):
-        return False
+        return AddonPreparation(
+            managed=True, action="kept", major=_checkout_major(checkout)
+        )
+    same_series = current and _checkout_major(checkout) in (None, major)
+    if same_series and not refresh:
+        return AddonPreparation(managed=True, action="kept", major=major)
+    action = "refreshed" if same_series else ("replaced" if current else "cloned")
     checkout.parent.mkdir(parents=True, exist_ok=True)
     # Publish only a complete checkout: a failed download must not poison
     # production's addons path or prevent a subsequent synchronization.
@@ -238,9 +307,19 @@ def prepare_addon(
             )
         if checkout.exists():
             # Retired with the temporary directory.
-            checkout.rename(Path(temporary) / "previous")
+            _retire_checkout(checkout, Path(temporary))
         source.rename(checkout)
-    return True
+    return AddonPreparation(managed=True, action=action, major=major)
+
+
+def checkout_commit(checkout: Path) -> str | None:
+    """HEAD of the managed checkout; ``None`` when it is not a Git clone."""
+    from oduflow.git_ops import rev_parse
+
+    try:
+        return rev_parse(str(checkout))
+    except Exception:
+        return None
 
 
 _INSTALL = """
@@ -487,8 +566,16 @@ def execute(
         ) from None
 
 
-def synchronize(settings: Settings, team: TeamSettings, name: str) -> dict[str, Any]:
-    """Adopt an existing production; the caller holds its production lock."""
+def synchronize(
+    settings: Settings, team: TeamSettings, name: str, *, refresh: bool = False
+) -> dict[str, Any]:
+    """Adopt an existing production; the caller holds its production lock.
+
+    ``refresh`` re-clones the managed checkout from the connector repository
+    even when its Odoo series is unchanged — the only way the managed module
+    is ever updated. It is a documented no-op for a module the client ships
+    in their own repository, which Oduflow does not touch.
+    """
     from oduflow.docker_ops import production_ops
     from oduflow.docker_ops.client import get_client
 
@@ -508,24 +595,51 @@ def synchronize(settings: Settings, team: TeamSettings, name: str) -> dict[str, 
         (str(workspace / "extra" / repo), "") for repo in record.get("extra_addons", {})
     ]
     try:
-        replaced = prepare_addon(
-            settings, team, name, extras, record.get("odoo_image", ""), container
+        prepared = prepare_addon(
+            settings,
+            team,
+            name,
+            extras,
+            record.get("odoo_image", ""),
+            container,
+            refresh=refresh,
         )
     except UnsupportedOdooVersion:
         _record_status(team, name, "unsupported")
         raise
     checkout = addon_checkout(team, name)
-    if checkout.is_dir():
-        # A replaced checkout (Odoo series changed) is a new directory: the
-        # running container still sees the old one through its bind mount.
-        # Comparing what the container sees also repairs a previous
-        # synchronization whose container recreation failed.
-        if (
-            replaced
+    recreate = False
+    if prepared.managed and checkout.is_dir():
+        # A replaced or refreshed checkout is a new directory: the running
+        # container still sees the old one through its bind mount. Comparing
+        # what the container sees also repairs a previous synchronization
+        # whose container recreation failed.
+        recreate = (
+            prepared.recreate
             or not _has_managed_mount(container)
             or _mounted_major(container) != _checkout_major(checkout)
-        ):
-            production_ops.reconfigure_production(
-                settings, team, name, force_recreate=True
-            )
-    return provision(settings, team, name)
+        )
+    elif not prepared.managed:
+        # The client repository provides odumcp: a managed mount (of the
+        # checkout removed just now, or by a synchronization whose recreation
+        # failed) must disappear from the container.
+        recreate = prepared.recreate or _has_managed_mount(container)
+    if recreate:
+        production_ops.reconfigure_production(settings, team, name, force_recreate=True)
+    result = provision(settings, team, name)
+    result["addon_source"] = "managed" if prepared.managed else "repository"
+    result["checkout"] = prepared.action
+    result["refreshed"] = prepared.action == "refreshed"
+    result["container_recreated"] = recreate
+    if prepared.managed:
+        result["connector_branch"] = (
+            f"{prepared.major}.0" if prepared.major is not None else None
+        )
+        result["connector_commit"] = checkout_commit(checkout)
+    elif refresh:
+        result["note"] = (
+            "odumcp comes from the production repository, which Oduflow does "
+            "not touch: nothing was refreshed. Update the module by deploying "
+            "your repository."
+        )
+    return result

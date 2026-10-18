@@ -1688,6 +1688,11 @@ def create_production(
                 "Production infrastructure tools work."
             )
         except Exception:
+            # The cause goes to the server log only: a clone error can quote
+            # the repository URL with credentials.
+            logger.warning(
+                "%s: OduMCP addon source preparation failed", name, exc_info=True
+            )
             mcp_warning = (
                 "Production created, but OduMCP addon source preparation failed. "
                 "Odoo MCP tools are unavailable; check the connector repository "
@@ -1809,7 +1814,19 @@ def create_production(
         if not mcp_warning:
             try:
                 production_mcp.provision(settings, team, name)
+            except PrerequisiteNotMetError as exc:
+                # Our own explanation (no production_token, an addon of
+                # another Odoo series, a failed shell step) names the fix; it
+                # never carries the token.
+                mcp_warning = (
+                    "Production created, but OduMCP installation or key setup "
+                    f"failed: {exc} Odoo MCP tools are unavailable; fix the cause, "
+                    "then retry sync_production_mcp."
+                )
             except Exception:
+                logger.warning(
+                    "%s: OduMCP installation or key setup failed", name, exc_info=True
+                )
                 mcp_warning = (
                     "Production created, but OduMCP installation or key setup failed. "
                     "Odoo MCP tools are unavailable; check production logs and addon "
@@ -2010,10 +2027,12 @@ def _refresh_odumcp_for_image(
 ) -> None:
     """Point the managed OduMCP checkout at a changed image's Odoo series.
 
-    Only an existing managed checkout is refreshed; adopting a production that
-    never had one stays with sync_production_mcp. Optional like the rest of
-    OduMCP: a failure is recorded on the production (and logged), never fails
-    the reconfiguration.
+    Only an existing managed checkout is touched; adopting a production that
+    never had one stays with sync_production_mcp. A checkout the client
+    repository has since taken over is removed instead (the container is
+    recreated by the caller either way). Optional like the rest of OduMCP: a
+    failure is recorded on the production (and logged), never fails the
+    reconfiguration.
     """
     from oduflow import production_mcp, production_registry
 

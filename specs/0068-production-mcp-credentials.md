@@ -60,6 +60,24 @@ client-addon release before rollout.
   replaced on reconfiguration and on synchronization, and provisioning refuses
   an addon of another version. Odoo 15 and older are recorded as `unsupported`
   rather than as a failed synchronization. The dashboard flags both states.
+- **Ownership policy.** Oduflow ships `odumcp` as a managed component by
+  default; a client takes it over by committing the module into their own
+  repository, and from then on Oduflow does not touch it. The two sources were
+  previously allowed to coexist (the repository copy won only through
+  addons_path ordering, with the managed mount lingering). Now a synchronization
+  that finds the module in the client repositories removes the managed checkout
+  atomically and recreates the container so the mount disappears; nothing of
+  the client's code is ever modified, upgraded or refreshed by Oduflow. The
+  reverse holds too: a module removed from the repository is managed again on
+  the next synchronization.
+- **Explicit refresh.** The managed checkout is still never updated silently —
+  not on creation, not on deployments. `sync_production_mcp(refresh=true)` is
+  the single operator lever: it re-clones the same Odoo version's branch from
+  `odumcp_repo_url`, recreates the container and upgrades the module. It is a
+  documented no-op for a client-shipped module. Results now name the addon
+  source, what happened to the checkout, whether the container was recreated,
+  and the connector branch and commit, so the state of a production's connector
+  is inspectable rather than inferred.
 
 Related: [[0035-production-hosting]], [[0028-scoped-environment-mcp-access]],
 [[0059-production-to-dev-data-flow]].
@@ -70,3 +88,7 @@ Related: [[0035-production-hosting]], [[0028-scoped-environment-mcp-access]],
   direct OduMCP API access and automatic installation on production creation.
 - 2026-10-16: OduMCP for Odoo 16–20; `[production].odumcp_ref` retired in favour
   of the production's own Odoo version.
+- 2026-10-18: ownership policy made explicit — managed by default, client
+  takeover by committing the module removes the managed checkout; explicit
+  `refresh` lever on `sync_production_mcp`; creation reports the cause of a
+  failed provisioning.
