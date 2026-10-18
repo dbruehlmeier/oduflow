@@ -100,6 +100,11 @@ def _file_size_mb(path: str) -> float:
         return 0.0
 
 
+def _filestore_present(path: str) -> bool:
+    """Whether a template filestore holds files (``includes_filestore``)."""
+    return os.path.isdir(path) and bool(os.listdir(path))
+
+
 def _update_template_sizes(
     team: TeamSettings,
     settings: Settings,
@@ -4427,6 +4432,9 @@ def import_template(
     odoo_image = f"odoo:{major_version}" if major_version else ""
 
     # 5. Save metadata.json
+    includes_filestore = _filestore_present(
+        team.get_template_filestore_path(template_name)
+    )
     metadata = {
         "odoo_image": odoo_image,
         "repo_url": "",
@@ -4435,7 +4443,7 @@ def import_template(
         "odoo_version": manifest.get("version", ""),
         "pg_version": manifest.get("pg_version", ""),
         "modules": manifest.get("modules", {}),
-        "includes_filestore": not without_filestore,
+        "includes_filestore": includes_filestore,
         # No source_commit: an imported database has no branch of ours behind
         # it, so the lineage check has nothing to compare against and is skipped.
         "snapshot_at": _utc_now_iso(),
@@ -4476,7 +4484,7 @@ def import_template(
         "template_db": result["template_db"],
         "restore_seconds": result.get("restore_seconds", 0),
         "zip_size_mb": round(backup_size_mb, 1),
-        "includes_filestore": not without_filestore,
+        "includes_filestore": includes_filestore,
         "affected_envs": affected_envs,
         "remount_failures": remount_failures,
     }
@@ -4735,6 +4743,7 @@ def finalize_imported_template(
     staging_dir: str,
     *,
     addon_error_policy: str = "strict",
+    without_filestore: bool = False,
 ) -> dict[str, object]:
     """Promote a fully-staged push import into the live template and load it.
 
@@ -4745,11 +4754,20 @@ def finalize_imported_template(
     filestore/dump/metadata into the template directory, chown the filestore
     for the odoo user, then refresh sizes and restore the dump into the
     template DB. The staging directory is removed on success.
+
+    ``without_filestore`` is the database-only import: a staged filestore/
+    (chunks left by an earlier, interrupted full upload) is not promoted, and
+    the live filestore stays as it is — like the other database-only imports.
+    The result's ``filestore`` says which happened: ``imported``, ``kept`` (an
+    existing template's filestore) or ``none``.
     """
     from oduflow.docker_ops import env_ops
 
     os.makedirs(staging_dir, exist_ok=True)
     promoted_marker = os.path.join(staging_dir, ".promoted")
+    # Only when the live filestore is this import's: a database-only finalize
+    # keeps an older one, which a retry must not count as uploaded chunks.
+    filestore_marker = os.path.join(staging_dir, ".filestore-promoted")
     staged_meta = os.path.join(staging_dir, "metadata.json")
     staged_dump = os.path.join(staging_dir, "dump.sql.gz")
     staged_fs = os.path.join(staging_dir, "filestore")
@@ -4782,12 +4800,18 @@ def finalize_imported_template(
         os.makedirs(tpl_dir, exist_ok=True)
 
         # Swap filestore (the overlay lower layer) while envs are unmounted.
-        if os.path.isdir(staged_fs):
+        filestore_created = False
+        if not without_filestore and os.path.isdir(staged_fs):
+            # Before the swap, like .promoted: until the rename the upload
+            # status still reads the staged filestore/, which it prefers.
+            open(filestore_marker, "a").close()
             if os.path.exists(template_filestore_path):
                 shutil.rmtree(template_filestore_path)
             os.rename(staged_fs, template_filestore_path)
         elif not os.path.isdir(template_filestore_path):
             os.makedirs(template_filestore_path, exist_ok=True)
+            filestore_created = True
+        filestore_imported = os.path.isfile(filestore_marker)
 
         # Swap dump: drop stale dumps under other names so
         # get_template_sql_path resolves to the new gzip'd SQL dump.
@@ -4805,7 +4829,9 @@ def finalize_imported_template(
         if os.path.isfile(staged_meta):
             os.replace(staged_meta, live_meta)
 
-        if major_version:
+        # A kept filestore was chowned when it was imported; walking it all
+        # again would only stretch the team-locked window, overlays unmounted.
+        if major_version and (filestore_imported or filestore_created):
             try:
                 uid_gid = get_odoo_uid_gid(client, f"odoo:{major_version}")
                 uid_str, gid_str = uid_gid.split(":")
@@ -4820,7 +4846,17 @@ def finalize_imported_template(
             except Exception as exc:  # noqa: BLE001 - chown is best-effort
                 logger.warning("Could not chown template filestore: %s", exc)
 
-    _update_template_sizes(team, settings, template_name)
+    includes_filestore = _filestore_present(template_filestore_path)
+    if filestore_imported:
+        filestore = "imported"
+    elif includes_filestore:
+        filestore = "kept"
+    else:
+        filestore = "none"
+    with open(live_meta) as f:
+        metadata = json.load(f)
+    metadata["includes_filestore"] = includes_filestore
+    _update_template_sizes(team, settings, template_name, metadata)
     result = reload_template(settings, team, template_name=template_name)
 
     # Turn any uploaded/announced addons (Enterprise, Themes, extra repos) into
@@ -4856,6 +4892,8 @@ def finalize_imported_template(
         "template_name": template_name,
         "template_db": result["template_db"],
         "restore_seconds": result.get("restore_seconds", 0),
+        "includes_filestore": includes_filestore,
+        "filestore": filestore,
         "affected_envs": remount.affected,
         "remount_failures": remount.failures,
         "extra_addons": wired,

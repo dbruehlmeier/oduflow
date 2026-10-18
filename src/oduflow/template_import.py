@@ -915,9 +915,7 @@ def _promote_and_reload(
         if metadata.get("odoo_image") and syncing_filestore:
             _chown_filestore(client, str(metadata["odoo_image"]), live_fs)
 
-    metadata["includes_filestore"] = os.path.isdir(live_fs) and bool(
-        os.listdir(live_fs)
-    )
+    metadata["includes_filestore"] = system_ops._filestore_present(live_fs)
     metadata = system_ops._update_template_sizes(
         team, settings, template_name, metadata
     )
@@ -1567,9 +1565,7 @@ def refresh_from_own_files(
         metadata["odoo_image"] = f"odoo:{major}"
         if os.path.isdir(live_fs):
             _chown_filestore(client, str(metadata["odoo_image"]), live_fs)
-    metadata["includes_filestore"] = os.path.isdir(live_fs) and bool(
-        os.listdir(live_fs)
-    )
+    metadata["includes_filestore"] = system_ops._filestore_present(live_fs)
     metadata = system_ops._update_template_sizes(
         team, settings, template_name, metadata
     )
