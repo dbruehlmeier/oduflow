@@ -435,8 +435,10 @@ class TestFailureDiagnostics:
         assert deploy["status"] == "rollback_failed"
         assert deploy["error"].startswith(
             "Deploy failed at step 'upgrade' (exit_code=255); the rollback did "
-            "not recover: the restart did not become healthy within 120s. Cause: "
-            "psycopg2.errors.SerializationFailure"
+            "not recover: the restart did not become healthy within "
+            f"{settings.prod_health_timeout}s (configurable as [production] "
+            "health_timeout); a later healthy start or restart clears the flag. "
+            "Cause: psycopg2.errors.SerializationFailure"
         )
         assert "SerializationFailure" in deploy["failure_excerpt"]
 

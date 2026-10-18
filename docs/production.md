@@ -154,6 +154,7 @@ restart Oduflow; productions themselves are then created at runtime:
 [production]
 enabled = true          # required; restart Oduflow after changing
 workers_cap = 8         # upper bound for auto-tuned Odoo workers
+health_timeout = 180    # seconds a production may take to become healthy
 
 [backup]                # configures backups; production must also be enabled
 bucket = "acme-backups"
@@ -356,8 +357,8 @@ that changes code (`update_production` or an auto-deploy) and by
 `restart_production`; a plain `reconfigure_production(name="erp")` does it
 immediately.
 
-After recreating the container, reconfigure waits up to 180 s for Odoo to
-become healthy. A container that crash-loops, for example on an environment
+After recreating the container, reconfigure waits up to
+`[production] health_timeout` seconds (default 180) for Odoo to become healthy. A container that crash-loops, for example on an environment
 variable that breaks Python, fails the wait early: Docker restarts it twice
 during the wait, and the production lock is released for the next call. The
 same rule applies to every production health wait, including deploy
@@ -462,7 +463,16 @@ preflight SQL failure, triggers code rollback just like a failed module command.
 `update_production(name)` pulls the branch (and extra-addon worktrees),
 classifies the changes (or takes explicit `install=` / `upgrade=` /
 `restart=true`), applies them, and **verifies** the deploy — module exit
-codes plus an in-container health check. A changed `.oduflow/requirements.txt`
+codes plus an in-container health check. In auto mode (no explicit
+`install`/`upgrade`/`restart`), only modules **installed in the database** are
+upgraded: an extra-addon repo typically bundles many modules of which a few
+are installed, and a routine fast-forward touching uninstalled ones must not
+fail the deploy — their changes are dropped with a warning and the rest is
+classified again, so a JS or view change in an installed module still
+reloads and a changed `.py` still restarts. A module already in the database
+is upgraded even when it looks new (moved between directories or repos), and
+new modules are never auto-installed on a production. Explicit
+`install=`/`upgrade=` requests keep the strict behaviour. A changed `.oduflow/requirements.txt`
 or `.oduflow/apt_packages.txt` — in the main repo or an extra-addon repo —
 reinstalls the pip/apt dependencies into the container before the restart
 (they are also installed from scratch whenever the container is recreated:
@@ -498,6 +508,14 @@ Every deploy lands in the production's history (`production_deploys`):
 commits, action, modules, status (`success` / `rolled_back` /
 `rollback_failed` / `skipped`), trigger (mcp / ui / webhook / schedule).
 
+The health checks after a deploy, rollback, reconfigure, restore or Stack
+apply wait up to `[production] health_timeout` seconds (default 180). Raise it
+for workers-mode productions with many modules — they can take minutes to
+start serving. A production stuck with an `unhealthy` flag after a timed-out
+rollback recovers with `restart_production` or `start_production`: on a
+flagged production either one re-judges health and clears the flag once the
+service answers again (and says so when it still does not).
+
 Manual code rollback to any commit: `rollback_production(name, to_commit)`.
 
 ### Diagnosing a failed deploy
@@ -529,7 +547,7 @@ What the exit codes mean:
 | `1` from `dependencies` | An apt or pip install failed. Oduflow reports 1 for any failed dependency step |
 | `1` from `exception` | Oduflow raised an exception after the code moved. The exception's text is in `error` |
 | `137` | The command was killed by `SIGKILL`, typically by the container's memory limit |
-| `0` with `failed_step: health` | The commands succeeded, but the restarted server did not answer within 180 s |
+| `0` with `failed_step: health` | The commands succeeded, but the restarted server did not answer within `[production] health_timeout` seconds |
 
 **Where the upgrade runs.** `odoo -i` / `odoo -u` is a `docker exec` into the
 production's running container: `/entrypoint.sh odoo -d <db>

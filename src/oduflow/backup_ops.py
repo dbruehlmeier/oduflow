@@ -698,9 +698,7 @@ def restore_production(
     # serving before is expected to be serving after.
     healthy = True
     if was_running:
-        healthy = production_ops.wait_production_healthy(
-            client, settings, team, name, timeout=180
-        )
+        healthy = production_ops.wait_production_healthy(client, settings, team, name)
         production_registry.update_production(team, name, {"unhealthy": not healthy})
     production_registry.set_nested(
         team, name, "backup", {"last_restore_id": snapshot_id}
@@ -898,9 +896,7 @@ def restore_production_from_environment(
     # serving before is expected to be serving after.
     healthy = True
     if was_running:
-        healthy = production_ops.wait_production_healthy(
-            client, settings, team, name, timeout=180
-        )
+        healthy = production_ops.wait_production_healthy(client, settings, team, name)
         production_registry.update_production(team, name, {"unhealthy": not healthy})
 
     if str(source_env.get("template", "")).startswith(PRODUCTION_TEMPLATE_PREFIX):

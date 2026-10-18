@@ -764,6 +764,12 @@ def _failure_diagnostics(step: str, output: str) -> tuple[dict[str, str], str]:
     return fields, _failure_cause(step, excerpt, output)
 
 
+def strip_deploy_output(deploys: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Deploy records without ``output_tail`` (up to 16 KB each), for the
+    summaries an agent reads unless it asks for the output."""
+    return [{k: v for k, v in d.items() if k != "output_tail"} for d in deploys]
+
+
 # ---------------------------------------------------------------------------
 # Health probe
 # ---------------------------------------------------------------------------
@@ -811,15 +817,18 @@ def wait_production_healthy(
     settings: Settings,
     team: TeamSettings,
     name: str,
-    timeout: int = 180,
+    timeout: int | None = None,
 ) -> bool:
     """Poll the production's Odoo until healthy or timeout.
 
-    Gives up early on a crash loop: once Docker has restarted the container
+    The timeout defaults to ``[production] health_timeout``. Gives up early
+    on a crash loop: once Docker has restarted the container
     :data:`_CRASH_LOOP_RESTARTS` times during the wait, its main process keeps
     dying (an env var that hides the Python packages, a broken import) and
     waiting out the timeout only holds the production's lock longer.
     """
+    if timeout is None:
+        timeout = settings.prod_health_timeout
     deadline = time.monotonic() + timeout
     baseline: int | None = None
     while time.monotonic() < deadline:
@@ -2338,7 +2347,7 @@ def reconfigure_production(
         repo_path,
         extra_mount_paths,
     )
-    healthy = wait_production_healthy(client, settings, team, name, timeout=180)
+    healthy = wait_production_healthy(client, settings, team, name)
     production_registry.update_production(team, name, {"unhealthy": not healthy})
 
     new_head = ""
@@ -2669,6 +2678,31 @@ def purge_deleted_productions(
 # ---------------------------------------------------------------------------
 
 
+def _rejudge_unhealthy(
+    client: DockerClient,
+    settings: Settings,
+    team: TeamSettings,
+    name: str,
+    record: dict[str, Any],
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    """Re-judge a production flagged unhealthy once it was (re)started.
+
+    Starting or restarting is how operators recover a flagged production, so
+    either must drop a stale flag (e.g. from a rollback whose restart outlived
+    the health wait) once Odoo answers again; ``result`` then reports the
+    verdict as ``healthy``. An unflagged production stays instant: no wait,
+    no verdict. (A routing-drift recreate re-judges in reconfigure_production.)
+    """
+    if not record.get("unhealthy"):
+        return result
+    from oduflow import production_registry
+
+    healthy = wait_production_healthy(client, settings, team, name)
+    production_registry.update_production(team, name, {"unhealthy": not healthy})
+    return {**result, "healthy": healthy}
+
+
 def start_production(
     settings: Settings, team: TeamSettings, name: str
 ) -> dict[str, Any]:
@@ -2677,14 +2711,15 @@ def start_production(
     assert_writable(settings)
     from oduflow import production_registry
 
-    production_registry.get_production(team, name)
+    record = production_registry.get_production(team, name)
     client = get_client()
     # The production DB must be up before Odoo.
     ensure_prod_infra(client, settings, force=True)
     container = _require_container(client, settings, team, name)
     container.start()
     logger.info("Production started", extra={"env_name": prod_env_name(name)})
-    return {"name": name, "odoo_container": container.name, "status": "running"}
+    result = {"name": name, "odoo_container": container.name, "status": "running"}
+    return _rejudge_unhealthy(client, settings, team, name, record, result)
 
 
 def stop_production(
@@ -2708,7 +2743,7 @@ def restart_production(
     assert_writable(settings)
     from oduflow import production_registry
 
-    production_registry.get_production(team, name)
+    record = production_registry.get_production(team, name)
     client = get_client()
     if settings.backup is not None:
         ensure_prod_infra(client, settings, force=True, accept_live_evidence=True)
@@ -2732,7 +2767,8 @@ def restart_production(
     assert_writable(settings)
     container.restart()
     logger.info("Production restarted", extra={"env_name": prod_env_name(name)})
-    return {"name": name, "odoo_container": container.name, "status": "running"}
+    result = {"name": name, "odoo_container": container.name, "status": "running"}
+    return _rejudge_unhealthy(client, settings, team, name, record, result)
 
 
 def _has_routing_drift(
@@ -3038,7 +3074,7 @@ def _update_production(
 
         report_progress(progress_key, "verifying health")
         ok = deploy["exit_code"] == 0 and wait_production_healthy(
-            client, settings, team, name, timeout=180
+            client, settings, team, name
         )
         if ok:
             production_registry.update_production(
@@ -3099,9 +3135,7 @@ def _update_production(
 
             assert_writable(settings)
             container.restart()
-            recovered = wait_production_healthy(
-                client, settings, team, name, timeout=120
-            )
+            recovered = wait_production_healthy(client, settings, team, name)
         except Exception as exc:
             recovered = False
             rollback_error = str(exc)
@@ -3137,7 +3171,12 @@ def _update_production(
 
         deploy["status"] = "rollback_failed"
         rollback_problem = (
-            rollback_error or "the restart did not become healthy within 120s"
+            rollback_error
+            or (
+                "the restart did not become healthy within "
+                f"{settings.prod_health_timeout}s (configurable as [production] "
+                "health_timeout); a later healthy start or restart clears the flag"
+            )
         ).rstrip(".")
         deploy["error"] = (
             f"{failure}; the rollback did not recover: {rollback_problem}.{cause_note}"
@@ -3261,7 +3300,7 @@ def rollback_production(
 
     assert_writable(settings)
     container.restart()
-    healthy = wait_production_healthy(client, settings, team, name, timeout=120)
+    healthy = wait_production_healthy(client, settings, team, name)
 
     production_registry.update_production(team, name, {"unhealthy": not healthy})
     deploy = {
@@ -3460,7 +3499,7 @@ def get_production_info(
         "container_status": container.status if container is not None else "missing",
         "commit": head,
         "commits": commits,
-        "deploys": read_deploys(team, name, limit=5),
+        "deploys": strip_deploy_output(read_deploys(team, name, limit=5)),
         "backup": record.get("backup", {}),
     }
 

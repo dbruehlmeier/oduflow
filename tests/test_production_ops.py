@@ -2133,11 +2133,117 @@ class TestServerMode:
             patch.object(production_ops, "get_client"),
             patch.object(production_ops, "_require_container", return_value=current),
             patch.object(production_ops, "reconfigure_production") as reconfigure,
+            patch.object(production_ops, "wait_production_healthy") as health,
         ):
             result = production_ops.restart_production(settings, team, "erp")
         reconfigure.assert_not_called()
         current.restart.assert_called_once()
         assert "recreated" not in result
+        # A healthy production restarts instantly: no health wait, no flag.
+        health.assert_not_called()
+
+    def test_restart_clears_stale_unhealthy_flag(self, settings, team):
+        # A rollback whose restart outlived the health wait leaves
+        # unhealthy=True; a plain restart that comes up healthy must clear it.
+        _seed_prod_record(team)
+        production_registry.update_production(team, "erp", {"unhealthy": True})
+        record = production_registry.get_production(team, "erp")
+        current = MagicMock()
+        current.labels = {
+            "oduflow.server_mode": "workers",
+            **production_ops.prod_routing_labels(settings, team, "erp", record),
+        }
+        with (
+            patch.object(production_ops, "get_client"),
+            patch.object(production_ops, "_require_container", return_value=current),
+            patch.object(
+                production_ops, "wait_production_healthy", return_value=True
+            ) as health,
+        ):
+            result = production_ops.restart_production(settings, team, "erp")
+        current.restart.assert_called_once()
+        health.assert_called_once()
+        assert result["healthy"] is True
+        assert production_registry.get_production(team, "erp")["unhealthy"] is False
+
+    def test_start_clears_stale_unhealthy_flag(self, settings, team):
+        # Stop + Start is a recovery path too: it must not depend on the
+        # operator picking Restart for the flag to clear.
+        _seed_prod_record(team)
+        production_registry.update_production(team, "erp", {"unhealthy": True})
+        container = MagicMock()
+        with (
+            patch.object(production_ops, "get_client"),
+            patch.object(production_ops, "ensure_prod_infra"),
+            patch.object(production_ops, "_require_container", return_value=container),
+            patch.object(
+                production_ops, "wait_production_healthy", return_value=True
+            ) as health,
+        ):
+            result = production_ops.start_production(settings, team, "erp")
+        container.start.assert_called_once()
+        health.assert_called_once()
+        assert result["healthy"] is True
+        assert production_registry.get_production(team, "erp")["unhealthy"] is False
+
+    def test_start_of_healthy_production_does_not_wait(self, settings, team):
+        _seed_prod_record(team)
+        with (
+            patch.object(production_ops, "get_client"),
+            patch.object(production_ops, "ensure_prod_infra"),
+            patch.object(production_ops, "_require_container"),
+            patch.object(production_ops, "wait_production_healthy") as health,
+        ):
+            result = production_ops.start_production(settings, team, "erp")
+        health.assert_not_called()
+        assert "healthy" not in result
+
+    def test_health_wait_defaults_to_configured_timeout(self, settings, team):
+        settings = replace(settings, prod_health_timeout=5)
+        with (
+            # Start at 100: one probe at 104 (< 105), deadline passed at 106.
+            # The old hard-coded 180s would keep polling and exhaust the clock.
+            patch.object(production_ops.time, "monotonic", side_effect=[100, 104, 106]),
+            patch.object(production_ops.time, "sleep"),
+            patch.object(production_ops, "_get_container", return_value=None) as get,
+        ):
+            assert not production_ops.wait_production_healthy(
+                MagicMock(), settings, team, "erp"
+            )
+        get.assert_called_once()
+
+    def test_info_deploys_omit_failed_step_output(self, settings, team):
+        _seed_prod_record(team)
+        production_ops.append_deploy(
+            team, "erp", {"status": "rolled_back", "output_tail": "x" * 8000}
+        )
+        with (
+            patch.object(production_ops, "get_client"),
+            patch.object(production_ops, "_get_container", return_value=None),
+        ):
+            info = production_ops.get_production_info(settings, team, "erp")
+        assert info["deploys"][-1]["status"] == "rolled_back"
+        assert "output_tail" not in info["deploys"][-1]
+        # The record itself keeps it for production_deploys(include_output=True).
+        assert production_ops.read_deploys(team, "erp")[-1]["output_tail"] == "x" * 8000
+
+    def test_restart_keeps_unhealthy_when_still_not_serving(self, settings, team):
+        _seed_prod_record(team)
+        production_registry.update_production(team, "erp", {"unhealthy": True})
+        record = production_registry.get_production(team, "erp")
+        current = MagicMock()
+        current.labels = {
+            "oduflow.server_mode": "workers",
+            **production_ops.prod_routing_labels(settings, team, "erp", record),
+        }
+        with (
+            patch.object(production_ops, "get_client"),
+            patch.object(production_ops, "_require_container", return_value=current),
+            patch.object(production_ops, "wait_production_healthy", return_value=False),
+        ):
+            result = production_ops.restart_production(settings, team, "erp")
+        assert result["healthy"] is False
+        assert production_registry.get_production(team, "erp")["unhealthy"] is True
 
     @pytest.mark.parametrize(
         "outcome,expected",

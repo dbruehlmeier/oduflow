@@ -539,6 +539,19 @@ GROUPS: tuple[Group, ...] = (
                 note="Existing productions pick it up on reconfigure.",
             ),
             Field(
+                "health_timeout",
+                "int",
+                "Health wait (s)",
+                "Seconds a production gets to become healthy after a deploy, "
+                "rollback, reconfigure, restore, Stack apply or recovery "
+                "start/restart.",
+                default=180,
+                minimum=1,
+                apply=LIVE,
+                note="Raise it for workers-mode productions with many modules; "
+                "they can take minutes to start serving.",
+            ),
+            Field(
                 "odumcp_repo_url",
                 "str",
                 "Production MCP addon repo",

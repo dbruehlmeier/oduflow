@@ -4802,6 +4802,177 @@ def _apply_actions(
     }
 
 
+def _owning_module(file_path: str, unit_path: str) -> str | None:
+    """The module that owns *file_path*, or None for a file outside any module.
+
+    Stricter than ``git_analysis._get_module_name``, which falls back to the
+    top-level directory: a live ``tools/patch.py`` must not be mistaken for an
+    uninstalled module named ``tools``. Only a top-level directory that no
+    longer exists (a module this pull removed) keeps that fallback.
+    """
+    parts = file_path.split("/")
+    if len(parts) < 2:
+        return None
+    dir_parts = parts[:-1]
+    for i in range(len(dir_parts), 0, -1):
+        if os.path.isfile(os.path.join(unit_path, *dir_parts[:i], "__manifest__.py")):
+            return dir_parts[i - 1]
+    if os.path.isdir(os.path.join(unit_path, parts[0])):
+        return None
+    return parts[0]
+
+
+def _residual_action(recommendation: dict[str, Any]) -> str:
+    """What a recommendation still needs once its module operations are gone.
+
+    An ``install``/``upgrade`` action masks the lesser changes that came with
+    it: a changed ``.py`` (restart) or view XML / JS (refresh).
+    """
+    action = str(recommendation.get("action", "none"))
+    if action not in ("install", "upgrade"):
+        return action
+    details = recommendation.get("details") or {}
+    if (
+        details.get("py_changed")
+        or details.get("restart_required")
+        or details.get("deps_changed")
+    ):
+        return "restart"
+    if details.get("xml_hot") or details.get("js_changed"):
+        return "refresh"
+    return "none"
+
+
+def _narrow_auto_plan(
+    settings: Settings,
+    team: TeamSettings,
+    env_name: str,
+    unit_recs: list[tuple[tuple[str, str | None, list[str]], dict[str, Any]]],
+    *,
+    is_production: bool,
+) -> tuple[dict[str, Any], list[str]]:
+    """Narrow an auto-classified module plan to what the database can act on.
+
+    Auto mode derives module names purely from changed file paths, but an
+    extra-addons repo bundles many modules of which only a few are installed,
+    and a routine fast-forward touches lots of them. Upgrading an uninstalled
+    module is a hard preflight error in the apply step (and installing one was
+    never asked for), so the plan is narrowed instead of failing the whole
+    apply; explicit install/upgrade requests keep the strict error.
+
+    Files of uninstalled modules are inert (Odoo never loads them), so they
+    are dropped and the rest of each unit is classified again: a JS change in
+    an installed module still refreshes, and a live ``.py`` still restarts,
+    when the merged ``upgrade`` was only for an uninstalled module. A module
+    the classifier calls new but the database already has (moved between
+    directories or repos, so git found no old manifest) is upgraded instead.
+    A production never auto-installs.
+
+    ``unit_recs`` pairs each ``(repo_path, base_ref, files)`` classification
+    unit with its :func:`~oduflow.git_analysis.recommend` result. Returns the
+    narrowed plan in the :func:`~oduflow.git_analysis.merge_recommendations`
+    shape, plus warnings naming what was skipped.
+    """
+    from oduflow.docker_ops.odoo_ops import _MODULE_NAME_RE, _get_module_states
+    from oduflow.git_analysis import merge_recommendations, recommend
+
+    new_modules = {m for _unit, rec in unit_recs for m in rec["modules_to_install"]}
+    names = set(new_modules)
+    owners: list[list[str | None]] = []
+    for (unit_path, _ref, files), rec in unit_recs:
+        unit_owners = [_owning_module(f, unit_path) for f in files]
+        owners.append(unit_owners)
+        names.update(m for m in unit_owners if m)
+        names.update(rec["modules_to_upgrade"])
+
+    # These names come from repository paths: one that is not a plain module
+    # name never reaches SQL, and the plan keeps it exactly as classified.
+    lookup = tuple(sorted(m for m in names if _MODULE_NAME_RE.match(m)))
+    states: dict[str, str] = {}
+    if lookup:
+        try:
+            states = _get_module_states(settings, team, env_name, lookup)
+        except Exception as exc:
+            # Best-effort narrowing: without the database the plan stays as
+            # classified, and the apply step's own preflight reports the failure.
+            logger.warning(
+                "Could not read module states to narrow the auto plan (%s); "
+                "applying it unfiltered",
+                exc,
+                extra={"env_name": env_name},
+            )
+            lookup = ()
+    known = set(lookup)
+
+    def installed(module: str) -> bool:
+        return states.get(module) in ("installed", "to upgrade")
+
+    def inert(module: str | None) -> bool:
+        # A dev environment still auto-installs new modules: their files stay.
+        return (
+            module is not None
+            and module in known
+            and not installed(module)
+            and (is_production or module not in new_modules)
+        )
+
+    dropped: set[str] = set()
+    recs: list[dict[str, Any]] = []
+    for ((unit_path, ref, files), rec), unit_owners in zip(unit_recs, owners):
+        unit_dropped = {m for m in unit_owners if m is not None and inert(m)}
+        if unit_dropped:
+            dropped |= unit_dropped
+            kept = [f for f, m in zip(files, unit_owners) if m not in unit_dropped]
+            rec = recommend(kept, unit_path, ref)
+        recs.append(rec)
+
+    skipped_new = dropped & new_modules
+    not_installed = dropped - new_modules
+    narrowed: list[dict[str, Any]] = []
+    for rec in recs:
+        to_install: list[str] = []
+        to_upgrade: list[str] = []
+        for module in rec["modules_to_upgrade"]:
+            if module in known and not installed(module):
+                not_installed.add(module)
+            else:
+                to_upgrade.append(module)
+        for module in rec["modules_to_install"]:
+            if installed(module):
+                to_upgrade.append(module)
+            elif is_production:
+                skipped_new.add(module)
+            else:
+                to_install.append(module)
+        if to_install or to_upgrade:
+            action = "install" if to_install else "upgrade"
+        else:
+            action = _residual_action(rec)
+        narrowed.append(
+            {
+                **rec,
+                "action": action,
+                "modules_to_install": to_install,
+                "modules_to_upgrade": to_upgrade,
+            }
+        )
+
+    warnings: list[str] = []
+    if skipped_new:
+        warnings.append(
+            "Skipped new modules (auto mode never installs modules on a "
+            f"production): {', '.join(sorted(skipped_new))}. Install explicitly "
+            "with update_production(install=...) if they are wanted."
+        )
+    if not_installed:
+        warnings.append(
+            "Skipped modules that are not installed in this database: "
+            f"{', '.join(sorted(not_installed))}. Auto mode only upgrades "
+            "installed modules; install them explicitly if they are wanted."
+        )
+    return merge_recommendations(narrowed), warnings
+
+
 def pull_environment(
     settings: Settings,
     team: TeamSettings,
@@ -4867,6 +5038,7 @@ def pull_environment(
 
     local_path = container_obj.labels.get("oduflow.local_path", "")
     is_local = bool(local_path)
+    is_production = container_obj.labels.get("oduflow.prod") == "true"
     repo_path = local_path or get_repo_path(env_name, team.workspaces_dir)
 
     if not os.path.isdir(repo_path):
@@ -4917,7 +5089,6 @@ def pull_environment(
     # per-repo dependency-descriptor check below.
     extra_dep_candidates: list[tuple[str, str, list[str]]] = []
     if extra_addons:
-        is_production = container_obj.labels.get("oduflow.prod") == "true"
         if is_production:
             # Production retains one mutable worktree per deployment. Its
             # deploy log records these HEADs and rollback resets them in place.
@@ -4990,10 +5161,15 @@ def pull_environment(
 
     # --- 2. Determine actions: explicit (agent-driven) vs auto (classify) ---
     explicit = bool(install) or bool(upgrade) or restart
+    # Per-unit results are kept: auto mode re-classifies a unit when it drops
+    # the files of modules this database never installed.
+    unit_recs = [
+        ((rp, ref, files), recommend(files, rp, ref))
+        for rp, ref, files in classify_units
+        if files
+    ]
     recommended = (
-        merge_recommendations(
-            recommend(files, rp, ref) for rp, ref, files in classify_units if files
-        )
+        merge_recommendations(rec for _unit, rec in unit_recs)
         if all_changed
         else {"action": "none", "modules_to_install": [], "modules_to_upgrade": []}
     )
@@ -5015,6 +5191,7 @@ def pull_environment(
 
     warnings: list[str] = []
     do_refresh = False
+    auto_narrowed = False
     if explicit:
         to_install = list(install or [])
         to_upgrade = list(upgrade or [])
@@ -5073,6 +5250,16 @@ def pull_environment(
         to_upgrade = list(recommended.get("modules_to_upgrade", []))
         do_restart = recommended.get("action") == "restart"
         do_refresh = recommended.get("action") == "refresh"
+        if to_install or to_upgrade:
+            narrowed, narrow_warnings = _narrow_auto_plan(
+                settings, team, env_name, unit_recs, is_production=is_production
+            )
+            warnings.extend(narrow_warnings)
+            auto_narrowed = bool(narrow_warnings)
+            to_install = list(narrowed["modules_to_install"])
+            to_upgrade = list(narrowed["modules_to_upgrade"])
+            do_restart = narrowed["action"] == "restart"
+            do_refresh = narrowed["action"] == "refresh"
 
     if before_apply is not None and (
         explicit
@@ -5121,6 +5308,13 @@ def pull_environment(
     )
     if warnings:
         result["warnings"] = warnings
+    if auto_narrowed and result.get("action") == "none":
+        # The default "none" message blames Markdown files; here the pull did
+        # change code, it just belongs to modules this database never installed.
+        result["message"] = (
+            "Nothing to apply: the pulled changes only touch modules that are "
+            "not installed in this database (see warnings)."
+        )
     if is_local and int(result.get("exit_code", 0)) == 0:
         _write_local_snapshot(repo_path, env_name, team)
     return result

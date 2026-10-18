@@ -10718,9 +10718,16 @@ async function _prodPost(url, body, okMsg, skipReload) {
   return null;
 }
 
-function prodAction(name, action) {
-  _prodPost(API_PRODUCTIONS + '/' + encodeURIComponent(name) + '/' + action, undefined,
-    'Production "' + name + '": ' + action);
+async function prodAction(name, action) {
+  var data = await _prodPost(API_PRODUCTIONS + '/' + encodeURIComponent(name) + '/' + action, undefined, '');
+  if (!data) return;
+  // Start/restart re-check a production flagged unhealthy; one that still
+  // fails the check keeps the flag, so it is not reported as a success.
+  if (data.healthy === false) {
+    showToast('Production "' + name + '": ' + action + ' done, but it is still unhealthy (health check timed out). Check its logs.', true);
+  } else {
+    showToast('Production "' + name + '": ' + action);
+  }
 }
 
 async function prodUpdate(name) {
