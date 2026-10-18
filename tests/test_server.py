@@ -2212,6 +2212,44 @@ class TestTemplateLocks:
         mock_rename.assert_not_called()
 
 
+class TestProductionToolResponses:
+    @pytest.fixture(autouse=True)
+    def _prod_enabled(self):
+        import oduflow.server
+
+        with patch.object(
+            oduflow.server, "_settings", replace(TEST_SETTINGS, prod_enabled=True)
+        ):
+            yield
+
+    @pytest.mark.parametrize("tool", ["start_production", "restart_production"])
+    def test_still_unhealthy_after_start_is_not_a_plain_success(self, tool):
+        with patch(
+            f"oduflow.docker_ops.production_ops.{tool}",
+            return_value={
+                "name": "erp",
+                "odoo_container": "oduflow-erp",
+                "status": "running",
+                "healthy": False,
+            },
+        ):
+            text = _get_tool_fn(tool)(name="erp")
+        assert "WARNING" in text
+        assert "stays marked unhealthy" in text
+
+    def test_unflagged_restart_reads_as_success(self):
+        with patch(
+            "oduflow.docker_ops.production_ops.restart_production",
+            return_value={
+                "name": "erp",
+                "odoo_container": "oduflow-erp",
+                "status": "running",
+            },
+        ):
+            text = _get_tool_fn("restart_production")(name="erp")
+        assert text == "Production 'erp' restarted (oduflow-erp)."
+
+
 class TestProductionBackupLocks:
     """Prune must exclude snapshot and restore, which the team lock never did:
     productions lock in their own `prod:` keyspace."""

@@ -2583,7 +2583,9 @@ Read a production's Odoo container logs.
 
 ### `start_production`
 
-Start a stopped production.
+Start a stopped production. On a production flagged `unhealthy`, it waits for
+the health check (`[production] health_timeout`) and clears the flag once
+Odoo answers.
 
 Lock: production.
 { .odu-tool-meta }
@@ -2618,7 +2620,9 @@ Lock: production. **Takes the production offline.**
 ### `restart_production`
 
 Restart a production's Odoo container — brief downtime. A container whose
-Traefik routing is outdated is recreated instead (same downtime).
+Traefik routing is outdated is recreated instead (same downtime). On a
+production flagged `unhealthy`, it waits for the health check and clears the
+flag once Odoo answers; the reply warns when it still does not.
 
 Lock: production.
 { .odu-tool-meta }

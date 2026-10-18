@@ -43,6 +43,26 @@
   Before, `reconfigure_production` and deploy verification kept the
   production's lock for the full 180 s, so a broken setting could not be
   reverted during that time.
+- **Auto deploys skip uninstalled modules** — an extra-addons repo bundles
+  many modules of which only a few are installed, and a fast-forward that
+  touched the others failed the whole `update_production` (or
+  `pull_environment`) with "not installed and cannot be upgraded". Auto mode
+  now drops the changes of uninstalled modules with a warning and classifies
+  the rest again, so a JS or view change in an installed module still reloads
+  and a changed `.py`, including one outside any module, still restarts. A
+  module the database already has is upgraded even when it looks new (moved
+  between directories or repos), and a production never auto-installs new
+  modules. Explicit `install=`/`upgrade=` requests keep the strict error.
+- **Configurable production health wait** — the new `[production]
+  health_timeout` (default 180 s) sets how long every production health wait
+  lasts: deploy verification, the rollback restart (was 120 s), reconfigure,
+  restore and Stack apply. Workers-mode productions with many modules can take
+  minutes to start serving.
+- **Starting a production clears a stale unhealthy flag** —
+  `start_production` and `restart_production` on a production flagged
+  unhealthy now wait for its health check and clear the flag once Odoo
+  answers. When it still does not, the MCP reply and the dashboard say so
+  instead of reporting a plain success.
 - **Production environment variables that break the container are refused**
   — `create_production` and a changed `reconfigure_production(env_vars=…)`
   refuse `HOME`, `PYTHONHOME`, `PYTHONUSERBASE`, `PYTHONNOUSERSITE` and a

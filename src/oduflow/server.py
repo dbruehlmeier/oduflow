@@ -5800,6 +5800,18 @@ def production_logs(
     )
 
 
+def _still_unhealthy_note(settings: Settings, result: dict[str, Any]) -> str:
+    """Warning for a production that was flagged unhealthy and still is after
+    a start/restart (its result then carries ``healthy``)."""
+    if result.get("healthy") is not False:
+        return ""
+    return (
+        " WARNING: it still did not pass the health check within "
+        f"{settings.prod_health_timeout}s and stays marked unhealthy; inspect "
+        "production_logs."
+    )
+
+
 @mcp.tool()
 @handle_errors
 @production_enabled
@@ -5814,7 +5826,9 @@ def start_production(name: str, ctx: Context | None = None) -> str:
     settings = _get_settings()
     team = _resolve_team(ctx)
     result = production_ops.start_production(settings, team, name)
-    return f"Production '{name}' started ({result['odoo_container']})."
+    return f"Production '{name}' started ({result['odoo_container']})." + (
+        _still_unhealthy_note(settings, result)
+    )
 
 
 @mcp.tool()
@@ -5854,7 +5868,9 @@ def restart_production(name: str, ctx: Context | None = None) -> str:
             f"Production '{name}' recreated ({result['odoo_container']}) to "
             "apply its current Traefik routing."
         )
-    return f"Production '{name}' restarted ({result['odoo_container']})."
+    return f"Production '{name}' restarted ({result['odoo_container']})." + (
+        _still_unhealthy_note(settings, result)
+    )
 
 
 @mcp.tool()
@@ -6155,10 +6171,7 @@ def production_deploys(
     if not deploys:
         return f"No deploys recorded for production '{name}'."
     if not include_output:
-        deploys = [
-            {key: value for key, value in deploy.items() if key != "output_tail"}
-            for deploy in deploys
-        ]
+        deploys = production_ops.strip_deploy_output(deploys)
     import json as _json
 
     return _json.dumps(deploys, indent=2)

@@ -1736,6 +1736,234 @@ class TestPullEnvironmentLocalAndSharedExtraCheckouts:
         mock_write.assert_called_once()
 
 
+class TestAutoPlanNarrowing:
+    """Auto mode only acts on modules the database can act on (issue: extra
+    repos bundle hundreds of modules; a fast-forward must not fail the deploy
+    over the uninstalled ones)."""
+
+    @staticmethod
+    def _tree(root, files):
+        """Lay out *files* under *root*; ``<mod>/__manifest__.py`` marks a module."""
+        for rel in files:
+            path = root / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("{}" if path.name == "__manifest__.py" else "")
+
+    def _pull_auto(self, mock_docker_client, tmp_path, tree, changed, states):
+        team = TeamSettings(team_id="1", data_dir=str(tmp_path / "team"))
+        settings = Settings(teams={"1": team})
+        repo = tmp_path / "team" / "workspaces" / "env" / "repo"
+        repo.mkdir(parents=True)
+        self._tree(repo, tree)
+        container = MagicMock()
+        container.labels = {"oduflow.git_branch": "main"}
+        mock_docker_client.containers.get.return_value = container
+        with (
+            # No base ref: the real path-only classifier runs, git-free.
+            patch("oduflow.git_ops.pull_repo", return_value=("", changed)),
+            patch(
+                "oduflow.docker_ops.odoo_ops._get_module_states",
+                return_value=states,
+            ) as module_states,
+            patch(
+                "oduflow.docker_ops.env_ops._apply_actions",
+                return_value={"action": "none", "changed_files": changed},
+            ) as apply,
+        ):
+            result = env_ops.pull_environment(settings, team, "env")
+        return result, apply.call_args.kwargs, module_states
+
+    def test_uninstalled_modules_are_skipped_not_failed(
+        self, mock_docker_client, tmp_path
+    ):
+        manifests = ["moda/__manifest__.py", "modb/__manifest__.py"]
+        result, applied, _states = self._pull_auto(
+            mock_docker_client,
+            tmp_path,
+            manifests,
+            manifests,
+            {"moda": "installed", "modb": "uninstalled"},
+        )
+        assert applied["to_upgrade"] == ["moda"]
+        assert any("modb" in w for w in result["warnings"])
+
+    def test_changes_only_in_uninstalled_modules_are_inert(
+        self, mock_docker_client, tmp_path
+    ):
+        changed = ["modb/__manifest__.py", "modb/models/b.py"]
+        result, applied, _states = self._pull_auto(
+            mock_docker_client, tmp_path, changed, changed, {"modb": "uninstalled"}
+        )
+        # Odoo never loads an uninstalled module's code: nothing to upgrade,
+        # nothing to restart or refresh for.
+        assert applied["to_upgrade"] == []
+        assert applied["do_restart"] is False
+        assert applied["do_refresh"] is False
+        assert "not installed" in result["message"]
+
+    def test_live_python_still_restarts_when_all_upgrades_are_skipped(
+        self, mock_docker_client, tmp_path
+    ):
+        # modb's manifest bump is the only upgrade and modb is uninstalled,
+        # but moda (installed) changed a .py — the running server must restart
+        # even though the merged action ("upgrade") masked it.
+        changed = ["moda/models/a.py", "modb/__manifest__.py"]
+        _result, applied, _states = self._pull_auto(
+            mock_docker_client,
+            tmp_path,
+            ["moda/__manifest__.py", *changed],
+            changed,
+            {"moda": "installed", "modb": "uninstalled"},
+        )
+        assert applied["to_upgrade"] == []
+        assert applied["do_restart"] is True
+
+    def test_views_and_js_in_installed_module_still_refresh(
+        self, mock_docker_client, tmp_path
+    ):
+        changed = [
+            "moda/views/a.xml",
+            "moda/static/src/a.js",
+            "modb/__manifest__.py",
+        ]
+        _result, applied, _states = self._pull_auto(
+            mock_docker_client,
+            tmp_path,
+            ["moda/__manifest__.py", *changed],
+            changed,
+            {"moda": "installed", "modb": "uninstalled"},
+        )
+        assert applied["to_upgrade"] == []
+        assert applied["do_refresh"] is True
+        assert applied["do_restart"] is False
+
+    def test_python_outside_any_module_restarts(self, mock_docker_client, tmp_path):
+        # tools/ has no manifest: its .py is live code (e.g. loaded through a
+        # server-wide module), not an uninstalled module named "tools".
+        changed = ["tools/patches/monkey.py", "modb/__manifest__.py"]
+        _result, applied, module_states = self._pull_auto(
+            mock_docker_client, tmp_path, changed, changed, {"modb": "uninstalled"}
+        )
+        assert applied["to_upgrade"] == []
+        assert applied["do_restart"] is True
+        assert module_states.call_args.args[3] == ("modb",)
+
+    def test_skipped_pseudo_module_keeps_its_python_restart(
+        self, mock_docker_client, tmp_path
+    ):
+        # The path-only fallback calls tools/data.csv an upgrade of "tools";
+        # skipping that pseudo-module must not swallow the live .py beside it.
+        changed = ["tools/data.csv", "tools/patch.py"]
+        result, applied, _states = self._pull_auto(
+            mock_docker_client, tmp_path, changed, changed, {}
+        )
+        assert applied["to_upgrade"] == []
+        assert applied["do_restart"] is True
+        assert any("tools" in w for w in result["warnings"])
+
+    def test_unsafe_module_names_never_reach_sql(self, mock_docker_client, tmp_path):
+        evil = "x'); DROP TABLE res_users; --"
+        changed = [f"{evil}/__manifest__.py", "modb/__manifest__.py"]
+        _result, _applied, module_states = self._pull_auto(
+            mock_docker_client, tmp_path, changed, changed, {"modb": "installed"}
+        )
+        assert module_states.call_args.args[3] == ("modb",)
+
+    def _unit(self, tmp_path, files, rec):
+        self._tree(tmp_path, files)
+        return [((str(tmp_path), "old", files), rec)]
+
+    @staticmethod
+    def _rec(action, install=(), upgrade=()):
+        return {
+            "action": action,
+            "modules_to_install": list(install),
+            "modules_to_upgrade": list(upgrade),
+            "details": {},
+        }
+
+    @pytest.mark.parametrize("is_production", [True, False])
+    def test_installed_module_classified_as_new_is_upgraded(
+        self, tmp_path, is_production
+    ):
+        # Moved between directories/repos: git finds no old manifest and the
+        # classifier says "install", but the database already has it.
+        unit_recs = self._unit(
+            tmp_path, ["foo/__manifest__.py"], self._rec("install", install=["foo"])
+        )
+        with patch(
+            "oduflow.docker_ops.odoo_ops._get_module_states",
+            return_value={"foo": "installed"},
+        ):
+            plan, warnings = env_ops._narrow_auto_plan(
+                TEST_SETTINGS,
+                TEST_TEAM,
+                "prod-erp",
+                unit_recs,
+                is_production=is_production,
+            )
+        assert plan["action"] == "upgrade"
+        assert plan["modules_to_install"] == []
+        assert plan["modules_to_upgrade"] == ["foo"]
+        assert warnings == []
+
+    def test_production_never_auto_installs(self, tmp_path):
+        unit_recs = self._unit(
+            tmp_path,
+            ["brand_new_mod/__manifest__.py"],
+            self._rec("install", install=["brand_new_mod"]),
+        )
+        with patch("oduflow.docker_ops.odoo_ops._get_module_states", return_value={}):
+            plan, warnings = env_ops._narrow_auto_plan(
+                TEST_SETTINGS, TEST_TEAM, "prod-erp", unit_recs, is_production=True
+            )
+        assert plan["action"] == "none"
+        assert plan["modules_to_install"] == []
+        assert any("brand_new_mod" in w for w in warnings)
+        assert any("install=" in w for w in warnings)
+
+    def test_dev_environment_still_auto_installs_new_modules(self, tmp_path):
+        unit_recs = self._unit(
+            tmp_path,
+            ["brand_new_mod/__manifest__.py"],
+            self._rec("install", install=["brand_new_mod"]),
+        )
+        with patch("oduflow.docker_ops.odoo_ops._get_module_states", return_value={}):
+            plan, warnings = env_ops._narrow_auto_plan(
+                TEST_SETTINGS, TEST_TEAM, "env", unit_recs, is_production=False
+            )
+        assert plan["action"] == "install"
+        assert plan["modules_to_install"] == ["brand_new_mod"]
+        assert warnings == []
+
+    def test_unreadable_module_states_keep_the_plan_unfiltered(self, tmp_path):
+        unit_recs = self._unit(
+            tmp_path,
+            ["moda/__manifest__.py", "moda/models/a.py"],
+            self._rec("upgrade", upgrade=["moda"]),
+        )
+        with patch(
+            "oduflow.docker_ops.odoo_ops._get_module_states",
+            side_effect=RuntimeError("db down"),
+        ):
+            plan, warnings = env_ops._narrow_auto_plan(
+                TEST_SETTINGS, TEST_TEAM, "env", unit_recs, is_production=False
+            )
+        assert plan["action"] == "upgrade"
+        assert plan["modules_to_upgrade"] == ["moda"]
+        assert warnings == []
+
+    def test_module_state_lookup_rejects_unsafe_names(self):
+        from oduflow.docker_ops import odoo_ops
+
+        with patch.object(odoo_ops, "_execute_db_query") as query:
+            with pytest.raises(ValueError):
+                odoo_ops._get_module_states(
+                    TEST_SETTINGS, TEST_TEAM, "env", ("a'); DROP TABLE x; --",)
+                )
+        query.assert_not_called()
+
+
 class TestCreateEnvironmentEnvVars:
     @patch(
         "oduflow.extra_addons.generate_odoo_conf",

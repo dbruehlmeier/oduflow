@@ -435,6 +435,10 @@ class Settings:
     prod_db_volume: str = "oduflow-prod-db-data"
     prod_walg_version: str = ""  # empty = version pinned in walg.py
     prod_workers_cap: int = 8  # upper bound for auto-tuned Odoo workers
+    # Seconds a production gets to become healthy after a deploy, rollback,
+    # reconfigure, restore, Stack apply or recovery start/restart. Workers-mode productions with many modules
+    # can take several minutes to start serving.
+    prod_health_timeout: int = 180
     # [production.wal]: cluster-wide disk protection, independent of backups.
     wal_upload_timeout: int = 120
     wal_warn_after: int = 120
@@ -858,6 +862,8 @@ class Settings:
 
         if self.prod_workers_cap < 1:
             raise ValueError("[production] workers_cap must be >= 1")
+        if self.prod_health_timeout < 1:
+            raise ValueError("[production] health_timeout must be >= 1")
 
         if self.backup is not None:
             b = self.backup
@@ -1160,6 +1166,7 @@ class Settings:
             ),
             prod_walg_version=str(production.get("walg_version", "")).strip(),
             prod_workers_cap=int(production.get("workers_cap", 8)),
+            prod_health_timeout=int(production.get("health_timeout", 180)),
             wal_upload_timeout=int(wal_values["wal_upload_timeout"]),
             wal_warn_after=int(wal_values["wal_warn_after"]),
             wal_stall_after=int(wal_values["wal_stall_after"]),
