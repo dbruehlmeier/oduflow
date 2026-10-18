@@ -2788,10 +2788,15 @@ def _build_routes(
         Before promotion, live template files are deliberately ignored so an
         overwrite cannot fake progress from old data. A ``.promoted`` marker
         explicitly switches missing artifacts to the live copy, allowing a
-        failed final restore to retry without re-uploading moved files.
+        failed final restore to retry without re-uploading moved files. The
+        live filestore counts only under ``.filestore-promoted``: a
+        database-only finalize promotes the dump but keeps an older filestore.
         """
         staging = team.get_import_staging_dir(template_name)  # validates name
         promoted = os.path.isfile(os.path.join(staging, ".promoted"))
+        filestore_promoted = os.path.isfile(
+            os.path.join(staging, ".filestore-promoted")
+        )
         live_dir = team.get_template_dir(template_name)
         staged_meta = os.path.join(staging, "metadata.json")
         staged_dump = os.path.join(staging, "dump.sql.gz")
@@ -2814,7 +2819,7 @@ def _build_routes(
             staged_fs_dir
             if os.path.isdir(staged_fs_dir)
             else team.get_template_filestore_path(template_name)
-            if promoted
+            if filestore_promoted
             else staged_fs_dir
         )
         chunks: list[str] = []
@@ -2889,8 +2894,12 @@ def _build_routes(
         Optional booleans ``with_enterprise`` / ``with_themes`` /
         ``with_extra_addons`` append the matching ``--with-*`` flags to the
         returned command so the checkboxes in the import dialog drive what the
-        Odoo.sh client downloads. ``addon_error_policy`` is stored with the
-        token and controls strict versus best-effort addon wiring at finalize.
+        Odoo.sh client downloads; ``without_filestore`` appends
+        ``--without-filestore`` for a database-only import.
+        ``addon_error_policy`` and ``without_filestore`` are stored with the
+        token: the first controls strict versus best-effort addon wiring at
+        finalize, the second keeps finalize database-only whatever the client
+        sends.
         """
         team = _get_ui_team(request)
         with_flags: list[str] = []
@@ -2912,6 +2921,9 @@ def _build_routes(
                 with_flags.append("--with-themes")
             if data.get("with_extra_addons"):
                 with_flags.append("--with-extra-addons")
+            without_filestore = bool(data.get("without_filestore"))
+            if without_filestore:
+                with_flags.append("--without-filestore")
             addon_error_policy = str(
                 data.get("addon_error_policy")
                 or import_tokens.ADDON_ERROR_POLICY_STRICT
@@ -2920,6 +2932,7 @@ def _build_routes(
                 team,
                 template_name,
                 addon_error_policy=addon_error_policy,
+                without_filestore=without_filestore,
             )
         except ValueError as e:
             return _error_text_response(e)
@@ -3363,6 +3376,20 @@ def _build_routes(
         except FlowError as e:
             return _error_response(e)
         template_name = str(record["template_name"])
+        # Database-only when the token was minted so or the client ran with
+        # --without-filestore: either way staged chunks are not promoted, so a
+        # disagreement can only leave the live filestore in place, never
+        # replace it with a partial one.
+        flag = request.query_params.get("without_filestore", "0").strip().lower()
+        if flag in {"1", "true", "yes", "on"}:
+            without_filestore = True
+        elif flag in {"0", "false", "no", "off", ""}:
+            without_filestore = bool(record.get("without_filestore"))
+        else:
+            return JSONResponse(
+                {"ok": False, "error": "without_filestore must be 1 or 0."},
+                status_code=400,
+            )
         try:
             progress = _import_progress(team, template_name)
         except ValueError as e:  # invalid template name
@@ -3394,6 +3421,7 @@ def _build_routes(
                         record.get("addon_error_policy")
                         or import_tokens.ADDON_ERROR_POLICY_STRICT
                     ),
+                    without_filestore=without_filestore,
                 )
                 import_tokens.invalidate(team, str(record["token"]))
             return JSONResponse({"ok": True, "result": result})

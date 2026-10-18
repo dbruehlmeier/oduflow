@@ -61,6 +61,18 @@
   and the rollback removed the workspace's purge marker. `create_production`
   now refuses up front while the workspace is still on disk, and names the
   purge that frees the name.
+- **Database-only import from Odoo.sh** — the Odoo.sh import always uploaded
+  the whole filestore, which can run to hundreds of GB from a limited shell
+  session, and stopped with exit code 3 when the backup had no filestore
+  directory. The **Import from Odoo.sh** dialog now has a **Database only**
+  checkbox, like the HTTP, S3 and local-path imports; it adds
+  `--without-filestore` to the command, which uploads the manifest, the SQL
+  dump and any selected addons but no filestore. An existing template keeps its
+  current filestore, and chunks left by an interrupted full upload are not
+  promoted as a partial filestore. The client's summary says whether the
+  filestore was imported, kept or not included. Without the flag, a missing
+  filestore still stops the import, now with a hint to re-run with
+  `--without-filestore`.
 
 ## v1.88.0
 

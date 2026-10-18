@@ -142,14 +142,14 @@ would let work in the environment.
 | `POST` | `/api/templates/{name}/rename` | Rename it; body: `new_name` |
 | `POST` | `/api/templates/import-from-odoo` | UI-authenticated: import a template. Body: `source` (http(s) Odoo URL — then `master_pwd` required — or `s3://bucket/prefix` or a local path; `odoo_url` accepted as a legacy alias), `template_name`, optional `db_name`, booleans `without_filestore` / `overwrite` / `refresh`, optional `s3_endpoint` / `s3_access_key` / `s3_secret_key` / `s3_region` |
 | `POST` | `/api/s3/browse` | UI-authenticated: list one level of an S3 bucket for the import dialog's object browser, or the buckets when `bucket` is empty. Body: `bucket`, `prefix`, `continuation_token`, `endpoint`, `region`, `access_key`, `secret_key`, and `template` to sign with that template's stored secret. Returns `buckets`, `folders`, `files` (newest first), `truncated`, `next_token`. Read-only, so not team-locked |
-| `POST` | `/api/templates/import-token` | UI-authenticated: mint a 15-minute Odoo.sh import token |
+| `POST` | `/api/templates/import-token` | UI-authenticated: mint a 15-minute Odoo.sh import token. Body: `template_name`, optional booleans `with_enterprise` / `with_themes` / `with_extra_addons` (add the matching `--with-*` flags to the returned `command`) and `without_filestore` (adds `--without-filestore`; stored with the token, so finalize is database-only), optional `addon_error_policy` (`strict`, the default, or `best_effort`) |
 | `GET` | `/api/templates/import/status` | Import-token authenticated: report resumable upload progress |
 | `POST` | `/api/templates/import/manifest` | Upload template metadata |
 | `POST` | `/api/templates/import/dump` | Stream/chunk the compressed SQL dump |
 | `POST` | `/api/templates/import/filestore` | Upload one atomic filestore hash-directory archive |
 | `POST` | `/api/templates/import/addon` | Stream/chunk one private addon archive |
 | `POST` | `/api/templates/import/addon-remote` | Register an addon repo that the server can clone |
-| `POST` | `/api/templates/import/finalize` | Validate staged data and atomically publish/restore the template |
+| `POST` | `/api/templates/import/finalize` | Validate staged data and atomically publish/restore the template. `?without_filestore=1` (or `true`), sent by `--without-filestore`, or a token minted with `without_filestore` makes it database-only: staged filestore chunks are not promoted and an existing template keeps its filestore; other values are rejected. The result's `filestore` is `imported`, `kept` or `none`, next to `includes_filestore` |
 | `GET` | `/import-odoo.sh` | Download the token-authenticated Odoo.sh import client |
 
 The pull-import endpoint accepts HTTP and HTTPS source URLs. HTTP sends the Odoo
