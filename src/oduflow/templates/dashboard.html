@@ -1351,6 +1351,22 @@
   /* The flex rules above would otherwise override the UA's
      [hidden] { display: none } for rows the name filter hides. */
   .form-group .check-item[hidden] { display: none; }
+  /* A branch read off the Odoo image is marked in its own row, not only
+     counted under the list: the value alone looks exactly like a saved one.
+     Only ticked rows carry the mark, since only they are mounted. */
+  .form-group .check-item:has(> input[type="checkbox"]:checked):has(> .branch-input[data-autofilled])::after {
+    content: "guessed";
+    flex: 0 0 auto;
+    padding: 1px 7px;
+    border-radius: 999px;
+    border: 1px solid color-mix(in oklab, var(--text-dim) 24%, transparent);
+    background: color-mix(in oklab, var(--text-dim) 12%, transparent);
+    color: var(--text-dim);
+    font-size: var(--text-2xs);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
   /* The name filter and default-branch picker share the Select all / Clear
      row and stay at the compact size of its buttons. */
   .form-group .check-list-actions input.extra-filter,
@@ -1693,7 +1709,9 @@
       </div>
       <div class="form-group">
         <label for="cr-image">Odoo image</label>
-        <input type="text" id="cr-image" placeholder="e.g. odoo:19.0">
+        <input type="text" id="cr-image" placeholder="e.g. odoo:19.0"
+               oninput="scheduleExtraBranchAutofill('cr-extra')"
+               onchange="autofillExtraBranches('cr-extra')">
       </div>
       <div class="form-group" id="cr-template-group">
         <label for="cr-template">Template</label>
@@ -1713,9 +1731,10 @@
                   aria-label="Fill a branch into every repo that has it"
                   onchange="applyDefaultExtraBranch('cr-extra')"></select>
         </div>
-        <div id="cr-extra-addons-checkboxes" class="check-list" onchange="updateExtraRepoStatus('cr-extra')"></div>
+        <div id="cr-extra-addons-checkboxes" class="check-list" onchange="updateExtraRepoStatus('cr-extra')"
+             oninput="markExtraBranchEdited(event)"></div>
         <div class="hint" id="cr-extra-status" hidden></div>
-        <div class="hint">Select repos to mount in this environment; picking a branch fills it into every repo that has it.</div>
+        <div class="hint">Select repos to mount in this environment. Branches are filled in from the Odoo image wherever a repo carries one; picking a branch fills it into every repo that has it.</div>
       </div>
       <div class="form-group">
         <label for="cr-auto-install">Auto-install modules</label>
@@ -2350,7 +2369,9 @@
       <div id="template-settings-form" style="display:none;">
         <div class="form-group">
           <label for="tset-image">Odoo image</label>
-          <input type="text" id="tset-image" placeholder="e.g. odoo:19.0">
+          <input type="text" id="tset-image" placeholder="e.g. odoo:19.0"
+                 oninput="scheduleExtraBranchAutofill('tset-extra')"
+                 onchange="autofillExtraBranches('tset-extra')">
         </div>
         <div class="form-group">
           <label for="tset-repo">Repository URL</label>
@@ -2380,9 +2401,10 @@
                     aria-label="Fill a branch into every repo that has it"
                     onchange="applyDefaultExtraBranch('tset-extra')"></select>
           </div>
-          <div id="tset-extra-addons" class="check-list" onchange="updateExtraRepoStatus('tset-extra')"></div>
+          <div id="tset-extra-addons" class="check-list" onchange="updateExtraRepoStatus('tset-extra')"
+               oninput="markExtraBranchEdited(event)"></div>
           <div class="hint" id="tset-extra-status" hidden></div>
-          <div class="hint">Checked repos are mounted into environments created from this template. Each one needs a branch; picking a branch fills it into every repo that has it.</div>
+          <div class="hint">Checked repos are mounted into environments created from this template. Each one needs a branch: branches are filled in from the Odoo image wherever a repo carries one, and picking a branch fills it into every repo that has it.</div>
         </div>
         <div class="form-group">
           <label for="tset-auto-install">Auto-install modules</label>
@@ -5707,6 +5729,8 @@ var _templateSettingsLoadToken = 0;
 // into this object so keys the form does not know about survive a round-trip.
 var _templateSettingsMeta = {};
 var _templateSettingsRawMode = false;
+// The extra repo branch fields' guess/edit marks while raw JSON is shown.
+var _templateSettingsBranchMarks = null;
 
 var TSET_ENV_HINT = 'One KEY=VALUE per line. Injected into environments created from this template; values given at creation time override them per key.';
 
@@ -5757,8 +5781,12 @@ function _tsetBranchOptions(branches) {
 // extra addon repos as a plain checkbox list, so one set of helpers drives
 // either of them, addressed by the id prefix shared by all of its controls.
 var EXTRA_REPO_PICKERS = {
-  'cr-extra': {list: 'cr-extra-addons-checkboxes', checkbox: '.cr-extra-cb'},
-  'tset-extra': {list: 'tset-extra-addons', checkbox: '.tset-extra-cb'}
+  'cr-extra': {
+    list: 'cr-extra-addons-checkboxes', checkbox: '.cr-extra-cb', image: 'cr-image'
+  },
+  'tset-extra': {
+    list: 'tset-extra-addons', checkbox: '.tset-extra-cb', image: 'tset-image'
+  }
 };
 
 function _extraRepoRows(prefix) {
@@ -5789,6 +5817,13 @@ function extraRepoBranchNames(r) {
   return _tsetBranchOptions(extraRepoBranchChoices(r));
 }
 
+// Registered extra repos by name, for rows that only know their repo's name.
+function _extraReposByName() {
+  var repos = Object.create(null);
+  (cachedExtraRepos || []).forEach(function(r) { repos[r.name] = r; });
+  return repos;
+}
+
 // A hidden row is still submitted and still mounted, so a selection the filter
 // hides has to be stated as a count: otherwise Clear looks like it emptied a
 // list that in fact still carries repos.
@@ -5806,6 +5841,19 @@ function updateExtraRepoStatus(prefix) {
   if (hiddenChecked) {
     parts.push(hiddenChecked + (hiddenChecked === 1 ? ' selected repo is' : ' selected repos are') +
       ' hidden by the filter and still mounted; Select all and Clear only touch visible rows.');
+  }
+  // A guessed branch looks exactly like a saved one, so say how many of the
+  // repos to be mounted got one: they are read off the Odoo image, not off the
+  // repo's history. Unticked rows are guessed too, ready for a tick, but are
+  // nobody's concern until they are ticked.
+  var guessed = rows.filter(function(row) {
+    var cb = row.querySelector('input[type="checkbox"]');
+    var input = row.querySelector('.branch-input');
+    return cb && cb.checked && input && input.hasAttribute('data-autofilled');
+  }).length;
+  if (guessed) {
+    parts.push(guessed + (guessed === 1 ? ' selected repo got its' : ' selected repos got their') +
+      ' branch from the Odoo image (marked guessed); correct any that are wrong.');
   }
   var status = document.getElementById(prefix + '-status');
   status.textContent = parts.join(' ');
@@ -5857,13 +5905,169 @@ function applyDefaultExtraBranch(prefix) {
   var branch = picker.value;
   picker.value = '';
   if (!branch) return;
-  var repos = Object.create(null);
-  (cachedExtraRepos || []).forEach(function(r) { repos[r.name] = r; });
+  var repos = _extraReposByName();
   _extraRepoRows(prefix).forEach(function(row) {
     var repo = repos[row.querySelector('input[type="checkbox"]').value];
     if (repo && extraRepoBranchNames(repo).indexOf(branch) !== -1) {
-      row.querySelector('.branch-input').value = branch;
+      var input = row.querySelector('.branch-input');
+      input.value = branch;
+      // Picked on purpose, so a later image edit must not revise it.
+      input.removeAttribute('data-autofilled');
     }
+  });
+  updateExtraRepoStatus(prefix);
+}
+
+// Mirrors major_from_image_reference() in odoo_version.py: the Odoo series a
+// Docker image reference carries, or null when the reference is no evidence of
+// one. Deliberately conservative, for the same reason as the server-side
+// original — a number that is not an Odoo series (acme/odoo-stack:2.0) must not
+// become a branch guess. tests/test_web_ui_static.py checks the two agree.
+var ODOO_MAJOR_MIN = 6;
+var ODOO_MAJOR_MAX = 30;
+
+function _plausibleOdooMajor(digits) {
+  var major = parseInt(digits, 10);
+  return (major >= ODOO_MAJOR_MIN && major <= ODOO_MAJOR_MAX) ? major : null;
+}
+
+// Repository path without the registry host, so that a vendor's own registry
+// (odoo-registry.example/postgres) does not make every image it serves look
+// like an Odoo image.
+function _imagePath(reference) {
+  var segments = reference.split('/');
+  var host = segments[0];
+  if (segments.length > 1 &&
+      (host.indexOf('.') !== -1 || host.indexOf(':') !== -1 || host === 'localhost')) {
+    return segments.slice(1).join('/');
+  }
+  return reference;
+}
+
+function odooMajorFromImage(image) {
+  if (!image) return null;
+  var reference = String(image).split('@')[0];
+  var leaf = reference.split('/').pop();
+  var hasTag = leaf.indexOf(':') !== -1;
+  var tag = hasTag ? leaf.slice(leaf.lastIndexOf(':') + 1) : '';
+  var repository = hasTag ? reference.slice(0, reference.lastIndexOf(':')) : reference;
+  var path = _imagePath(repository);
+  var tagMatch = /(?:^|[/_-])odoo(?:$|[/_-])/i.test(path)
+    ? /^(?:saas[-~])?(\d+)(?:\.\d+)?(?:$|[-_])/.exec(tag)
+    : null;
+  var tagMajor = tagMatch ? _plausibleOdooMajor(tagMatch[1]) : null;
+  // Versioned repository names (acme/odoo-15) are read independently, with the
+  // tag detached, so acme/odoo-15:latest still yields 15.
+  var repoMatch = /odoo[-_:/]?(\d+)(?:\.\d+)?(?:$|[-_])/i.exec(path);
+  var repoMajor = repoMatch ? _plausibleOdooMajor(repoMatch[1]) : null;
+  // Either number could be a custom build version; when they disagree the
+  // reference says nothing reliable at all.
+  if (tagMajor !== null && repoMajor !== null && tagMajor !== repoMajor) return null;
+  return tagMajor !== null ? tagMajor : repoMajor;
+}
+
+// Branch names the Odoo series in an image is published under, most specific
+// first: Odoo itself and the OCA both branch per version ("19.0"), and a few
+// repos drop the minor. An online release (saas~19.1) is a series of its own,
+// saas-19.1, that the stable 19.0 must not stand in for; its minor is read off
+// the tag here because odooMajorFromImage() keeps to the major, as the server
+// does.
+function odooBranchCandidates(image) {
+  var major = odooMajorFromImage(image);
+  if (major === null) return [];
+  var leaf = String(image).split('@')[0].split('/').pop();
+  var tag = leaf.indexOf(':') !== -1 ? leaf.slice(leaf.lastIndexOf(':') + 1) : '';
+  if (!/^saas[-~]/.test(tag)) return [major + '.0', String(major)];
+  var saas = /^saas[-~](\d+)\.(\d+)(?:$|[-_])/.exec(tag);
+  return saas && parseInt(saas[1], 10) === major ? ['saas-' + major + '.' + saas[2]] : [];
+}
+
+// Whether the branches a repo carries are known at all: one registered before
+// the remote list was stored, and never refreshed since, has neither list.
+function extraRepoBranchesKnown(r) {
+  return !!(r && (r.available_known || (r.branches || []).length));
+}
+
+// Fills the branch matching the Odoo image into every row, so a list of
+// per-version repos (an OCA set, enterprise) does not have to be typed out by
+// hand. Only ever writes a branch the repo really carries, and only into rows
+// it filled itself: a branch from a template, from a production or from the
+// user's own keyboard always wins (a field the user emptied stays empty), and
+// a changed image revises nothing but the previous guesses.
+function autofillExtraBranches(prefix) {
+  var imageField = document.getElementById(EXTRA_REPO_PICKERS[prefix].image);
+  var candidates = odooBranchCandidates(imageField ? imageField.value.trim() : '');
+  var repos = _extraReposByName();
+  _extraRepoRows(prefix).forEach(function(row) {
+    var input = row.querySelector('.branch-input');
+    if (!input || input.hasAttribute('data-edited') ||
+        (input.value && !input.hasAttribute('data-autofilled'))) return;
+    var repo = repos[row.querySelector('input[type="checkbox"]').value];
+    var names = repo ? extraRepoBranchNames(repo) : [];
+    var guess = candidates.filter(function(b) { return names.indexOf(b) !== -1; })[0] || '';
+    // A repo whose branches are unknown gets nothing filled in, but the guess
+    // is still worth showing: the user can see which branch is expected and
+    // type it, instead of working the version out from the image by hand.
+    var expected = (!guess && candidates.length && !extraRepoBranchesKnown(repo))
+      ? candidates[0] : '';
+    input.value = guess;
+    input.placeholder = expected || 'branch';
+    if (guess) input.setAttribute('data-autofilled', '');
+    else input.removeAttribute('data-autofilled');
+  });
+  updateExtraRepoStatus(prefix);
+}
+
+// The image field revises the guesses as it is typed into, but only once the
+// typing pauses: a half-typed reference (odoo:1) reads as no version at all
+// and would clear every guess for a keystroke. Leaving the field runs the
+// autofill at once (onchange), so a submit never sees the previous image's.
+var _extraAutofillTimers = Object.create(null);
+
+function scheduleExtraBranchAutofill(prefix) {
+  clearTimeout(_extraAutofillTimers[prefix]);
+  _extraAutofillTimers[prefix] = setTimeout(function() {
+    autofillExtraBranches(prefix);
+  }, 300);
+}
+
+// A branch the user types, or empties, stops being a guess for good, so
+// later image edits leave the field alone. Delegated, because the rows are
+// rebuilt on every render.
+function markExtraBranchEdited(event) {
+  var input = event.target;
+  if (input && input.classList && input.classList.contains('branch-input')) {
+    input.removeAttribute('data-autofilled');
+    input.setAttribute('data-edited', '');
+  }
+}
+
+// Which branch fields hold a guess or a deliberate edit, by repo, so that a
+// list rebuilt from the same values (the raw JSON round trip) can tell them
+// apart from saved values again.
+function _extraBranchMarks(prefix) {
+  var marks = Object.create(null);
+  _extraRepoRows(prefix).forEach(function(row) {
+    var input = row.querySelector('.branch-input');
+    if (!input) return;
+    marks[row.querySelector('input[type="checkbox"]').value] = {
+      value: input.value,
+      autofilled: input.hasAttribute('data-autofilled'),
+      edited: input.hasAttribute('data-edited')
+    };
+  });
+  return marks;
+}
+
+// Puts the marks back on the fields that still hold the value they had; one
+// changed in the meantime (in the JSON) is a saved value now.
+function _restoreExtraBranchMarks(prefix, marks) {
+  _extraRepoRows(prefix).forEach(function(row) {
+    var input = row.querySelector('.branch-input');
+    var mark = input && marks[row.querySelector('input[type="checkbox"]').value];
+    if (!mark || mark.value !== input.value) return;
+    if (mark.autofilled) input.setAttribute('data-autofilled', '');
+    if (mark.edited) input.setAttribute('data-edited', '');
   });
 }
 
@@ -5888,7 +6092,7 @@ function _tsetExtraRow(name, repoUrl, branches, extras, idx, missing) {
   '</label>';
 }
 
-function _tsetRenderExtraAddons(extras) {
+function _tsetRenderExtraAddons(extras, branchMarks) {
   var container = document.getElementById('tset-extra-addons');
   var repos = cachedExtraRepos || [];
   var known = Object.create(null);
@@ -5902,8 +6106,12 @@ function _tsetRenderExtraAddons(extras) {
   container.innerHTML = rows.length
     ? rows.join('')
     : '<span class="hint" style="margin-top:0;">No extra repos available</span>';
+  // Before the autofill, which would otherwise take a field the user emptied
+  // for one it may fill.
+  if (branchMarks) _restoreExtraBranchMarks('tset-extra', branchMarks);
   setExtraRepoActionsEnabled('tset-extra', rows.length > 0);
   initExtraRepoTools('tset-extra');
+  autofillExtraBranches('tset-extra');
 }
 
 function _tsetRenderCredentials(current) {
@@ -5939,7 +6147,7 @@ function _tsetRenderFacts(meta) {
   document.getElementById('tset-facts-group').style.display = rows.length ? '' : 'none';
 }
 
-function _tsetFillForm(meta) {
+function _tsetFillForm(meta, branchMarks) {
   document.getElementById('tset-image').value = meta.odoo_image || '';
   document.getElementById('tset-repo').value = meta.repo_url || '';
   document.getElementById('tset-local-path').value = meta.local_path || '';
@@ -5959,7 +6167,7 @@ function _tsetFillForm(meta) {
   document.getElementById('tset-overlay').value =
     overlay === true ? 'overlay' : (overlay === false ? 'copy' : 'auto');
   _tsetRenderCredentials(meta.git_user || '');
-  _tsetRenderExtraAddons(_tsetNormalizeExtras(meta.extra_addons));
+  _tsetRenderExtraAddons(_tsetNormalizeExtras(meta.extra_addons), branchMarks);
   _tsetRenderFacts(meta);
 }
 
@@ -6018,6 +6226,9 @@ function toggleTemplateSettingsMode() {
   if (!_templateSettingsRawMode) {
     var collected = _tsetCollectForm();
     if (!collected) return;
+    // The JSON holds a guessed branch as a plain value; the form it comes
+    // back to must still mark it as a guess.
+    _templateSettingsBranchMarks = _extraBranchMarks('tset-extra');
     editor.value = JSON.stringify(collected, null, 2) + '\n';
     _tsetSetMode(true);
     editor.focus();
@@ -6040,7 +6251,7 @@ function toggleTemplateSettingsMode() {
   }
   errEl.style.display = 'none';
   _templateSettingsMeta = parsed;
-  _tsetFillForm(parsed);
+  _tsetFillForm(parsed, _templateSettingsBranchMarks);
   _tsetSetMode(false);
 }
 
@@ -6394,22 +6605,23 @@ function renderTemplates(templates) {
   }).join('');
 }
 
-function populateTemplateSelect() {
+// selected: the template a card opened the modal for; without one the first
+// template stays selected.
+function populateTemplateSelect(selected) {
   var sel = document.getElementById('cr-template');
   sel.innerHTML = '';
   cachedTemplates.forEach(function(t) {
     sel.innerHTML += '<option value="' + esc(t.template_name) + '">' + esc(t.template_name) + '</option>';
   });
   sel.innerHTML += '<option value="none">None (init from scratch)</option>';
+  if (selected) sel.value = selected;
   sel.onchange = function() {
     var tpl = cachedTemplates.find(function(t) { return t.template_name === sel.value; });
     if (tpl) {
       if (tpl.repo_url && !document.getElementById('cr-repo').value.trim()) {
         document.getElementById('cr-repo').value = tpl.repo_url;
       }
-      if (tpl.odoo_image && !document.getElementById('cr-image').value.trim()) {
-        document.getElementById('cr-image').value = tpl.odoo_image;
-      }
+      setCreateTemplateImage(tpl);
       if (tpl.git_user && !document.getElementById('cr-git-user').value) {
         document.getElementById('cr-git-user').value = tpl.git_user;
       }
@@ -6421,12 +6633,19 @@ function populateTemplateSelect() {
       document.querySelectorAll('.cr-extra-cb').forEach(function(cb) {
         cb.checked = cb.value in tplExtras;
         var brInput = document.querySelector('.cr-extra-branch-input[data-repo="' + cb.value + '"]');
-        if (brInput) brInput.value = tplExtras[cb.value] || '';
+        if (!brInput) return;
+        brInput.value = tplExtras[cb.value] || '';
+        // The template's own branches are a decision, not a guess, and they
+        // replace whatever was typed: an empty one is open to a guess again.
+        brInput.removeAttribute('data-autofilled');
+        brInput.removeAttribute('data-edited');
       });
       // The template just decided the whole selection (replacing whatever a
       // branch was filled into); a filter left over from the previous one must
-      // not keep its picks off screen.
+      // not keep its picks off screen. Repos it left empty fall back to the
+      // branch the Odoo image implies.
       revealExtraRepos('cr-extra');
+      autofillExtraBranches('cr-extra');
     }
     fillCreateTemplateEnvVars(tpl);
   };
@@ -6435,7 +6654,14 @@ function populateTemplateSelect() {
   if (_createFromProduction) return;
   var initial = cachedTemplates.find(function(t) { return t.template_name === sel.value; });
   fillCreateTemplateEnvVars(initial);
-  if (initial) setCreateBaseBranch(initial.source_branch);
+  if (initial) {
+    setCreateBaseBranch(initial.source_branch);
+    // The server runs the preselected template's image when the field is
+    // left empty, so the field shows it and the extra repo branches are
+    // guessed from it, as they are for a template picked by hand.
+    setCreateTemplateImage(initial);
+    autofillExtraBranches('cr-extra');
+  }
 }
 
 // A new branch starts from the code its database snapshot was taken from (a
@@ -6443,6 +6669,19 @@ function populateTemplateSelect() {
 // replaces the field, so a template without one keeps what the user typed.
 function setCreateBaseBranch(branch) {
   if (branch) document.getElementById('cr-base-branch').value = branch;
+}
+
+// An image a template filled in follows the selected template: left stale, it
+// would run that template's database on another template's Odoo, and guess
+// its extra repo branches from it. One the user typed, or a production's,
+// stays.
+function setCreateTemplateImage(tpl) {
+  var imageField = document.getElementById('cr-image');
+  var image = imageField.value.trim();
+  if (!image || image === _createTemplateImage) {
+    imageField.value = (tpl && tpl.odoo_image) || '';
+    _createTemplateImage = imageField.value;
+  }
 }
 
 function openCreateFromTemplate(templateName) {
@@ -6453,6 +6692,7 @@ function openCreateFromTemplate(templateName) {
   document.getElementById('cr-hostname').value = '';
   document.getElementById('cr-repo').value = tpl && tpl.repo_url ? tpl.repo_url : '';
   document.getElementById('cr-image').value = tpl && tpl.odoo_image ? tpl.odoo_image : '';
+  _createTemplateImage = document.getElementById('cr-image').value;
   document.getElementById('cr-auto-install').value = tpl && tpl.auto_install_modules ? tpl.auto_install_modules : '';
   document.getElementById('cr-base-branch').value = tpl && tpl.source_branch ? tpl.source_branch : '';
   fillCreateTemplateEnvVars(tpl);
@@ -6461,12 +6701,11 @@ function openCreateFromTemplate(templateName) {
   errEl.textContent = '';
   document.getElementById('cr-submit').disabled = false;
   loadTemplates().then(function() {
-    populateTemplateSelect();
-    var sel = document.getElementById('cr-template');
-    sel.value = templateName;
+    populateTemplateSelect(templateName);
     var fresh = cachedTemplates.find(function(t) { return t.template_name === templateName; }) || tpl;
     fillCreateTemplateEnvVars(fresh);
-    // Assigned outright: populateTemplateSelect() filled the first template's.
+    // Assigned outright: setCreateBaseBranch() would keep a branch the card's
+    // older copy of the template put there.
     document.getElementById('cr-base-branch').value = fresh && fresh.source_branch ? fresh.source_branch : '';
   });
   loadCredentials().then(function() {
@@ -6503,6 +6742,7 @@ function openCreateFromTemplate(templateName) {
     }).join('');
     setExtraRepoActionsEnabled('cr-extra', true);
     initExtraRepoTools('cr-extra');
+    autofillExtraBranches('cr-extra');
   });
   showModal('create-modal');
   document.getElementById('cr-branch').focus();
@@ -6511,6 +6751,9 @@ function openCreateFromTemplate(templateName) {
 // Set when the create modal was opened from a production card: the environment
 // is then built from a dev copy of that production instead of a template.
 var _createFromProduction = '';
+// The Odoo image a template put into the create modal, so that picking another
+// template can tell it from one the user typed.
+var _createTemplateImage = '';
 
 function setCreateSourceProduction(name) {
   _createFromProduction = name || '';
@@ -6536,6 +6779,7 @@ function openCreateModal(fromProduction) {
   document.getElementById('cr-hostname').value = '';
   document.getElementById('cr-repo').value = prod && prod.repo_url ? prod.repo_url : '';
   document.getElementById('cr-image').value = prod && prod.odoo_image ? prod.odoo_image : '';
+  _createTemplateImage = '';
   document.getElementById('cr-base-branch').value = prod && prod.branch ? prod.branch : '';
   document.getElementById('cr-auto-install').value = '';
   document.getElementById('cr-env-vars').value = '';
@@ -6545,7 +6789,7 @@ function openCreateModal(fromProduction) {
   errEl.style.display = 'none';
   errEl.textContent = '';
   document.getElementById('cr-submit').disabled = false;
-  loadTemplates().then(populateTemplateSelect);
+  loadTemplates().then(function() { populateTemplateSelect(); });
   loadCredentials().then(function() {
     var sel = document.getElementById('cr-git-user');
     sel.innerHTML = '<option value="">— None —</option>';
@@ -6579,6 +6823,7 @@ function openCreateModal(fromProduction) {
     }).join('');
     setExtraRepoActionsEnabled('cr-extra', true);
     initExtraRepoTools('cr-extra');
+    autofillExtraBranches('cr-extra');
   });
   showModal('create-modal');
   document.getElementById('cr-branch').focus();

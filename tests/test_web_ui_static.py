@@ -39,6 +39,21 @@ def _js_function(source: str, name: str) -> str:
     raise AssertionError(f"unterminated JavaScript function {name}")
 
 
+def _js_var(source: str, name: str) -> str:
+    """Extract one top-level dashboard variable declaration."""
+    start = source.index(f"var {name} = ")
+    depth = 0
+    for index in range(start, len(source)):
+        char = source[index]
+        if char in "{[(":
+            depth += 1
+        elif char in "}])":
+            depth -= 1
+        elif char == ";" and depth == 0:
+            return source[start : index + 1]
+    raise AssertionError(f"unterminated JavaScript variable {name}")
+
+
 def _run_node(source: str) -> dict[str, object]:
     result = subprocess.run(
         ["node", "-"],
@@ -673,7 +688,13 @@ var EXTRA_REPO_PICKERS = {
 };
 function row(checked, hidden) {
   var cb = {checked: checked, type: 'checkbox'};
-  var r = {hidden: !!hidden, cb: cb, querySelector: function () { return cb; }};
+  // No branch was guessed into these rows, so the status line has only the
+  // selection to report.
+  var input = {value: '', hasAttribute: function () { return false; }};
+  var r = {
+    hidden: !!hidden, cb: cb,
+    querySelector: function (sel) { return sel === '.branch-input' ? input : cb; }
+  };
   cb.closest = function () { return r; };
   return r;
 }
@@ -748,6 +769,7 @@ def test_extra_repo_filter_and_default_branch():
             "extraRepoBranchChoices",
             "extraRepoBranchNames",
             "_extraRepoRows",
+            "_extraReposByName",
             "updateExtraRepoStatus",
             "filterExtraRepos",
             "revealExtraRepos",
@@ -772,7 +794,12 @@ var cachedExtraRepos = [
 ];
 function row(name, url, branch) {
   var cb = {value: name, checked: false};
-  var input = {value: branch};
+  var input = {
+    value: branch, attributes: {},
+    hasAttribute: function (k) { return Object.hasOwn(this.attributes, k); },
+    setAttribute: function (k, v) { this.attributes[k] = v; },
+    removeAttribute: function (k) { delete this.attributes[k]; }
+  };
   return {
     hidden: false,
     textContent: name + ' (' + url + ')',
@@ -1801,3 +1828,482 @@ process.stdout.write(JSON.stringify({
     assert "undefined" not in result["missing"]
     assert "null" not in result["missing"]
     assert f"Last archive: <strong>{result['local']}</strong>" in result["archived"]
+
+
+# References the dashboard has to read exactly as the server does: official
+# tags, custom registries, versioned repository names, and the ones that carry
+# no Odoo version at all (a calendar tag, a product version of its own, a
+# repository and tag that disagree).
+_IMAGE_REFERENCES = (
+    "odoo:19.0",
+    "odoo:18.0-20250101",
+    "odoo:latest",
+    "odoo",
+    "",
+    "registry.example:5000/acme/odoo-ee:17.0-custom",
+    "ghcr.io/acme/odoo-16",
+    "ghcr.io/acme/odoo-16:latest",
+    "ghcr.io/acme/odoo-stack:2.0",
+    "ghcr.io/acme/platform:latest",
+    "postgres:16",
+    "odoo:saas~19.1",
+    "acme/odoo-15:16.0",
+    "odoo-registry.example/postgres:16",
+    "oduist/customer_odoo",
+    "odoo:2024.3",
+    "odoo:19.0@sha256:dead",
+    "localhost:5000/odoo:18.0",
+    # Neither a digest's hex nor a registry port is a version tag.
+    "odoo@sha256:" + "9" * 64,
+    "registry:5000/odoo",
+    "acme/odoo:20260910",
+)
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")
+def test_dashboard_reads_an_images_odoo_version_exactly_as_the_server_does():
+    """The branch guess must not outgrow odoo_version.major_from_image_reference.
+
+    The dashboard carries its own copy of that heuristic (it runs before any
+    container exists), and a copy that drifts would offer branches for versions
+    the server never agrees are there.
+    """
+    from oduflow.odoo_version import major_from_image_reference
+
+    source = _DASHBOARD.read_text(encoding="utf-8")
+    functions = "\n".join(
+        _js_function(source, name)
+        for name in ("_plausibleOdooMajor", "_imagePath", "odooMajorFromImage")
+    )
+    result = _run_node(
+        _js_var(source, "ODOO_MAJOR_MIN")
+        + "\n"
+        + _js_var(source, "ODOO_MAJOR_MAX")
+        + "\n"
+        + functions
+        + "\nvar images = "
+        + json.dumps(list(_IMAGE_REFERENCES))
+        + ";\n"
+        """
+        var majors = {};
+        images.forEach(function (image) { majors[image] = odooMajorFromImage(image); });
+        console.log(JSON.stringify(majors));
+        """
+    )
+
+    assert result == {
+        image: major_from_image_reference(image) for image in _IMAGE_REFERENCES
+    }
+
+
+# A field stand-in for the branch inputs: value, placeholder and attributes,
+# plus the class the delegated input handler looks for.
+_JS_BRANCH_FIELD = """
+function field(value) {
+  return {
+    value: value, placeholder: 'branch', attributes: {},
+    classList: {contains: function (c) { return c === 'branch-input'; }},
+    hasAttribute: function (k) { return Object.hasOwn(this.attributes, k); },
+    setAttribute: function (k, v) { this.attributes[k] = v; },
+    removeAttribute: function (k) { delete this.attributes[k]; }
+  };
+}
+"""
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")
+def test_extra_addons_branches_are_guessed_from_the_image_but_never_overwrite_a_choice():
+    source = _DASHBOARD.read_text(encoding="utf-8")
+    functions = "\n".join(
+        _js_function(source, name)
+        for name in (
+            "_plausibleOdooMajor",
+            "_imagePath",
+            "odooMajorFromImage",
+            "odooBranchCandidates",
+            "extraRepoBranchesKnown",
+            "extraRepoBranchChoices",
+            "_tsetBranchOptions",
+            "extraRepoBranchNames",
+            "_extraReposByName",
+            "updateExtraRepoStatus",
+            "autofillExtraBranches",
+            "markExtraBranchEdited",
+        )
+    )
+    harness = (
+        _js_var(source, "ODOO_MAJOR_MIN")
+        + "\n"
+        + _js_var(source, "ODOO_MAJOR_MAX")
+        + "\n"
+        + _js_var(source, "EXTRA_REPO_PICKERS")
+        + _JS_BRANCH_FIELD
+        + """
+        var image = {value: 'odoo:19.0'};
+        var status = {textContent: '', hidden: true};
+        var document = {getElementById: function (id) {
+          return id === 'cr-image' ? image : status;
+        }};
+        var cachedExtraRepos = [
+          // Only the remote list is known: nothing downloaded yet.
+          {name: 'ready', available_branches: ['origin/18.0', 'origin/19.0'],
+           available_known: true},
+          {name: 'enterprise', available_branches: ['18.0', '19.0', 'saas-19.1'],
+           available_known: true},
+          {name: 'behind', branches: ['17.0', '18.0'], available_known: true},
+          // Registered before the remote list was stored: no branches known.
+          {name: 'unknown', branches: [], available_branches: [],
+           available_known: false},
+          {name: 'typed', available_branches: ['19.0'], available_known: true},
+          {name: 'cleared', available_branches: ['18.0', '19.0'], available_known: true},
+          {name: 'unticked', available_branches: ['18.0', '19.0'], available_known: true}
+        ];
+        var inputs = {
+          ready: field(''), enterprise: field(''), behind: field(''),
+          unknown: field(''), typed: field('18.0-custom'), cleared: field(''),
+          unticked: field('')
+        };
+        var rows = Object.keys(inputs).map(function (name) {
+          var cb = {value: name, checked: name !== 'unticked'};
+          return {
+            hidden: false,
+            querySelector: function (sel) {
+              return sel === '.branch-input' ? inputs[name] : cb;
+            }
+          };
+        });
+        function _extraRepoRows() { return rows; }
+        function type(name, value) {
+          inputs[name].value = value;
+          markExtraBranchEdited({target: inputs[name]});
+        }
+        function shape() {
+          var out = {};
+          Object.keys(inputs).forEach(function (name) {
+            out[name] = [inputs[name].value, inputs[name].placeholder];
+          });
+          return out;
+        }
+        """
+        + functions
+        + """
+        autofillExtraBranches('cr-extra');
+        var guessed = shape();
+        var note = status.textContent;
+
+        // Typing in a row takes it out of the guesses for good, and so does
+        // emptying one.
+        type('ready', '19.0-hotfix');
+        type('cleared', '');
+        image.value = 'odoo:18.0';
+        autofillExtraBranches('cr-extra');
+        var rebuilt = shape();
+
+        image.value = 'odoo:saas~19.1';
+        autofillExtraBranches('cr-extra');
+        var online = shape();
+
+        image.value = 'ghcr.io/acme/platform:latest';
+        autofillExtraBranches('cr-extra');
+        console.log(JSON.stringify({
+          guessed: guessed, note: note, rebuilt: rebuilt, online: online,
+          cleared: shape(), noteCleared: status.textContent
+        }));
+        """
+    )
+
+    assert _run_node(harness) == {
+        # Filled where the repo really carries 19.0; a repo that does not keeps
+        # an empty field, and one whose branches are unknown only gets the
+        # expected name as a placeholder. A branch already typed is left alone.
+        "guessed": {
+            "ready": ["19.0", "branch"],
+            "enterprise": ["19.0", "branch"],
+            "behind": ["", "branch"],
+            "unknown": ["", "19.0"],
+            "typed": ["18.0-custom", "branch"],
+            "cleared": ["19.0", "branch"],
+            "unticked": ["19.0", "branch"],
+        },
+        # Only the ticked repos are counted: the unticked guess is not mounted.
+        "note": (
+            "3 selected repos got their branch from the Odoo image "
+            "(marked guessed); correct any that are wrong."
+        ),
+        # Another image revises the guesses and nothing else.
+        "rebuilt": {
+            "ready": ["19.0-hotfix", "branch"],
+            "enterprise": ["18.0", "branch"],
+            "behind": ["18.0", "branch"],
+            "unknown": ["", "18.0"],
+            "typed": ["18.0-custom", "branch"],
+            "cleared": ["", "branch"],
+            "unticked": ["18.0", "branch"],
+        },
+        # An online release only takes its own saas branch: the stable 19.0
+        # does not stand in for it.
+        "online": {
+            "ready": ["19.0-hotfix", "branch"],
+            "enterprise": ["saas-19.1", "branch"],
+            "behind": ["", "branch"],
+            "unknown": ["", "saas-19.1"],
+            "typed": ["18.0-custom", "branch"],
+            "cleared": ["", "branch"],
+            "unticked": ["", "branch"],
+        },
+        # An image with no Odoo version in it leaves no guess behind either.
+        "cleared": {
+            "ready": ["19.0-hotfix", "branch"],
+            "enterprise": ["", "branch"],
+            "behind": ["", "branch"],
+            "unknown": ["", "branch"],
+            "typed": ["18.0-custom", "branch"],
+            "cleared": ["", "branch"],
+            "unticked": ["", "branch"],
+        },
+        "noteCleared": "",
+    }
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")
+def test_saas_images_never_guess_a_branch_of_another_series():
+    source = _DASHBOARD.read_text(encoding="utf-8")
+    functions = "\n".join(
+        _js_function(source, name)
+        for name in (
+            "_plausibleOdooMajor",
+            "_imagePath",
+            "odooMajorFromImage",
+            "odooBranchCandidates",
+        )
+    )
+    images = [
+        "odoo:19.0",
+        "odoo:saas~19.1",
+        "acme/odoo-19:saas-19.2-custom",
+        # A saas tag without its minor names no branch that exists.
+        "odoo:saas~19",
+        # The repository name and the saas tag disagree: no version at all.
+        "acme/odoo-18:saas~19.1",
+        "postgres:16",
+    ]
+    result = _run_node(
+        _js_var(source, "ODOO_MAJOR_MIN")
+        + "\n"
+        + _js_var(source, "ODOO_MAJOR_MAX")
+        + "\n"
+        + functions
+        + "\nvar images = "
+        + json.dumps(images)
+        + ";\n"
+        """
+        var out = {};
+        images.forEach(function (image) { out[image] = odooBranchCandidates(image); });
+        console.log(JSON.stringify(out));
+        """
+    )
+
+    assert result == {
+        "odoo:19.0": ["19.0", "19"],
+        "odoo:saas~19.1": ["saas-19.1"],
+        "acme/odoo-19:saas-19.2-custom": ["saas-19.2"],
+        "odoo:saas~19": [],
+        "acme/odoo-18:saas~19.1": [],
+        "postgres:16": [],
+    }
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")
+def test_template_settings_raw_json_round_trip_keeps_branch_guesses_marked():
+    source = _DASHBOARD.read_text(encoding="utf-8")
+    functions = "\n".join(
+        _js_function(source, name)
+        for name in ("_extraBranchMarks", "_restoreExtraBranchMarks")
+    )
+    harness = (
+        _JS_BRANCH_FIELD
+        + """
+        function rowsOf(inputs) {
+          return Object.keys(inputs).map(function (name) {
+            var cb = {value: name, checked: true};
+            return {querySelector: function (sel) {
+              return sel === '.branch-input' ? inputs[name] : cb;
+            }};
+          });
+        }
+        var before = {
+          guessed: field('19.0'), emptied: field(''), saved: field('main'),
+          changed: field('19.0')
+        };
+        before.guessed.setAttribute('data-autofilled', '');
+        before.changed.setAttribute('data-autofilled', '');
+        before.emptied.setAttribute('data-edited', '');
+        var current = rowsOf(before);
+        function _extraRepoRows() { return current; }
+        """
+        + functions
+        + """
+        var marks = _extraBranchMarks('tset-extra');
+        // Back from raw JSON: every row is rebuilt from the JSON values, and
+        // one guess was edited there.
+        var after = {
+          guessed: field('19.0'), emptied: field(''), saved: field('main'),
+          changed: field('19.0-custom')
+        };
+        current = rowsOf(after);
+        _restoreExtraBranchMarks('tset-extra', marks);
+        var out = {};
+        Object.keys(after).forEach(function (name) {
+          out[name] = Object.keys(after[name].attributes).sort();
+        });
+        console.log(JSON.stringify(out));
+        """
+    )
+
+    assert _run_node(harness) == {
+        "guessed": ["data-autofilled"],
+        "emptied": ["data-edited"],
+        "saved": [],
+        # Edited in the JSON, so it is a saved value now.
+        "changed": [],
+    }
+    # The marks go back on before the autofill runs, or the emptied field
+    # would be refilled first; and the toggle hands them over both ways.
+    render = _js_function(source, "_tsetRenderExtraAddons")
+    assert render.index("_restoreExtraBranchMarks(") < render.index(
+        "autofillExtraBranches("
+    )
+    toggle = _js_function(source, "toggleTemplateSettingsMode")
+    assert "_templateSettingsBranchMarks = _extraBranchMarks('tset-extra')" in toggle
+    assert "_tsetFillForm(parsed, _templateSettingsBranchMarks)" in toggle
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")
+def test_create_modal_image_follows_the_template_that_filled_it():
+    source = _DASHBOARD.read_text(encoding="utf-8")
+    harness = (
+        _js_function(source, "populateTemplateSelect")
+        + "\n"
+        + _js_function(source, "setCreateTemplateImage")
+        + """
+        var _createFromProduction = '';
+        var _createTemplateImage = '';
+        var cachedTemplates = [
+          {template_name: 'a', odoo_image: 'odoo:18.0'},
+          {template_name: 'b', odoo_image: 'odoo:19.0'},
+          {template_name: 'bare'}
+        ];
+        var els = {
+          'cr-template': {innerHTML: '', value: 'a'},
+          'cr-image': {value: ''},
+          'cr-repo': {value: 'kept'},
+          'cr-git-user': {value: 'kept'},
+          'cr-auto-install': {value: 'kept'}
+        };
+        var document = {
+          getElementById: function (id) { return els[id]; },
+          querySelectorAll: function () { return []; }
+        };
+        var esc = function (s) { return s; };
+        var autofilledWith = [];
+        function fillCreateTemplateEnvVars() {}
+        function setCreateBaseBranch() {}
+        function revealExtraRepos() {}
+        function autofillExtraBranches() { autofilledWith.push(els['cr-image'].value); }
+        var sel = els['cr-template'];
+        function pick(name) { sel.value = name; sel.onchange(); return els['cr-image'].value; }
+        var out = {};
+        // Opened with the first template preselected: the server would run
+        // its image for an empty field, so the field shows it.
+        populateTemplateSelect();
+        out.opened = els['cr-image'].value;
+        out.switched = pick('b');
+        out.bare = pick('bare');
+        out.back = pick('a');
+        els['cr-image'].value = 'acme/odoo:17.0-custom';
+        out.typed = pick('b');
+        // Opened from a template's card, which is the one preselected.
+        els['cr-image'].value = 'odoo:19.0';
+        _createTemplateImage = 'odoo:19.0';
+        sel.value = 'a';
+        populateTemplateSelect('b');
+        out.fromCard = [sel.value, els['cr-image'].value];
+        // A production source keeps its own image, whatever is preselected.
+        _createFromProduction = 'prod';
+        _createTemplateImage = '';
+        els['cr-image'].value = 'odoo:16.0';
+        populateTemplateSelect();
+        out.fromProduction = els['cr-image'].value;
+        out.autofilledWith = autofilledWith;
+        console.log(JSON.stringify(out));
+        """
+    )
+
+    assert _run_node(harness) == {
+        "opened": "odoo:18.0",
+        # The previous template's image would run the new template's database
+        # on the wrong Odoo and guess its branches from it.
+        "switched": "odoo:19.0",
+        "bare": "",
+        "back": "odoo:18.0",
+        # One the user typed stays.
+        "typed": "acme/odoo:17.0-custom",
+        "fromCard": ["b", "odoo:19.0"],
+        "fromProduction": "odoo:16.0",
+        # Branches are guessed after the image is settled, from that image.
+        "autofilledWith": [
+            "odoo:18.0",
+            "odoo:19.0",
+            "",
+            "odoo:18.0",
+            "acme/odoo:17.0-custom",
+            "odoo:19.0",
+        ],
+    }
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")
+def test_image_typing_revises_branch_guesses_once_it_pauses():
+    source = _DASHBOARD.read_text(encoding="utf-8")
+    harness = (
+        _js_var(source, "_extraAutofillTimers")
+        + "\n"
+        + _js_function(source, "scheduleExtraBranchAutofill")
+        + """
+        var pending = {};
+        var nextId = 1;
+        function setTimeout(fn) { var id = nextId++; pending[id] = fn; return id; }
+        function clearTimeout(id) { delete pending[id]; }
+        var runs = [];
+        function autofillExtraBranches(prefix) { runs.push(prefix); }
+        // Three keystrokes in the create modal, one in template settings.
+        scheduleExtraBranchAutofill('cr-extra');
+        scheduleExtraBranchAutofill('cr-extra');
+        scheduleExtraBranchAutofill('cr-extra');
+        scheduleExtraBranchAutofill('tset-extra');
+        var before = runs.length;
+        Object.keys(pending).forEach(function (id) { pending[id](); });
+        console.log(JSON.stringify({before: before, runs: runs}));
+        """
+    )
+
+    assert _run_node(harness) == {"before": 0, "runs": ["cr-extra", "tset-extra"]}
+    # Leaving the field runs it at once, so a submit never sees stale guesses.
+    for prefix, field in (("cr-extra", "cr-image"), ("tset-extra", "tset-image")):
+        markup = source[source.index(f'id="{field}"') :]
+        markup = markup[: markup.index(">")]
+        assert f"oninput=\"scheduleExtraBranchAutofill('{prefix}')\"" in markup
+        assert f"onchange=\"autofillExtraBranches('{prefix}')\"" in markup
+
+
+def test_guessed_branches_are_marked_in_their_own_row():
+    # Status is never conveyed by color alone: the mark is a word, on ticked
+    # rows only, keyed to the same attribute the autofill sets.
+    source = _DASHBOARD.read_text(encoding="utf-8")
+    rule = (
+        '.form-group .check-item:has(> input[type="checkbox"]:checked)'
+        ":has(> .branch-input[data-autofilled])::after {"
+    )
+    css = source[source.index(rule) :]
+    css = css[: css.index("}")]
+    assert 'content: "guessed";' in css

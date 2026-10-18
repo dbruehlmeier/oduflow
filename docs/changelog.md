@@ -20,6 +20,20 @@
   See decision record
   [0079](https://github.com/oduflow/oduflow/blob/main/specs/0079-per-environment-agent-identities.md).
 
+### Features
+
+- **Extra repo branches are filled in from the Odoo image** — the **Create
+  Environment** dialog and a template's **Settings** fill each extra repo's
+  branch from the Odoo image (`odoo:19.0` → `19.0`) wherever the repo carries
+  that branch, so per-version repos such as the OCA sets or enterprise no
+  longer have to be typed out. An online-release image (`odoo:saas~19.1`) only
+  gets its own `saas-19.1`. Branches from a template, a production or your own
+  typing are never replaced, a field you cleared stays empty, and each selected
+  repo with a filled-in branch is marked **guessed** and counted under the list.
+  The image field now also follows a template switch when a template filled it,
+  so the new template's database no longer runs on the previous template's
+  Odoo. (#337)
+
 ### Fixes
 
 - **Failed production deploys explain themselves** — a failed
