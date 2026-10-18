@@ -2857,7 +2857,10 @@ def _complete_odumcp_takeover(
     ``(status, note)`` — ``("", "")`` when nothing applied, ``"completed"``,
     or ``"failed"`` when the recreate did not succeed; the still-mounted
     checkout is then left intact for sync_production_mcp to finish the job.
-    Never fails the (already successful) deploy.
+    A recreated container that did not become healthy still completes the
+    takeover (the repository copy was already the one Odoo loaded), but the
+    note says so instead of reporting a clean recreate. Never fails the
+    (already successful) deploy.
     """
     from oduflow import production_mcp
     from oduflow.locking import report_progress
@@ -2868,7 +2871,7 @@ def _complete_odumcp_takeover(
         return "", ""
     report_progress(progress_key, "removing the managed odumcp copy")
     try:
-        reconfigure_production(settings, team, name, force_recreate=True)
+        outcome = reconfigure_production(settings, team, name, force_recreate=True)
     except Exception as exc:
         logger.warning(
             "%s: the repository now ships odumcp, but recreating the container "
@@ -2876,12 +2879,24 @@ def _complete_odumcp_takeover(
             name,
             exc_info=True,
         )
+        # Our own errors explain themselves; anything else stays in the server
+        # log (same policy as create_production: a git error can quote URLs).
+        cause = f" ({exc})" if isinstance(exc, FlowError) else ""
         return (
             "failed",
             "The repository now ships odumcp, but recreating the container to "
-            f"drop the managed copy failed ({exc}); run sync_production_mcp to "
+            f"drop the managed copy failed{cause}; run sync_production_mcp to "
             "complete the takeover.",
         )
+    # reconfigure_production records an unhealthy recreate instead of raising.
+    health = (
+        ""
+        if outcome.get("healthy", True)
+        else (
+            " The recreated container did not become healthy within the health "
+            "timeout; check production_logs."
+        )
+    )
     try:
         production_mcp.retire_managed_checkout(team, name)
     except OSError:
@@ -2895,12 +2910,12 @@ def _complete_odumcp_takeover(
             "completed",
             "odumcp now comes from the repository; the container was recreated "
             "without the managed copy, whose directory could not be removed yet "
-            "(the next sync_production_mcp retries).",
+            "(the next sync_production_mcp retries)." + health,
         )
     return (
         "completed",
         "odumcp now comes from the repository; the managed copy was removed and "
-        "the container recreated without it.",
+        "the container recreated without it." + health,
     )
 
 

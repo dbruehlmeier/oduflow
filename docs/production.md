@@ -88,8 +88,9 @@ exactly two cases:
 repository** (main or extra, where Odoo scans it) **and deploying.** The deploy
 that brings the module in completes the takeover by itself: once the new code is
 verified healthy, Oduflow recreates the container without the managed mount and
-removes its managed checkout, and records this in the deploy history (`odumcp
-now comes from the repository; managed copy removed`). This holds for manual,
+removes its managed checkout, records `odumcp_takeover: completed` in the deploy
+history entry and says so in the deploy result (`odumcp now comes from the
+repository; the managed copy was removed`). This holds for manual,
 webhook and auto-update deploys alike, and also when the deploy classified the
 change as nothing to apply (the detection keys on the repository state after the
 pull, not on the changed files). `sync_production_mcp` does the same for a

@@ -2792,8 +2792,16 @@ class TestDeployCompletesOdumcpTakeover:
         }
         return container
 
-    def _deploy(self, settings, team, container, pull_result, healthy=(True,)):
-        reconfigure = MagicMock(return_value={"healthy": True})
+    def _deploy(
+        self,
+        settings,
+        team,
+        container,
+        pull_result,
+        healthy=(True,),
+        recreate_healthy=True,
+    ):
+        reconfigure = MagicMock(return_value={"healthy": recreate_healthy})
         routing = MagicMock(return_value="")
         with (
             patch.object(production_ops, "get_client", return_value=MagicMock()),
@@ -2848,6 +2856,30 @@ class TestDeployCompletesOdumcpTakeover:
         )
         # The recreate converged routing from the record; no second recreate.
         routing.assert_not_called()
+
+    def test_unhealthy_recreate_is_reported_not_hidden(self, settings, team):
+        """reconfigure_production records an unhealthy recreate instead of
+        raising: the takeover still completes (the repository copy was the one
+        Odoo loaded), but the note must not claim a clean recreate."""
+        from oduflow.production_mcp import addon_checkout
+
+        _seed_prod_record(team)
+        self._managed_checkout(team)
+        self._repository_module(team)
+
+        result, reconfigure, _ = self._deploy(
+            settings,
+            team,
+            self._container(),
+            {"action": "restart", "exit_code": 0, "changed_files": ["x"]},
+            recreate_healthy=False,
+        )
+
+        reconfigure.assert_called_once()
+        assert not addon_checkout(team, "erp").exists()
+        assert result["deploy"]["odumcp_takeover"] == "completed"
+        assert "did not become healthy" in result["message"]
+        assert "production_logs" in result["message"]
 
     def test_failed_deploy_leaves_the_managed_copy_alone(self, settings, team):
         from oduflow.production_mcp import addon_checkout
