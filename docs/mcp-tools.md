@@ -3132,14 +3132,16 @@ changes in `oduflow.toml` (change the value, restart Oduflow, then run this).
 No secret is accepted or returned. Stopped productions must be started first.
 
 Oduflow ships `odumcp` as a managed checkout unless the production's own
-repositories (main or extra) contain the module. Once they do, the next
-synchronization removes the managed checkout and Oduflow never touches the
-module again; the client's deployments own it from then on. Adding or removing
-the managed mount, or replacing/refreshing the checkout, recreates the
-container. Each result reports `addon_source` (`managed` or `repository`),
-`checkout` (`kept`, `cloned`, `replaced`, `refreshed`, `removed` or
-`repository`), `container_recreated` and, for a managed checkout,
-`connector_branch` and `connector_commit`.
+repositories (main or extra) contain the module. Once they do, the deploy that
+brought the module in already completes the takeover (container recreated
+without the managed mount, managed checkout removed, noted in the deploy
+history); this tool does the same for a production whose takeover is still
+pending. Oduflow never touches the module again; the client's deployments own
+it from then on. Adding or removing the managed mount, or replacing/refreshing
+the checkout, recreates the container. Each result reports `addon_source`
+(`managed` or `repository`), `checkout` (`kept`, `cloned`, `replaced`,
+`refreshed`, `removed` or `repository`), `container_recreated` and, for a
+managed checkout, `connector_branch` and `connector_commit`.
 
 Lock: production (each one in turn).
 { .odu-tool-meta }
@@ -3147,15 +3149,18 @@ Lock: production (each one in turn).
 **Parameters**
 
 `name`
-:   *str · default empty* — One production, or empty for every production of the team.
+:   *str · default empty* — One production, or empty for every production of
+    the team. Required when `refresh` is true.
 
 `refresh`
 :   *bool · default false* — Re-clone the managed checkout from
     `[production].odumcp_repo_url` at the production's Odoo version even when
     that version is unchanged, recreate the container and upgrade the module.
     The only way the managed module is updated; nothing refreshes it
-    automatically. A no-op for a module shipped in the client repository (the
-    result says so in `note`).
+    automatically. Requires an explicit `name`: the call is rejected before
+    touching anything when `name` is empty, so one call never re-clones and
+    recreates every production of the team. A no-op for a module shipped in
+    the client repository (the result says so in `note`).
 
 **Use it when**
 

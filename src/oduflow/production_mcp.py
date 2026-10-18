@@ -12,7 +12,7 @@ import tempfile
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import httpx
 
@@ -216,6 +216,71 @@ def _retire_checkout(checkout: Path, temporary: Path) -> None:
     checkout.rename(temporary / "previous")
 
 
+def extra_worktree_paths(
+    team: TeamSettings, name: str, record: dict[str, Any] | None = None
+) -> list[str]:
+    """Host paths of the production's extra-addon worktrees, from its record."""
+    if record is None:
+        record = production_registry.get_production(team, name)
+    workspace = Path(get_workspace_path(prod_env_name(name), team.workspaces_dir))
+    return [
+        str(workspace / "extra" / repo) for repo in record.get("extra_addons") or {}
+    ]
+
+
+def repository_provides_addon(
+    team: TeamSettings, name: str, extra_host_paths: Iterable[str] | None = None
+) -> bool:
+    """Whether the client's own repositories ship odumcp where Odoo scans.
+
+    The single probe behind every decision about the managed copy: whether to
+    clone it, whether to mount it, whether to retire it. *extra_host_paths*
+    are the extra-addon worktrees; by default those the registry record lists.
+    """
+    main = Path(get_repo_path(prod_env_name(name), team.workspaces_dir))
+    if extra_host_paths is None:
+        extra_host_paths = extra_worktree_paths(team, name)
+    roots = [main, *(Path(host) for host in extra_host_paths)]
+    return any(
+        (_addons_root(root) / "odumcp" / "__manifest__.py").is_file() for root in roots
+    )
+
+
+def mounts_managed_module(
+    team: TeamSettings, name: str, extra_host_paths: Iterable[str] | None = None
+) -> bool:
+    """Whether a container built now mounts the managed odumcp copy.
+
+    Decided by repository state, not by the checkout's mere presence: once the
+    client repositories ship the module, any recreate drops the mount even
+    before the checkout itself is retired.
+    """
+    return (
+        managed_module(team, name) / "__manifest__.py"
+    ).is_file() and not repository_provides_addon(team, name, extra_host_paths)
+
+
+def retire_managed_checkout(team: TeamSettings, name: str) -> bool:
+    """Remove the managed checkout atomically; False when there was none.
+
+    Callers make sure no running container still mounts it (see
+    :func:`_retire_checkout`).
+    """
+    checkout = addon_checkout(team, name)
+    if not checkout.exists():
+        return False
+    logger.info(
+        "Removing the managed OduMCP checkout of '%s': the production "
+        "repository provides odumcp",
+        name,
+    )
+    with tempfile.TemporaryDirectory(
+        prefix=".odumcp-retired-", dir=checkout.parent
+    ) as temporary:
+        _retire_checkout(checkout, Path(temporary))
+    return True
+
+
 def prepare_addon(
     settings: Settings,
     team: TeamSettings,
@@ -242,27 +307,14 @@ def prepare_addon(
     on an explicit ``refresh``, which re-clones the same series. Raises
     UnsupportedOdooVersion before Odoo 16.
     """
-    main = Path(get_repo_path(prod_env_name(name), team.workspaces_dir))
-    roots = [main, *(Path(host) for host, _ in extra_paths)]
     checkout = addon_checkout(team, name)
-    if any(
-        (_addons_root(root) / "odumcp" / "__manifest__.py").is_file() for root in roots
-    ):
-        if not checkout.exists():
-            return AddonPreparation(managed=False, action="repository")
+    if repository_provides_addon(team, name, [host for host, _ in extra_paths]):
         # The client took the module over. The repository path comes first in
         # addons_path, so the managed copy shadows nothing, but it must not
         # linger there nor be mounted into the next container.
-        logger.info(
-            "Removing the managed OduMCP checkout of '%s': the production "
-            "repository provides odumcp",
-            name,
-        )
-        with tempfile.TemporaryDirectory(
-            prefix=".odumcp-retired-", dir=checkout.parent
-        ) as temporary:
-            _retire_checkout(checkout, Path(temporary))
-        return AddonPreparation(managed=False, action="removed")
+        if retire_managed_checkout(team, name):
+            return AddonPreparation(managed=False, action="removed")
+        return AddonPreparation(managed=False, action="repository")
     from oduflow.docker_ops.env_ops import _clone_repo
 
     current = (checkout / _MANIFEST).is_file()

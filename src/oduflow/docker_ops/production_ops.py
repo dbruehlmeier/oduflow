@@ -508,10 +508,16 @@ def _build_prod_odoo_conf(
         except ValueError as exc:
             logger.warning("Database management stays disabled for '%s': %s", name, exc)
             overrides["list_db"] = "False"
-    from oduflow.production_mcp import MOUNT, managed_module
+    from oduflow.production_mcp import (
+        MOUNT,
+        extra_worktree_paths,
+        mounts_managed_module,
+    )
 
     extra_container_paths = list(extra_container_paths)
-    if (managed_module(team, name) / "__manifest__.py").is_file():
+    # Mounted only while the client repositories do not ship odumcp: the
+    # same rule as _container_spec, so conf and mounts always agree.
+    if mounts_managed_module(team, name, extra_worktree_paths(team, name, record)):
         extra_container_paths.append(MOUNT)
     generated = output_path or os.path.join(_workspace(team, name), "odoo.conf")
     generate_odoo_conf(
@@ -1380,11 +1386,16 @@ def _container_spec(
     odoo_volumes: dict[str, dict[str, str]] = {
         repo_path: {"bind": "/mnt/extra-addons", "mode": "rw"}
     }
-    from oduflow.production_mcp import MOUNT, managed_module
+    from oduflow.production_mcp import MOUNT, managed_module, mounts_managed_module
 
-    connector = managed_module(team, name)
-    if (connector / "__manifest__.py").is_file():
-        odoo_volumes[str(connector)] = {"bind": MOUNT + "/odumcp", "mode": "ro"}
+    # The managed odumcp copy is mounted only while the client repositories
+    # (main repo and extra worktrees) do not ship the module: any recreate
+    # drops the mount once they do, before the checkout itself is retired.
+    if mounts_managed_module(team, name, [host for host, _ in extra_mount_paths]):
+        odoo_volumes[str(managed_module(team, name))] = {
+            "bind": MOUNT + "/odumcp",
+            "mode": "ro",
+        }
     for host_path, container_path in extra_mount_paths:
         odoo_volumes[host_path] = {"bind": container_path, "mode": "ro"}
     odoo_volumes[prod_filestore_dir(team, name)] = {
@@ -2829,6 +2840,70 @@ def _repair_routing_after_deploy(
     )
 
 
+def _complete_odumcp_takeover(
+    settings: Settings,
+    team: TeamSettings,
+    name: str,
+    container: Any,
+    progress_key: str,
+) -> tuple[str, str]:
+    """After a SUCCESSFUL deploy: when the pulled code now ships odumcp and the
+    running container still mounts Oduflow's managed copy, recreate the
+    container (the builders no longer mount the copy once the repository
+    provides the module) and then retire the checkout.
+
+    Keyed on the repository state after the pull, not on the changed-files
+    list: a deploy classified "none" still completes the takeover. Returns
+    ``(status, note)`` — ``("", "")`` when nothing applied, ``"completed"``,
+    or ``"failed"`` when the recreate did not succeed; the still-mounted
+    checkout is then left intact for sync_production_mcp to finish the job.
+    Never fails the (already successful) deploy.
+    """
+    from oduflow import production_mcp
+    from oduflow.locking import report_progress
+
+    if not production_mcp.repository_provides_addon(team, name):
+        return "", ""
+    if not production_mcp._has_managed_mount(container):
+        return "", ""
+    report_progress(progress_key, "removing the managed odumcp copy")
+    try:
+        reconfigure_production(settings, team, name, force_recreate=True)
+    except Exception as exc:
+        logger.warning(
+            "%s: the repository now ships odumcp, but recreating the container "
+            "without the managed copy failed",
+            name,
+            exc_info=True,
+        )
+        return (
+            "failed",
+            "The repository now ships odumcp, but recreating the container to "
+            f"drop the managed copy failed ({exc}); run sync_production_mcp to "
+            "complete the takeover.",
+        )
+    try:
+        production_mcp.retire_managed_checkout(team, name)
+    except OSError:
+        logger.warning(
+            "%s: the container runs without the managed odumcp copy, but its "
+            "checkout could not be removed",
+            name,
+            exc_info=True,
+        )
+        return (
+            "completed",
+            "odumcp now comes from the repository; the container was recreated "
+            "without the managed copy, whose directory could not be removed yet "
+            "(the next sync_production_mcp retries).",
+        )
+    return (
+        "completed",
+        "odumcp now comes from the repository; the managed copy was removed and "
+        "the container recreated without it.",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Update engine with automatic code rollback
 # ---------------------------------------------------------------------------
@@ -3106,16 +3181,26 @@ def _update_production(
             production_registry.update_production(
                 team, name, {"deploy_in_progress": False, "unhealthy": False}
             )
-            deploy["ts_end"] = _now_iso()
             # Extra-addon worktree HEADs at this deployed state (pull advanced
             # them), so a later rollback to new_head reverts them in lockstep.
             deploy["worktrees"] = _worktree_heads(team, name)
+            takeover, takeover_note = _complete_odumcp_takeover(
+                settings, team, name, container, progress_key
+            )
+            if takeover:
+                deploy["odumcp_takeover"] = takeover
+            deploy["ts_end"] = _now_iso()
             append_deploy(team, name, deploy)
-            routing_note = _repair_routing_after_deploy(settings, team, name, container)
-            if routing_note:
-                result["message"] = " ".join(
-                    filter(None, [result.get("message", ""), routing_note])
-                )
+            # The takeover recreated the container from the record, routing
+            # included; otherwise legacy routing labels get their repair here.
+            routing_note = (
+                ""
+                if takeover == "completed"
+                else _repair_routing_after_deploy(settings, team, name, container)
+            )
+            notes = [result.get("message", ""), takeover_note, routing_note]
+            if takeover_note or routing_note:
+                result["message"] = " ".join(filter(None, notes))
             return {
                 **result,
                 "name": name,

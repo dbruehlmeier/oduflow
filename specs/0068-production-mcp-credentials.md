@@ -77,7 +77,18 @@ client-addon release before rollout.
   documented no-op for a client-shipped module. Results now name the addon
   source, what happened to the checkout, whether the container was recreated,
   and the connector branch and commit, so the state of a production's connector
-  is inspectable rather than inferred.
+  is inspectable rather than inferred. A refresh names one production; the
+  whole-team form of the tool refuses it.
+- **Mount decided by repository state; deploy completes the takeover.** The
+  container builders mount the managed copy only while the client repositories
+  do not ship `odumcp`, so any recreate — reconfiguration, image change,
+  synchronization — drops the mount the moment the module is client code,
+  independently of the checkout's presence on disk. The deploy that brings
+  `odumcp` into the repository (manual, webhook or auto-update) finishes the
+  takeover itself after the new code is verified: it recreates the container
+  without the mount, then retires the checkout, and records the fact in the
+  deploy history. A failed recreate leaves the still-mounted checkout intact
+  for `sync_production_mcp` to finish.
 
 Related: [[0035-production-hosting]], [[0028-scoped-environment-mcp-access]],
 [[0059-production-to-dev-data-flow]].

@@ -256,6 +256,106 @@ def test_managed_addon_is_mounted_and_kept_in_generated_config(configured, monke
     assert connector.MOUNT in generate.call_args.args[2]
 
 
+def _generated_addons_paths(settings, team, monkeypatch, extra_conf_paths=()):
+    """The addons_path list handed to generate_odoo_conf for 'erp'."""
+    from oduflow.docker_ops import production_ops
+    from oduflow.naming import get_repo_path, prod_env_name
+
+    generate = MagicMock()
+    monkeypatch.setattr("oduflow.extra_addons.generate_odoo_conf", generate)
+    monkeypatch.setattr(
+        "oduflow.pg_tune.detect_resources",
+        lambda: {"total_ram_mb": 4096, "cpu_count": 2},
+    )
+    production_ops._build_prod_odoo_conf(
+        settings,
+        team,
+        "erp",
+        get_repo_path(prod_env_name("erp"), team.workspaces_dir),
+        list(extra_conf_paths),
+    )
+    return generate.call_args.args[2]
+
+
+def test_repository_module_disables_the_managed_mount(configured, monkeypatch):
+    """The mount follows repository state, not the checkout's presence: a
+    recreate for any reason drops it once the client ships odumcp."""
+    from oduflow.docker_ops import production_ops
+
+    settings, team = configured
+    module = connector.managed_module(team, "erp")
+    module.mkdir(parents=True)
+    (module / "__manifest__.py").write_text("{}")
+    _repository_module(team)
+    record = production_registry.get_production(team, "erp")
+
+    _, volumes, _ = production_ops._container_spec(
+        settings, team, "erp", record, {"pg_user": "odoo", "pg_password": "db-test"}, []
+    )
+
+    assert str(module) not in volumes
+    assert not any(v["bind"].startswith(connector.MOUNT) for v in volumes.values())
+    assert connector.MOUNT not in _generated_addons_paths(settings, team, monkeypatch)
+
+
+def test_extra_repository_module_disables_the_managed_mount(configured, monkeypatch):
+    """An extra-addon worktree shipping odumcp counts as the client's code."""
+    from pathlib import Path
+
+    from oduflow.docker_ops import production_ops
+    from oduflow.naming import get_workspace_path, prod_env_name
+
+    settings, team = configured
+    module = connector.managed_module(team, "erp")
+    module.mkdir(parents=True)
+    (module / "__manifest__.py").write_text("{}")
+    worktree = Path(get_workspace_path(prod_env_name("erp"), team.workspaces_dir))
+    worktree = worktree / "extra" / "fleet"
+    existing_module(worktree, "addons", "odumcp")
+    record = production_registry.update_production(
+        team, "erp", {"extra_addons": {"fleet": "main"}}
+    )
+
+    _, volumes, _ = production_ops._container_spec(
+        settings,
+        team,
+        "erp",
+        record,
+        {"pg_user": "odoo", "pg_password": "db-test"},
+        [(str(worktree), "/mnt/extra-addons-fleet")],
+    )
+
+    assert str(module) not in volumes
+    paths = _generated_addons_paths(
+        settings, team, monkeypatch, ["/mnt/extra-addons-fleet/addons"]
+    )
+    assert connector.MOUNT not in paths
+    assert "/mnt/extra-addons-fleet/addons" in paths
+
+
+def test_refresh_requires_an_explicit_production_name(configured, monkeypatch):
+    """One refresh re-clones and recreates: never the whole team at once."""
+    import asyncio
+
+    from fastmcp.exceptions import ToolError
+
+    from oduflow import server
+
+    settings, team = configured
+    monkeypatch.setattr(server, "_get_settings", lambda: settings)
+    monkeypatch.setattr(server, "_resolve_team", lambda ctx=None: team)
+    synchronize = MagicMock(return_value={"name": "erp", "status": "ready"})
+    monkeypatch.setattr(connector, "synchronize", synchronize)
+    tool = server.mcp._tool_manager._tools["sync_production_mcp"].fn
+
+    with pytest.raises(ToolError, match="name one production"):
+        asyncio.run(tool(refresh=True))
+    synchronize.assert_not_called()
+
+    asyncio.run(tool(name="erp", refresh=True))
+    synchronize.assert_called_once_with(settings, team, "erp", refresh=True)
+
+
 def test_missing_addon_uses_configured_source(configured, monkeypatch):
     settings, team = configured
 
