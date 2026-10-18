@@ -195,7 +195,7 @@ def test_existing_addon_does_not_clone(configured, monkeypatch):
     (module / "__manifest__.py").write_text("{}")
     clone = MagicMock()
     monkeypatch.setattr("oduflow.docker_ops.env_ops._clone_repo", clone)
-    connector.prepare_addon(settings, team, "erp", [])
+    connector.prepare_addon(settings, team, "erp", [], "odoo:19.0")
     clone.assert_not_called()
 
 
@@ -263,7 +263,8 @@ def test_missing_addon_uses_configured_source(configured, monkeypatch):
         from pathlib import Path
 
         assert url == settings.prod_odumcp_repo_url
-        assert ref == settings.prod_odumcp_ref
+        # The branch follows the production's Odoo version.
+        assert ref == "19.0"
         assert target_team == team
         module = Path(path) / "addons/odumcp"
         module.mkdir(parents=True)
@@ -271,8 +272,8 @@ def test_missing_addon_uses_configured_source(configured, monkeypatch):
 
     clone_mock = MagicMock(side_effect=clone)
     monkeypatch.setattr("oduflow.docker_ops.env_ops._clone_repo", clone_mock)
-    connector.prepare_addon(settings, team, "erp", [])
-    connector.prepare_addon(settings, team, "erp", [])
+    connector.prepare_addon(settings, team, "erp", [], "odoo:19.0")
+    connector.prepare_addon(settings, team, "erp", [], "odoo:19.0")
     assert clone_mock.call_count == 1
 
 
@@ -367,7 +368,7 @@ def test_failed_download_can_be_retried(configured, monkeypatch):
 
     monkeypatch.setattr("oduflow.docker_ops.env_ops._clone_repo", fail)
     with pytest.raises(RuntimeError, match="interrupted"):
-        connector.prepare_addon(settings, team, "erp", [])
+        connector.prepare_addon(settings, team, "erp", [], "odoo:19.0")
     assert not connector.addon_checkout(team, "erp").exists()
     assert not list(
         connector.addon_checkout(team, "erp").parent.glob(".odumcp-download-*")
@@ -379,7 +380,7 @@ def test_failed_download_can_be_retried(configured, monkeypatch):
         (module / "__manifest__.py").write_text("{}")
 
     monkeypatch.setattr("oduflow.docker_ops.env_ops._clone_repo", succeed)
-    connector.prepare_addon(settings, team, "erp", [])
+    connector.prepare_addon(settings, team, "erp", [], "odoo:19.0")
     assert (
         connector.addon_checkout(team, "erp") / "addons/odumcp/__manifest__.py"
     ).is_file()
@@ -405,14 +406,14 @@ def test_root_addon_is_used_only_when_odoo_scans_the_root(configured, monkeypatc
     existing_module(repo, "odumcp")
     clone = MagicMock()
     monkeypatch.setattr("oduflow.docker_ops.env_ops._clone_repo", clone)
-    connector.prepare_addon(settings, team, "erp", [])
+    connector.prepare_addon(settings, team, "erp", [], "odoo:19.0")
     clone.assert_not_called()
 
     # A top-level addons/ moves the generated addons_path off the repo root,
     # so the very same odumcp at the root is no longer visible to Odoo.
     (repo / "addons").mkdir()
     with pytest.raises(PrerequisiteNotMetError):
-        connector.prepare_addon(settings, team, "erp", [])
+        connector.prepare_addon(settings, team, "erp", [], "odoo:19.0")
     clone.assert_called_once()
 
 
@@ -425,7 +426,7 @@ def test_extra_repo_addon_probe_follows_its_addons_path(
     clone = MagicMock()
     monkeypatch.setattr("oduflow.docker_ops.env_ops._clone_repo", clone)
     connector.prepare_addon(
-        settings, team, "erp", [(str(extra), "/mnt/extra-addons-fleet")]
+        settings, team, "erp", [(str(extra), "/mnt/extra-addons-fleet")], "odoo:19.0"
     )
     clone.assert_not_called()
 
@@ -450,3 +451,203 @@ def test_status_bookkeeping_never_masks_the_provisioning_error(configured, monke
     monkeypatch.setattr(production_registry, "update_production", vanished)
     with pytest.raises(PrerequisiteNotMetError, match="module unavailable"):
         connector.provision(settings, team, "erp")
+
+
+def test_list_productions_reports_mcp_status(configured, monkeypatch):
+    """The dashboard flags a failed OduMCP setup on the production card."""
+    from oduflow.docker_ops import production_ops
+
+    settings, team = configured
+    production_registry.create_production(team, "crm", {"domain": "crm.example.com"})
+    production_registry.update_production(
+        team, "erp", {"mcp": {"status": "sync_failed"}}
+    )
+    monkeypatch.setattr(production_ops, "get_client", MagicMock)
+
+    listed = {
+        prod["name"]: prod["mcp_status"]
+        for prod in production_ops.list_productions(settings, team)
+    }
+
+    # A record from before OduMCP provisioning carries no status at all.
+    assert listed == {"crm": "", "erp": "sync_failed"}
+
+
+def _fake_clone(version):
+    """A _clone_repo stand-in that publishes odumcp at *version*."""
+
+    def clone(url, ref, path, *args, **kwargs):
+        from pathlib import Path
+
+        module = Path(path) / "addons/odumcp"
+        module.mkdir(parents=True)
+        (module / "__manifest__.py").write_text(repr({"version": version}))
+
+    return MagicMock(side_effect=clone)
+
+
+@pytest.mark.parametrize("major", [16, 17, 18, 19, 20])
+def test_addon_branch_follows_the_production_odoo_version(
+    configured, monkeypatch, major
+):
+    settings, team = configured
+    clone = _fake_clone(f"{major}.0.1.4.0")
+    monkeypatch.setattr("oduflow.docker_ops.env_ops._clone_repo", clone)
+
+    assert connector.prepare_addon(settings, team, "erp", [], f"odoo:{major}.0")
+
+    assert clone.call_args.args[1] == f"{major}.0"
+
+
+def test_odoo_before_16_has_no_managed_addon(configured, monkeypatch):
+    settings, team = configured
+    clone = MagicMock()
+    monkeypatch.setattr("oduflow.docker_ops.env_ops._clone_repo", clone)
+
+    with pytest.raises(PrerequisiteNotMetError, match="Odoo 16 and later"):
+        connector.prepare_addon(settings, team, "erp", [], "odoo:15.0")
+    clone.assert_not_called()
+
+
+def test_upgraded_production_gets_its_new_version_addon(configured, monkeypatch):
+    """A checkout made for Odoo 19 must not be mounted into Odoo 20."""
+    settings, team = configured
+    checkout = connector.addon_checkout(team, "erp")
+    monkeypatch.setattr(
+        "oduflow.docker_ops.env_ops._clone_repo", _fake_clone("19.0.1.4.2")
+    )
+    assert connector.prepare_addon(settings, team, "erp", [], "odoo:19.0")
+
+    same = MagicMock()
+    monkeypatch.setattr("oduflow.docker_ops.env_ops._clone_repo", same)
+    assert not connector.prepare_addon(settings, team, "erp", [], "odoo:19.0")
+    same.assert_not_called()
+
+    upgrade = _fake_clone("20.0.1.4.0")
+    monkeypatch.setattr("oduflow.docker_ops.env_ops._clone_repo", upgrade)
+    assert connector.prepare_addon(settings, team, "erp", [], "odoo:20.0")
+    assert upgrade.call_args.args[1] == "20.0"
+    manifest = (checkout / "addons/odumcp/__manifest__.py").read_text()
+    assert "20.0.1.4.0" in manifest
+    assert not list(checkout.parent.glob(".odumcp-download-*"))
+
+
+def test_unversioned_image_is_asked_for_its_odoo_version(configured, monkeypatch):
+    settings, team = configured
+    run = MagicMock(return_value=b"Odoo Server 18.0-20260901\n")
+    monkeypatch.setattr("oduflow.docker_ops.client.get_client", MagicMock)
+    monkeypatch.setattr("oduflow.docker_ops.client.run_for_output", run)
+
+    assert connector.odoo_major(settings, "acme/customer-erp:latest") == 18
+    assert run.call_args.kwargs["entrypoint"] == "odoo"
+
+    run.side_effect = RuntimeError("no odoo binary")
+    with pytest.raises(PrerequisiteNotMetError, match="Cannot determine"):
+        connector.odoo_major(settings, "acme/customer-erp:latest")
+
+
+def _synced_container(monkeypatch, manifest):
+    """A running container with the managed mount; *manifest* is what it sees."""
+    container = MagicMock(status="running")
+    container.attrs = {"Mounts": [{"Destination": connector.MOUNT + "/odumcp"}]}
+    container.exec_run.return_value = (
+        (0, repr(manifest).encode()) if manifest is not None else (1, b"")
+    )
+    monkeypatch.setattr("oduflow.docker_ops.client.get_client", lambda: None)
+    monkeypatch.setattr(
+        "oduflow.docker_ops.production_ops._get_container", lambda *a: container
+    )
+    reconfigure = MagicMock()
+    monkeypatch.setattr(
+        "oduflow.docker_ops.production_ops.reconfigure_production", reconfigure
+    )
+    monkeypatch.setattr(connector, "provision", lambda *a: {"status": "ready"})
+    return container, reconfigure
+
+
+def _managed_checkout(team, version):
+    module = connector.managed_module(team, "erp")
+    module.mkdir(parents=True, exist_ok=True)
+    (module / "__manifest__.py").write_text(repr({"version": version}))
+
+
+def test_sync_recreates_the_container_for_a_replaced_addon(configured, monkeypatch):
+    """The old bind mount still shows the previous checkout to the container."""
+    settings, team = configured
+    _managed_checkout(team, "19.0.1.4.2")
+    _, reconfigure = _synced_container(monkeypatch, {"version": "19.0.1.4.2"})
+
+    monkeypatch.setattr(connector, "prepare_addon", lambda *a: False)
+    connector.synchronize(settings, team, "erp")
+    reconfigure.assert_not_called()
+
+    monkeypatch.setattr(connector, "prepare_addon", lambda *a: True)
+    connector.synchronize(settings, team, "erp")
+    reconfigure.assert_called_once_with(settings, team, "erp", force_recreate=True)
+
+
+@pytest.mark.parametrize("seen", [None, {"version": "18.0.1.4.0"}])
+def test_retried_sync_repairs_a_failed_recreation(configured, monkeypatch, seen):
+    """The checkout was already replaced by a sync whose recreation failed:
+    the container sees a removed directory (None) or the old series."""
+    settings, team = configured
+    _managed_checkout(team, "19.0.1.4.2")
+    _, reconfigure = _synced_container(monkeypatch, seen)
+    monkeypatch.setattr(connector, "prepare_addon", lambda *a: False)
+
+    connector.synchronize(settings, team, "erp")
+
+    reconfigure.assert_called_once_with(settings, team, "erp", force_recreate=True)
+
+
+def test_unsupported_odoo_is_not_reported_as_a_failed_sync(configured, monkeypatch):
+    settings, team = configured
+    production_registry.update_production(team, "erp", {"odoo_image": "odoo:15.0"})
+    _synced_container(monkeypatch, None)
+
+    with pytest.raises(connector.UnsupportedOdooVersion):
+        connector.synchronize(settings, team, "erp")
+
+    record = production_registry.get_production(team, "erp")
+    assert record["mcp"]["status"] == "unsupported"
+    with pytest.raises(PrerequisiteNotMetError, match="Odoo 16 and later") as exc:
+        connector.execute(settings, team, "erp", "system.info")
+    assert "sync_production_mcp" not in str(exc.value)
+
+
+def test_provision_refuses_an_addon_of_another_odoo_series(configured, monkeypatch):
+    settings, team = configured
+    provision = connector.provision
+    container, _ = _synced_container(monkeypatch, {"version": "18.0.1.4.0"})
+    container.labels = {settings.image_label: "odoo:19.0"}
+    monkeypatch.setattr("oduflow.wal_monitor.assert_writable", lambda *a: None)
+    shell = MagicMock()
+    monkeypatch.setattr(connector, "_shell", shell)
+
+    with pytest.raises(PrerequisiteNotMetError, match="for Odoo 18, but"):
+        provision(settings, team, "erp")
+
+    shell.assert_not_called()
+    record = production_registry.get_production(team, "erp")
+    assert record["mcp"]["status"] == "sync_failed"
+
+
+def test_unknown_version_keeps_an_existing_checkout(configured, monkeypatch):
+    settings, team = configured
+    _managed_checkout(team, "19.0.1.4.2")
+    clone = MagicMock()
+    monkeypatch.setattr("oduflow.docker_ops.env_ops._clone_repo", clone)
+    monkeypatch.setattr("oduflow.docker_ops.client.get_client", MagicMock)
+    monkeypatch.setattr(
+        "oduflow.docker_ops.client.run_for_output",
+        MagicMock(side_effect=RuntimeError("no odoo binary")),
+    )
+
+    assert not connector.prepare_addon(settings, team, "erp", [], "acme/erp:latest")
+    clone.assert_not_called()
+
+    connector.addon_checkout(team, "erp").rename(
+        connector.addon_checkout(team, "erp").with_name("gone")
+    )
+    with pytest.raises(PrerequisiteNotMetError, match="Cannot determine"):
+        connector.prepare_addon(settings, team, "erp", [], "acme/erp:latest")

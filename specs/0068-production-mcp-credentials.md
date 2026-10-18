@@ -47,8 +47,19 @@ identify the integration rather than a person. Rotations across databases are
 explicit and not atomic; stopped or failed targets must be retried. Restores may
 restore old keys and require resynchronization. Endpoint authorization does not
 replace host/container isolation or control developers' code delivery permissions.
-The initial addon implementation supports Odoo 19 and requires the corresponding
+The initial addon implementation supported Odoo 19 and required the corresponding
 client-addon release before rollout.
+
+## Evolution
+
+- The connector repository now publishes `odumcp` with managed keys for every
+  Odoo version from 16 to 20, one branch per version. The addon branch is no
+  longer configured: it follows each production's Odoo version, taken from the
+  image tag or, for an unversioned custom image, from `odoo --version`. A
+  managed checkout made for another version (an upgraded production) is
+  replaced on reconfiguration and on synchronization, and provisioning refuses
+  an addon of another version. Odoo 15 and older are recorded as `unsupported`
+  rather than as a failed synchronization. The dashboard flags both states.
 
 Related: [[0035-production-hosting]], [[0028-scoped-environment-mcp-access]],
 [[0059-production-to-dev-data-flow]].
@@ -57,3 +68,5 @@ Related: [[0035-production-hosting]], [[0028-scoped-environment-mcp-access]],
 
 - 2026-09-19: agreed separate endpoints, a shared configured production key,
   direct OduMCP API access and automatic installation on production creation.
+- 2026-10-16: OduMCP for Odoo 16–20; `[production].odumcp_ref` retired in favour
+  of the production's own Odoo version.

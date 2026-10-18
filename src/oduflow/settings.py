@@ -19,9 +19,12 @@ logger = logging.getLogger("oduflow")
 
 TRACE: bool = False
 
-DEFAULT_AGENT_IMAGE = "oduist/oduflow-coder:0.3.3"
+DEFAULT_AGENT_IMAGE = "oduist/oduflow-coder:0.4.0"
 DEFAULT_POSTGRES_IMAGE = "postgres:16"
 _LEGACY_AGENT_IMAGE = "oduist/oduflow-coder:latest"
+# Retired keys already reported: settings are re-parsed for every console
+# validation and live apply, and one warning per process is enough.
+_warned_retired_keys: set[str] = set()
 
 # Active MCP transport for the running server ("stdio" | "http").
 # Set in server.main() before the server starts. Mostly informational;
@@ -428,7 +431,6 @@ class Settings:
     # provisioned lazily (first production or existing container).
     prod_enabled: bool = False
     prod_odumcp_repo_url: str = "https://github.com/oduflow/oduflow-client-addons.git"
-    prod_odumcp_ref: str = "19.0"
     prod_db_container: str = "oduflow-prod-db"
     prod_db_volume: str = "oduflow-prod-db-data"
     prod_walg_version: str = ""  # empty = version pinned in walg.py
@@ -924,6 +926,13 @@ class Settings:
                 "Remove it from oduflow.toml and set [database].image instead; "
                 "both development and production use that image."
             )
+        if "odumcp_ref" in production and "odumcp_ref" not in _warned_retired_keys:
+            _warned_retired_keys.add("odumcp_ref")
+            logger.warning(
+                "[production].odumcp_ref is ignored: the OduMCP addon branch "
+                "follows each production's Odoo version (e.g. 18.0). Remove it "
+                "from oduflow.toml."
+            )
         wal = production.get("wal", {})
         if not isinstance(wal, dict):
             raise ValueError("[production.wal] must be a table")
@@ -1149,7 +1158,6 @@ class Settings:
                     "https://github.com/oduflow/oduflow-client-addons.git",
                 )
             ),
-            prod_odumcp_ref=str(production.get("odumcp_ref", "19.0")),
             prod_walg_version=str(production.get("walg_version", "")).strip(),
             prod_workers_cap=int(production.get("workers_cap", 8)),
             wal_upload_timeout=int(wal_values["wal_upload_timeout"]),

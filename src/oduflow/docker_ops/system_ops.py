@@ -100,6 +100,11 @@ def _file_size_mb(path: str) -> float:
         return 0.0
 
 
+def _filestore_present(path: str) -> bool:
+    """Whether a template filestore holds files (``includes_filestore``)."""
+    return os.path.isdir(path) and bool(os.listdir(path))
+
+
 def _update_template_sizes(
     team: TeamSettings,
     settings: Settings,
@@ -1471,14 +1476,30 @@ def _copy_file_to_container(
     dest_dir: str,
     *,
     archive_name: str | None = None,
+    mode: int | None = None,
 ) -> None:
+    """Copy one host file into a container directory.
+
+    The archive carries the host file's mode unless ``mode`` overrides it —
+    needed when the host copy is deliberately stricter than what the process
+    inside the container (a non-root user) must still be able to read.
+    """
     import tempfile
+
+    def _set_mode(info: tarfile.TarInfo) -> tarfile.TarInfo:
+        if mode is not None:
+            info.mode = mode
+        return info
 
     with tempfile.NamedTemporaryFile(suffix=".tar", delete=False) as tmp:
         tmp_path = tmp.name
     try:
         with tarfile.open(tmp_path, mode="w") as tar:
-            tar.add(src_path, arcname=archive_name or os.path.basename(src_path))
+            tar.add(
+                src_path,
+                arcname=archive_name or os.path.basename(src_path),
+                filter=_set_mode,
+            )
         with open(tmp_path, "rb") as f:
             container.put_archive(dest_dir, f)
     finally:
@@ -2886,6 +2907,8 @@ def init_template(
     modules: str = "base",
     force: bool = False,
 ) -> dict[str, str]:
+    from oduflow.odoo_version import major_from_image_reference
+
     template_sql_path = team.get_template_sql_path(template_name)
     template_filestore_path = team.get_template_filestore_path(template_name)
 
@@ -2977,7 +3000,19 @@ def init_template(
             "PASSWORD": settings.db_password,
         },
         volumes=volumes,
-        command=f"odoo -d {build_db} -i {modules} --stop-after-init --without-demo=all",
+        # Odoo 19 made --without-demo a boolean; "=all" (the pre-19 module
+        # list) still disables demo there but logs a deprecation warning,
+        # while bare/boolean forms don't exist before 19. The flag stays
+        # explicit on 19+ too, so the instance odoo.conf cannot turn demo
+        # data on in a template.
+        command=(
+            f"odoo -d {build_db} -i {modules} --stop-after-init "
+            + (
+                "--without-demo=True"
+                if (major_from_image_reference(odoo_image) or 0) >= 19
+                else "--without-demo=all"
+            )
+        ),
         labels={settings.managed_label: "true"},
     )
 
@@ -3410,7 +3445,17 @@ def _finalize_template_metadata(
     metadata: dict[str, Any],
 ) -> dict[str, Any]:
     """Decide the overlay mode from the new baseline's size and persist metadata."""
+    from oduflow import template_import
     from oduflow.docker_ops import env_ops
+
+    # Publishing from an environment or a production rebuilds metadata from that
+    # source, so an S3 lineage does not survive it — the data no longer comes
+    # from the bucket. Release the secret Oduflow stored for it rather than
+    # leaving it in the team's secret store with nothing referencing it.
+    if "source_secret_key" not in metadata:
+        template_import.delete_managed_secret(
+            team, template_import._load_carried_metadata(team, template_name)
+        )
 
     template_filestore_path = team.get_template_filestore_path(template_name)
     fs_size = (
@@ -4173,7 +4218,6 @@ def import_template(
     ``overwrite`` (s3/local) incrementally re-syncs an existing template.
     """
     import urllib.request
-    import zipfile
 
     from oduflow import template_import
     from oduflow.url_safety import assert_allowed_url
@@ -4198,7 +4242,14 @@ def import_template(
             "or a local path) unless refresh=true."
         )
     if source.startswith("s3://"):
-        return template_import.import_from_s3_prefix(
+        # A key naming an archive is one object to unpack; anything else is a
+        # prefix holding the raw layout.
+        s3_import = (
+            template_import.import_from_s3_archive
+            if template_import.is_archive_key(source)
+            else template_import.import_from_s3_prefix
+        )
+        return s3_import(
             settings,
             team,
             url=source,
@@ -4364,60 +4415,11 @@ def import_template(
                 shutil.copy2(tmp_backup, template_sql_path)
                 logger.info("Saved DB-only dump to %s", template_sql_path)
             else:
-                with zipfile.ZipFile(tmp_backup, "r") as zf:
-                    # Extract manifest.json
-                    if "manifest.json" in zf.namelist():
-                        with zf.open("manifest.json") as mf:
-                            manifest = json.load(mf)
-
-                    # Extract dump.sql
-                    with (
-                        zf.open("dump.sql") as src,
-                        open(template_sql_path, "wb") as dst,
-                    ):
-                        shutil.copyfileobj(src, dst)
-                    logger.info("Extracted dump.sql to %s", template_sql_path)
-
-                    # Extract filestore
-                    if os.path.exists(template_filestore_path):
-                        shutil.rmtree(template_filestore_path)
-                    os.makedirs(template_filestore_path, exist_ok=True)
-
-                    fs_prefix = "filestore/"
-                    for member in zf.namelist():
-                        if not member.startswith(fs_prefix):
-                            continue
-                        rel = member[len(fs_prefix) :]
-                        if not rel:
-                            continue
-                        # Skip checklist/ symlink-like entries
-                        if rel.startswith("checklist/"):
-                            continue
-                        target = os.path.join(template_filestore_path, rel)
-                        # Reject any member that escapes the filestore dir (zip-slip).
-                        if not _is_within_directory(template_filestore_path, target):
-                            logger.warning(
-                                "Skipping unsafe archive member outside filestore: %s",
-                                member,
-                            )
-                            continue
-                        if member.endswith("/"):
-                            os.makedirs(target, exist_ok=True)
-                        else:
-                            os.makedirs(os.path.dirname(target), exist_ok=True)
-                            with zf.open(member) as src, open(target, "wb") as dst:
-                                shutil.copyfileobj(src, dst)
-
-                    fs_count = sum(
-                        1
-                        for f in pathlib.Path(template_filestore_path).rglob("*")
-                        if f.is_file()
-                    )
-                    logger.info(
-                        "Extracted filestore to %s (%d files)",
-                        template_filestore_path,
-                        fs_count,
-                    )
+                # Same unpacking (and the same zip-slip guard) as an archive
+                # imported from a bucket — one definition for both doors.
+                manifest = template_import.extract_odoo_backup_zip(
+                    tmp_backup, template_sql_path, template_filestore_path
+                )
 
             # chown the new lower layer so the odoo user can read it through the
             # overlay once it is remounted.
@@ -4447,6 +4449,9 @@ def import_template(
     odoo_image = f"odoo:{major_version}" if major_version else ""
 
     # 5. Save metadata.json
+    includes_filestore = _filestore_present(
+        team.get_template_filestore_path(template_name)
+    )
     metadata = {
         "odoo_image": odoo_image,
         "repo_url": "",
@@ -4455,7 +4460,7 @@ def import_template(
         "odoo_version": manifest.get("version", ""),
         "pg_version": manifest.get("pg_version", ""),
         "modules": manifest.get("modules", {}),
-        "includes_filestore": not without_filestore,
+        "includes_filestore": includes_filestore,
         # No source_commit: an imported database has no branch of ours behind
         # it, so the lineage check has nothing to compare against and is skipped.
         "snapshot_at": _utc_now_iso(),
@@ -4496,7 +4501,7 @@ def import_template(
         "template_db": result["template_db"],
         "restore_seconds": result.get("restore_seconds", 0),
         "zip_size_mb": round(backup_size_mb, 1),
-        "includes_filestore": not without_filestore,
+        "includes_filestore": includes_filestore,
         "affected_envs": affected_envs,
         "remount_failures": remount_failures,
     }
@@ -4755,6 +4760,7 @@ def finalize_imported_template(
     staging_dir: str,
     *,
     addon_error_policy: str = "strict",
+    without_filestore: bool = False,
 ) -> dict[str, object]:
     """Promote a fully-staged push import into the live template and load it.
 
@@ -4765,11 +4771,20 @@ def finalize_imported_template(
     filestore/dump/metadata into the template directory, chown the filestore
     for the odoo user, then refresh sizes and restore the dump into the
     template DB. The staging directory is removed on success.
+
+    ``without_filestore`` is the database-only import: a staged filestore/
+    (chunks left by an earlier, interrupted full upload) is not promoted, and
+    the live filestore stays as it is — like the other database-only imports.
+    The result's ``filestore`` says which happened: ``imported``, ``kept`` (an
+    existing template's filestore) or ``none``.
     """
     from oduflow.docker_ops import env_ops
 
     os.makedirs(staging_dir, exist_ok=True)
     promoted_marker = os.path.join(staging_dir, ".promoted")
+    # Only when the live filestore is this import's: a database-only finalize
+    # keeps an older one, which a retry must not count as uploaded chunks.
+    filestore_marker = os.path.join(staging_dir, ".filestore-promoted")
     staged_meta = os.path.join(staging_dir, "metadata.json")
     staged_dump = os.path.join(staging_dir, "dump.sql.gz")
     staged_fs = os.path.join(staging_dir, "filestore")
@@ -4802,12 +4817,18 @@ def finalize_imported_template(
         os.makedirs(tpl_dir, exist_ok=True)
 
         # Swap filestore (the overlay lower layer) while envs are unmounted.
-        if os.path.isdir(staged_fs):
+        filestore_created = False
+        if not without_filestore and os.path.isdir(staged_fs):
+            # Before the swap, like .promoted: until the rename the upload
+            # status still reads the staged filestore/, which it prefers.
+            open(filestore_marker, "a").close()
             if os.path.exists(template_filestore_path):
                 shutil.rmtree(template_filestore_path)
             os.rename(staged_fs, template_filestore_path)
         elif not os.path.isdir(template_filestore_path):
             os.makedirs(template_filestore_path, exist_ok=True)
+            filestore_created = True
+        filestore_imported = os.path.isfile(filestore_marker)
 
         # Swap dump: drop stale dumps under other names so
         # get_template_sql_path resolves to the new gzip'd SQL dump.
@@ -4825,7 +4846,9 @@ def finalize_imported_template(
         if os.path.isfile(staged_meta):
             os.replace(staged_meta, live_meta)
 
-        if major_version:
+        # A kept filestore was chowned when it was imported; walking it all
+        # again would only stretch the team-locked window, overlays unmounted.
+        if major_version and (filestore_imported or filestore_created):
             try:
                 uid_gid = get_odoo_uid_gid(client, f"odoo:{major_version}")
                 uid_str, gid_str = uid_gid.split(":")
@@ -4840,7 +4863,17 @@ def finalize_imported_template(
             except Exception as exc:  # noqa: BLE001 - chown is best-effort
                 logger.warning("Could not chown template filestore: %s", exc)
 
-    _update_template_sizes(team, settings, template_name)
+    includes_filestore = _filestore_present(template_filestore_path)
+    if filestore_imported:
+        filestore = "imported"
+    elif includes_filestore:
+        filestore = "kept"
+    else:
+        filestore = "none"
+    with open(live_meta) as f:
+        metadata = json.load(f)
+    metadata["includes_filestore"] = includes_filestore
+    _update_template_sizes(team, settings, template_name, metadata)
     result = reload_template(settings, team, template_name=template_name)
 
     # Turn any uploaded/announced addons (Enterprise, Themes, extra repos) into
@@ -4876,6 +4909,8 @@ def finalize_imported_template(
         "template_name": template_name,
         "template_db": result["template_db"],
         "restore_seconds": result.get("restore_seconds", 0),
+        "includes_filestore": includes_filestore,
+        "filestore": filestore,
         "affected_envs": remount.affected,
         "remount_failures": remount.failures,
         "extra_addons": wired,
@@ -5144,8 +5179,14 @@ def delete_template(
         logger.info("Dropped template DB %s", tpl_db)
 
     if dir_exists:
+        # Read before the directory goes: the S3 secret Oduflow stored for this
+        # template is referenced from its metadata and goes with it.
+        from oduflow import template_import
+
+        carried = template_import._load_carried_metadata(team, template_name)
         shutil.rmtree(template_dir_path)
         logger.info("Removed template directory %s", template_dir_path)
+        template_import.delete_managed_secret(team, carried)
 
     return {"status": "dropped", "template_name": template_name, "template_db": tpl_db}
 
@@ -5368,6 +5409,8 @@ def _template_env_vars(metadata: dict[str, Any], template_name: str) -> dict[str
 
 
 def list_templates(settings: Settings, team: TeamSettings) -> list[dict[str, Any]]:
+    from oduflow import template_import
+
     client = get_client()
     templates = team.list_templates()
     result = []
@@ -5421,6 +5464,9 @@ def list_templates(settings: Settings, team: TeamSettings) -> list[dict[str, Any
                 "source_branch": metadata.get("source_branch", ""),
                 "source_commit": metadata.get("source_commit", ""),
                 "snapshot_at": metadata.get("snapshot_at", ""),
+                # Set only for a template imported from a bucket: the
+                # connection to re-sync it, without the secret key.
+                "s3_source": template_import.public_source_view(metadata),
             }
         )
     return result

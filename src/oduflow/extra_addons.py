@@ -23,6 +23,7 @@ from oduflow.errors import (
 )
 from oduflow.git_ops import RepoAuthError, git_env_for_team
 from oduflow.naming import sanitize_repo_url
+from oduflow.odoo_version import major_from_image_reference
 from oduflow.settings import Settings, TeamSettings
 
 logger = logging.getLogger("oduflow")
@@ -1620,6 +1621,34 @@ def resolve_extra_addons_path(checkout_path: str, repo_name: str) -> str:
     return base
 
 
+# Odoo 19 replaced without_demo with a boolean with_demo (demo data off by
+# default). Its config loader still reads without_demo as an inverted alias,
+# but the pre-19 forms ("all", "sale,crm", an empty value) log a deprecation
+# warning on every start.
+_ODOO_FALSE_LITERALS = frozenset(("0", "no", "false", "off"))
+
+
+def _translate_without_demo(parser: configparser.RawConfigParser) -> None:
+    """Replace without_demo with the with_demo value Odoo 19+ reads from it.
+
+    Mirrors Odoo 19's own reading of the alias (``_check_without_demo`` in
+    ``odoo/tools/config.py``): only an explicit false (or the literal
+    ``None``) asks for demo data; true, a module list or an empty value leave
+    it off. Option names match case-insensitively, as Odoo lowercases them
+    on read. A with_demo already in the conf wins.
+    """
+    keys = [k for k in parser.options("options") if k.lower() == "without_demo"]
+    if not keys:
+        return
+    value = parser.get("options", keys[-1])
+    for key in keys:
+        parser.remove_option("options", key)
+    if any(k.lower() == "with_demo" for k in parser.options("options")):
+        return
+    with_demo = value.lower() in _ODOO_FALSE_LITERALS or value == "None"
+    parser.set("options", "with_demo", str(with_demo))
+
+
 def generate_odoo_conf(
     base_conf_path: str,
     output_path: str,
@@ -1628,6 +1657,8 @@ def generate_odoo_conf(
     overrides: dict[str, str] | None = None,
     pinned: dict[str, str] | None = None,
     remove_keys: tuple[str, ...] = (),
+    odoo_image: str = "",
+    mode: int | None = None,
 ) -> str:
     """Merge *base_conf_path* into *output_path*.
 
@@ -1635,7 +1666,10 @@ def generate_odoo_conf(
     ``remove_keys`` are dropped (both case-insensitive); a base conf that set
     either to something else is logged, since its value is not what runs.
     The listen interface is always pinned (:data:`LISTEN_INTERFACE_CONF`,
-    under any caller pins) and its alias always dropped.
+    under any caller pins) and its alias always dropped. When *odoo_image*
+    is known to be Odoo 19+, ``without_demo`` is rewritten as ``with_demo``.
+    ``mode`` sets the written file's permissions, for a conf whose contents
+    are sensitive.
     """
     parser = configparser.RawConfigParser()
     # Preserve option case (Odoo config keys are case-sensitive); the default
@@ -1659,6 +1693,10 @@ def generate_odoo_conf(
     # worker/limit settings that must win over whatever the base conf says.
     for key, value in (overrides or {}).items():
         parser.set("options", key, value)
+
+    major = major_from_image_reference(odoo_image)
+    if major is not None and major >= 19:
+        _translate_without_demo(parser)
 
     pinned = {
         k.lower(): v for k, v in {**LISTEN_INTERFACE_CONF, **(pinned or {})}.items()
@@ -1692,6 +1730,8 @@ def generate_odoo_conf(
 
     with open(output_path, "w") as f:
         parser.write(f)
+    if mode is not None:
+        os.chmod(output_path, mode)
 
     logger.info(
         "Generated Odoo config at %s with extra paths: %s", output_path, extra_paths

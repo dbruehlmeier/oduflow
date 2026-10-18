@@ -1614,14 +1614,19 @@ def import_template(
     ctx: Context | None = None,
 ) -> str:
     """
-    Import a template. One tool, four source shapes:
+    Import a template. One tool, five source shapes:
 
     - http(s) URL of a running Odoo: downloads a full ZIP backup or
       database-only dump via the database manager API (master_pwd required).
     - "s3://bucket/prefix": syncs a raw backup layout file-by-file —
       efficient for very large databases and filestores (parallel downloads,
       resume, no archiving on the source). Credentials: s3_* args if given,
-      else the [backup] settings when the bucket matches, else anonymous.
+      else the secret remembered for this template, else the [backup]
+      settings when the bucket matches, else anonymous.
+    - "s3://bucket/path/backup.zip": a single Odoo backup archive already in
+      the bucket. Fetched whole whenever it changes and its filestore
+      replaces the template's wholesale, so prefer the prefix layout for a
+      large database; this shape is for the archive you already have.
     - Local path on the Oduflow host: a directory with the same raw layout
       (files are hardlinked, near-instant on the same filesystem), or a
       single dump file for a database-only import.
@@ -1636,7 +1641,7 @@ def import_template(
     `aws s3 sync`).
 
     Args:
-        source: http(s) Odoo URL, "s3://bucket/prefix", or a local path. Empty only with refresh=true.
+        source: http(s) Odoo URL, "s3://bucket/prefix", "s3://bucket/path/backup.zip", or a local path. Empty only with refresh=true.
         master_pwd: Odoo master password (database manager password). Required for http(s) sources only.
         db_name: Name of the database to back up (http mode only). If empty, auto-detected (fails if multiple DBs exist).
         template_name: Name of the template profile to create or update.
@@ -1644,8 +1649,8 @@ def import_template(
         overwrite: s3/local only: incrementally re-sync an EXISTING template — only changed files are fetched, an unchanged dump skips the DB reload. Requires explicit user permission: it replaces the template's current data.
         refresh: Reload the template DB from files already in the template directory (no source). Requires explicit user permission: it rebuilds the template database.
         s3_endpoint: s3 only: custom S3 endpoint URL (MinIO etc.); empty = AWS S3 or the configured [backup] endpoint.
-        s3_access_key: s3 only: access key for the source bucket (with s3_secret_key); empty = [backup] credentials or anonymous.
-        s3_secret_key: s3 only: secret key paired with s3_access_key.
+        s3_access_key: s3 only: access key for the source bucket (with s3_secret_key); empty = the key remembered for this template, else [backup] credentials or anonymous.
+        s3_secret_key: s3 only: secret key paired with s3_access_key, or "secret:<name>" to sign with an existing team secret. A raw value is stored as the team secret "s3-template-<template>" and the template records only the reference, so re-syncing needs no key. Leave empty to reuse it; required again when the endpoint or access key changes.
         s3_region: s3 only: region of the source bucket.
     """
     settings = _get_settings()
@@ -5461,7 +5466,9 @@ def create_production(
 
     Args:
         name: Production name, e.g. "erp" (lowercase letters/digits/dashes).
-        repo_url: HTTPS git repository URL. Required unless from_environment
+        repo_url: Repository URL — HTTPS (https://github.com/owner/repo.git)
+                or SSH (git@github.com:owner/repo.git, needs the team deploy
+                key, see get_ssh_public_key). Required unless from_environment
                 is given (then it defaults to the environment's).
         branch: Git branch to deploy (full history is kept). Required unless
                 from_environment is given.
@@ -5577,8 +5584,10 @@ def sync_production_mcp(name: str = "", ctx: Context | None = None) -> str:
 
     Empty name processes every production of this team, reporting failures
     separately. Use after changing production_token in TOML and restarting
-    Oduflow. No secret is accepted or returned. Stopped productions must be
-    started first. Adding the managed addon mount recreates the container.
+    Oduflow, or after moving a production to another Odoo version. No secret
+    is accepted or returned. Stopped productions must be started first. Adding
+    the managed addon mount, or replacing a checkout made for another Odoo
+    version, recreates the container.
     """
     from oduflow import production_mcp
 
@@ -5751,6 +5760,9 @@ def get_production_info(name: str, ctx: Context | None = None) -> str:
     settings = _get_settings()
     team = _resolve_team(ctx)
     info = production_ops.get_production_info(settings, team, name)
+    # Credential-valued odoo.conf overrides are masked for agents; the
+    # dashboard reads the same function and shows the operator the values.
+    info["odoo_conf"] = production_ops.mask_odoo_conf(info.get("odoo_conf"))
     import json as _json
 
     return _json.dumps(info, indent=2)
@@ -5989,7 +6001,10 @@ def set_production_odoo_conf(
     worker settings, and survive deploys and retunes. Keys managed by Oduflow
     (addons_path, data_dir, db_*, the listen interface/ports and their
     xmlrpc* aliases) cannot be overridden. Current overrides are shown by
-    get_production_info.
+    get_production_info. Enabling Odoo's database manager
+    ("list_db": "True") requires an "admin_passwd" override of at least 12
+    characters. Credential values (admin_passwd, smtp_password) are stored
+    but reported back masked.
 
     Args:
         name: The production name.
@@ -6010,7 +6025,7 @@ def set_production_odoo_conf(
         unset_options=unset_list,
         restart=restart,
     )
-    conf = result["odoo_conf"]
+    conf = production_ops.mask_odoo_conf(result["odoo_conf"])
     conf_desc = "\n".join(f"  {k} = {v}" for k, v in sorted(conf.items())) or "  (none)"
     if result.get("message"):
         return f"{result['message']}\nCurrent overrides:\n{conf_desc}"
@@ -6482,10 +6497,9 @@ def delete_production(
     are KEPT unless drop_database=true. Kept leftovers are tombstoned: the
     reaper purges them [lifecycle] prod_purge_hours after the deletion
     (0 = keep forever, the default), and `oduflow cleanup
-    --purge-deleted-productions --force` purges them immediately.
-    Re-creating a production with the same name revives the leftovers'
-    tombstone-free state (the kept database itself must still be dealt with
-    explicitly, see create_production).
+    --purge-deleted-productions --force` purges them immediately. The name
+    stays taken while leftovers are kept: create_production refuses it until
+    they are purged.
 
     Args:
         name: The production name.
@@ -7021,6 +7035,7 @@ def _run_retune_postgres(
                             ],
                             plan=plan,
                             output_path=str(candidate_path),
+                            odoo_image=record.get("odoo_image", ""),
                         )
                     except Exception as exc:  # noqa: BLE001 - report each production
                         odoo_errors.append(f"team {team.team_id}/{name}: {exc}")
@@ -7152,6 +7167,9 @@ def _run_retune_postgres(
         if existing is not None:
             _backup(path)
         path.write_text(candidate, encoding="utf-8")
+        # Same owner-only mode _build_prod_odoo_conf writes: this conf may
+        # carry admin_passwd. _backup copies the mode along with the bytes.
+        path.chmod(0o600)
         print(f"Updated: {path}")
         staged_container = production_ops.stage_prod_odoo_conf(
             client, settings, team, name, str(path)
@@ -8136,9 +8154,9 @@ def _run_cli() -> None:
         nargs="?",
         default="",
         help=(
-            "http(s) Odoo URL, s3://bucket/prefix, or a local path with "
-            "dump.* + filestore/ (a single dump file for DB-only). "
-            "Omit together with --refresh"
+            "http(s) Odoo URL, s3://bucket/prefix, s3://bucket/backup.zip, "
+            "or a local path with dump.* + filestore/ (a single dump file "
+            "for DB-only). Omit together with --refresh"
         ),
     )
     p_import.add_argument(
@@ -8178,7 +8196,15 @@ def _run_cli() -> None:
         "--s3-access-key", default="", help="s3 only: source bucket access key"
     )
     p_import.add_argument(
-        "--s3-secret-key", default="", help="s3 only: source bucket secret key"
+        "--s3-secret-key",
+        # A key typed on the command line lands in ~/.bash_history; the env var
+        # keeps it out while staying scriptable. An explicit flag still wins.
+        default=os.environ.get("ODUFLOW_S3_SECRET_KEY", ""),
+        help=(
+            "s3 only: source bucket secret key, or secret:<name> for a team "
+            "secret (default: $ODUFLOW_S3_SECRET_KEY). Omit when re-syncing: "
+            "the secret stored for the template is reused"
+        ),
     )
     p_import.add_argument(
         "--s3-region", default="", help="s3 only: source bucket region"

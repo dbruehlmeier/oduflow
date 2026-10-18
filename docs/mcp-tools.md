@@ -1506,7 +1506,7 @@ filestore overlays. Fresh imports can run alongside environment operations.
 **Parameters**
 
 `source`
-:   *str · default empty* — An http(s) Odoo URL, `s3://bucket/prefix`, or an absolute local path. Omit with `refresh=True`.
+:   *str · default empty* — An http(s) Odoo URL, `s3://bucket/prefix` (raw dump + `filestore/` layout), `s3://bucket/path/backup.zip` (a single Odoo backup archive), or an absolute local path. Omit with `refresh=True`.
 
 `master_pwd`
 :   *str · default empty* — Required only for the Odoo database-manager source.
@@ -1527,7 +1527,7 @@ filestore overlays. Fresh imports can run alongside environment operations.
 :   *bool · default `False`* — With no source, restore from the template's own files and refresh metadata and overlays. Requires explicit permission.
 
 `s3_endpoint`, `s3_access_key`, `s3_secret_key`, `s3_region`
-:   *str · default empty* — S3 source connection settings. Credentials fall back to matching `[backup]` settings, then anonymous access. Supply access and secret keys together.
+:   *str · default empty* — S3 source connection settings. Supply access and secret keys together. `s3_secret_key` also accepts `secret:<name>` to sign with an existing team secret; a raw value is stored as the team secret `s3-template-<template>` and the template records only the reference, so a re-sync needs no key. Credentials resolve most-explicit-first: these parameters, then the secret remembered for this template, then matching `[backup]` settings, then anonymous access. The key is required again when the endpoint or access key changes.
 
 **Use it when**
 
@@ -2484,7 +2484,7 @@ Lock: production.
 :   *str · required* — Production name, e.g. `erp` (lowercase letters, digits, dashes).
 
 `repo_url`
-:   *str · default empty* — HTTPS git repository URL. Required unless `from_environment` supplies it.
+:   *str · default empty* — HTTPS (`https://github.com/owner/repo.git`) or SSH (`git@github.com:owner/repo.git`, needs the team deploy key — see [`get_ssh_public_key`](#get_ssh_public_key)). Required unless `from_environment` supplies it.
 
 `branch`
 :   *str · default empty* — Git branch to deploy (full history is kept). Required unless `from_environment` supplies it.
@@ -2745,9 +2745,8 @@ unless `drop_database=true`.
 Kept leftovers are tombstoned: the reaper purges them `[lifecycle]
 prod_purge_hours` after deletion (`0` = keep forever, the default), and
 `oduflow cleanup --purge-deleted-productions --force` purges them immediately.
-Re-creating a production with the same name revives the leftovers'
-tombstone-free state — the kept database itself must still be dealt with
-explicitly.
+The name stays taken while leftovers are kept: `create_production` refuses it
+until they are purged.
 
 Lock: production. Destructive.
 { .odu-tool-meta }
@@ -3110,8 +3109,9 @@ rest.
 New productions are provisioned automatically; this tool is for existing ones,
 for retrying a failed setup, and for rotating the key after `production_token`
 changes in `oduflow.toml` (change the value, restart Oduflow, then run this).
-No secret is accepted or returned. Stopped productions must be started first,
-and adding the managed addon mount recreates the container.
+No secret is accepted or returned. Stopped productions must be started first.
+Adding the managed addon mount, or replacing a checkout made for another Odoo
+version, recreates the container.
 
 Lock: production (each one in turn).
 { .odu-tool-meta }
@@ -3125,6 +3125,7 @@ Lock: production (each one in turn).
 
 - Adopting a production that predates automatic provisioning.
 - The connector reports itself unavailable after a failed setup.
+- The production moved to another Odoo version.
 - Rotating `production_token`.
 
 ### `production_odoo_info`

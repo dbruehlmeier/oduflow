@@ -55,29 +55,40 @@ all productions in its team; it does not identify individual administrators.
 
 ### Automatic OduMCP installation
 
-New production creation requires a configured production token and automatically
-attempts to install `odumcp` if it is absent. The supported addon release currently targets
-**Odoo 19**. Existing older productions can still be managed with infrastructure
-tools; automatic OduMCP provisioning requires a compatible Odoo 19 deployment.
+New production creation requires a configured production token. Until one is set,
+the dashboard's Production tab and its Create Production dialog show a setup
+notice, and the dialog cannot be submitted. Creation automatically
+attempts to install `odumcp` if it is absent. Automatic provisioning supports
+**Odoo 16 and later**. Older productions can still be managed with infrastructure
+tools.
 
 Oduflow uses addon code in the main or extra repositories when available. Otherwise
-it clones the configured connector repository and mounts **only** its `odumcp`
-addon read-only. This managed checkout survives container recreation and is not
-silently updated by unrelated deployments:
+it clones the connector repository at the branch of the production's own Odoo
+version (`18.0` for `odoo:18.0`) and mounts **only** its `odumcp` addon read-only.
+The version comes from the image tag; for a custom image without a version in its
+tag, Oduflow asks the image's `odoo --version`. This managed checkout survives
+container recreation and is not silently updated by unrelated deployments. When
+`reconfigure_production` moves a production to another Odoo version, the checkout
+is replaced with the new version's branch before the container is recreated; run
+`sync_production_mcp` afterwards to upgrade the installed module. A synchronization
+also replaces a checkout made for another version, and recreates the container
+whenever the container does not see the current checkout, which repairs an
+earlier synchronization whose recreation failed. Provisioning refuses to install
+an addon built for a different Odoo version than the one running:
 
 ```toml
 [production]
 enabled = true
 odumcp_repo_url = "https://github.com/oduflow/oduflow-client-addons.git"
-odumcp_ref = "19.0"  # branch or tag containing odumcp >= 19.0.1.1.0
 ```
 
-Deploy the accompanying addon changes before enabling this feature. The addon
-must implement `_set_oduflow_key`; an older release cannot synchronize credentials.
-For reproducible installations, select a released immutable tag. Source checkout
-failures, unavailable or incompatible modules and failed key provisioning do not
-fail production creation. Production remains available with a warning and an
-OduMCP status of `sync_failed`. Infrastructure tools continue to work. The
+The addon must implement `_set_oduflow_key`; an older release cannot synchronize
+credentials. Source checkout failures, unsupported Odoo versions, unavailable or
+incompatible modules and failed key provisioning do not fail production creation.
+Production remains available with a warning and an OduMCP status of `sync_failed`,
+which the dashboard shows as an **MCP FAILED** badge on the production card. A
+production on Odoo 15 or older gets the status `unsupported` instead, shown as
+**MCP N/A**: no synchronization can help there. Infrastructure tools continue to work. The
 `production_odoo_*` tools remain listed but return a configuration error until
 `sync_production_mcp` succeeds. Fix the addon source or compatibility issue and
 retry synchronization; recreating production is unnecessary.
@@ -386,6 +397,41 @@ dashboard edits them in the same **Settings** panel. Applying restarts the
 container (brief downtime) unless `restart=false`; a call that leaves the
 overrides unchanged skips the restart entirely.
 
+#### Database manager and the master password
+
+The generated conf sets `list_db = False`, which is what closes Odoo's
+database manager: Odoo gates every database management function (create,
+duplicate, drop, backup, restore) on that setting, and nothing else stands
+between that page and the databases except the **master password**
+(`admin_passwd`). Oduflow never writes one, so Odoo's compiled-in default —
+the literal `admin` — applies.
+
+Turning the manager on therefore requires choosing a real master password in
+the same override set (or in the team `odoo.prod.conf`):
+
+```text
+set_production_odoo_conf(name="erp", options={
+    "list_db": "True",
+    "admin_passwd": "<at least 12 characters, not 'admin'>",
+})
+```
+
+`list_db = True` without one is refused, and so is dropping `admin_passwd`
+while the manager stays on. A `list_db` value other than `True` or `False` is
+refused too: Odoo's conf loader converts only those spellings to a boolean, so
+`list_db = 0` (or `no`, or `FALSE`) would read as a non-empty, truthy string
+and *enable* database management. A hand-edited `productions.json` that opens
+the manager unlocked is overruled on the next conf rebuild, which logs the
+reason and keeps `list_db = False`.
+
+Credential-valued overrides (`admin_passwd`, `smtp_password`) are reported
+back masked by `get_production_info` and `set_production_odoo_conf`, so an
+agent with production MCP access never receives them; the dashboard, which is
+the operator's own console, keeps showing the values. The generated conf is
+written owner-only (`0600`) on the host, since it is the one managed file that
+can carry a credential — the `db_*` connection keys travel as container
+environment variables instead.
+
 ## Deploys and rollback
 
 Module preflight and post-install checks use the production PostgreSQL cluster
@@ -585,11 +631,16 @@ emergency recovery.
 
 ### WAL monitoring and automatic disk protection
 
+PostgreSQL records every change in 16 MiB WAL segments, and WAL-G uploads each
+finished segment to S3; that stream is what makes point-in-time recovery
+possible. PostgreSQL cannot delete or recycle a segment until it has been
+archived, so when uploads stop, WAL keeps accumulating on the same disk as the
+production databases. The monitor watches two things: whether archiving is
+making progress, and whether the disk will run out before it does.
+
 The **PostgreSQL WAL** panel in Production is shared by every production and
-team. It shows the queue's segment count and bytes, age of the oldest waiting
-segment, time without archive progress, current upload duration, last upload
-exit status, PostgreSQL restart count, and free space on the actual WAL
-filesystem. Space reserved for root is excluded. A dedicated daemon samples
+team. Free space is measured on the actual WAL filesystem; space reserved for
+root is excluded. A dedicated daemon samples
 locally every 15 seconds, independently of backup jobs and dashboard polling;
 the storage probe runs only after the local protection decision. Missing or
 older-than-60-second samples are errors, never healthy results.
@@ -599,6 +650,39 @@ progress triggers warning/error thresholds. A draining but old backlog stays
 visible. WAL upload attempts have a hard timeout and return failure on timeout
 or termination; PostgreSQL retains the segment and retries. Failed downloads
 of the WAL-G executable never switch configured archiving to a success no-op.
+
+#### Reading the WAL panel
+
+The badge is `ok`, `warn`, `error`, `off` (archiving not configured, or
+production PostgreSQL not provisioned) or `unknown` (the sample is stale, or
+the browser could not fetch the status), always with a text summary such as
+*Archiving is idle* (empty queue), *Archiving WAL*, or the reason for a
+warning or error.
+
+| Field | Meaning |
+| --- | --- |
+| **Queue** | Segments waiting for upload (`.ready` files in `pg_wal/archive_status`) and their total size. |
+| **Queue stop limit** | `stop_queue_gb`. A queue this large trips protection even with ample free disk. A queue above `warn_queue_gb` only warns. |
+| **Oldest waiting** | Age of the oldest segment still waiting for upload. |
+| **No progress** | How long archiving has made no progress while a queue exists. Warns after `warn_after`, errors after `stall_after`. |
+| **WAL on disk** | Total size of `pg_wal`, including already-archived segments that PostgreSQL keeps for reuse. With an empty queue, anything between `min_wal_size` and `max_wal_size` (512 MiB to a few GiB with the default tuning) is normal. |
+| **Available to PostgreSQL** | Free space on the filesystem holding `pg_wal` (the WAL filesystem), as available to the non-root postgres user. The status warns below 15% of the filesystem. |
+| **Safety reserve** | `stop_free_gb`. When free space reaches it, protection stops the cluster. Releasing protection requires `resume_free_gb`. |
+| **Disk consumption** | How fast free space is shrinking: the larger of the five-minute average and the slope since the previous sample. It covers the whole filesystem, not just WAL. |
+| **Estimated time to reserve** | `(available − reserve) / consumption`: how long until the reserve is reached at the current rate. |
+| **Archived** | `pg_stat_archiver.archived_count`: segments archived since the statistics were last reset. |
+| **Last archive** | Time of the last successful upload, in the browser's local time. It should keep advancing while WAL is generated. |
+| **Failed attempts** | `pg_stat_archiver.failed_count`: failed `archive_command` runs. |
+| **PG restarts** | Docker restart count of the shared PostgreSQL container. |
+| **Current upload** | Shown only while an upload runs: the segment and its elapsed time. |
+| **Last upload failed** | Shown only when the last `wal-push` exited non-zero: its exit code. Details are in the PostgreSQL logs. |
+| **Storage probe** | How storage access was verified: a WAL-G list run inside production PostgreSQL (see above). |
+| **Last startup check** | Result of the deployment preflight, when one has run. |
+| **Sample** | When the shown data was collected, in the browser's local time. |
+
+**Pause archiving** / **Resume archiving**, **Retry upload**, **Start
+PostgreSQL recovery** and **Release protection** correspond to the `pause` /
+`resume`, `retry`, `recover` and `release` actions below.
 
 Defaults can be changed in TOML:
 
@@ -753,8 +837,7 @@ they can be reclaimed later:
 - **Deferred purge** — set `[lifecycle] prod_purge_hours = N` in
   `oduflow.toml` and the background sweep permanently purges the leftovers
   (database, PostgreSQL role, workspace) N hours after the deletion. `0`
-  (default) keeps them forever. Re-creating a production with the same name
-  clears the tombstone, so a revived production is never purged.
+  (default) keeps them forever.
 - **Immediate purge** — `oduflow cleanup --purge-deleted-productions`
   lists tombstoned leftovers; add `--force` to purge them now, regardless of
   age.
@@ -762,6 +845,20 @@ they can be reclaimed later:
 Only tombstoned leftovers are ever purged: a workspace without the marker is
 presumed alive and is never touched (`oduflow cleanup` skips the whole
 `prod-*` namespace for the same reason).
+
+A deleted production's name stays taken while its leftovers are kept:
+`create_production` refuses a name whose database is still in the production
+cluster, or whose workspace is still on disk. Creating over a kept workspace
+would collide with its repository and mix the old filestore and deploy history
+into the new production. Copy out anything you still need, purge the
+leftovers, and create again.
+
+A failed `create_production` rolls back what it created. If the rollback
+cannot drop the new database, it tombstones the attempt, so the same purge
+reclaims it. The refusal names the remedy that applies: purge for tombstoned
+leftovers; for unmarked ones (a production deleted before tombstones existed,
+for example), a manual `DROP DATABASE` and removal of the workspace, after you
+check that they hold nothing you need.
 
 ## MCP tool reference
 

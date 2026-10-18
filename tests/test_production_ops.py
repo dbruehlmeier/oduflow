@@ -1,3 +1,4 @@
+import configparser
 import datetime
 import json
 import os
@@ -184,6 +185,40 @@ class TestCreateProduction:
         assert record["mcp"]["status"] == "sync_failed"
         assert client.containers.run.called
 
+    def test_unsupported_odoo_version_explains_missing_odumcp(self, settings, team):
+        from oduflow.production_mcp import UnsupportedOdooVersion
+
+        client = _mock_client()
+        order: list[str] = []
+        client.images.pull.side_effect = lambda *a, **k: order.append("pull")
+        with _PatchAll(_patch_create_stack(client)) as mocks:
+
+            def unsupported(*args, **kwargs):
+                order.append("prepare")
+                raise UnsupportedOdooVersion(
+                    "Automatic OduMCP provisioning supports Odoo 16 and later; "
+                    "this production runs Odoo 15."
+                )
+
+            mocks["prepare_odumcp"].side_effect = unsupported
+            result = production_ops.create_production(
+                settings,
+                team,
+                "erp",
+                "https://github.com/o/r.git",
+                "main",
+                "erp.example.com",
+                "odoo:15.0",
+            )
+            mocks["provision_odumcp"].assert_not_called()
+            assert mocks["prepare_odumcp"].call_args.args[4] == "odoo:15.0"
+        assert "supports Odoo 16 and later" in result["notes"][0]
+        # Retrying cannot help, so the card must not suggest it.
+        record = production_registry.get_production(team, "erp")
+        assert record["mcp"]["status"] == "unsupported"
+        # The addon series is chosen from the freshly pulled image.
+        assert order == ["pull", "prepare"]
+
     def test_requires_traefik_mode(self, settings, team):
         port_settings = Settings(
             routing_mode="port",
@@ -228,61 +263,225 @@ class TestCreateProduction:
                 "odoo:18.0",
             )
 
-    def test_existing_db_refused(self, settings, team):
+    def _create(self, settings, team, **kwargs):
+        return production_ops.create_production(
+            settings,
+            team,
+            "erp",
+            "https://github.com/o/r.git",
+            "main",
+            "erp.example.com",
+            "odoo:18.0",
+            **kwargs,
+        )
+
+    def test_orphan_db_refused_with_manual_drop(self, settings, team):
         client = _mock_client()
         with _PatchAll(_patch_create_stack(client, db_exists=True)):
-            with pytest.raises(ConflictError, match="already exists in the production"):
-                production_ops.create_production(
-                    settings,
-                    team,
-                    "erp",
-                    "https://github.com/o/r.git",
-                    "main",
-                    "erp.example.com",
-                    "odoo:18.0",
-                )
-        # No registry record left behind.
+            with pytest.raises(ConflictError) as excinfo:
+                self._create(settings, team)
+        message = str(excinfo.value)
+        assert "No production 'erp' is registered" in message
+        assert (
+            f"docker exec {settings.prod_db_container} psql -U {settings.db_user} "
+            "-d postgres -c 'DROP DATABASE \"oduflow_1_prod-erp\" WITH (FORCE);'"
+        ) in message
+        # delete_production needs a registry record: never the advice here.
+        assert "delete_production" not in message
+        # No registry record or workspace left behind.
         assert "erp" not in production_registry.list_productions(team)
+        assert not os.path.isdir(production_ops._workspace(team, "erp"))
 
-    def test_failed_create_preserves_preexisting_workspace(self, settings, team):
-        """P-H6: a workspace kept by delete_production(drop_database=False)
-        holds the old production's filestore and deploy history; a failed
-        re-create must not rmtree it during rollback."""
-        import os
-
-        client = _mock_client()
+    def test_unmarked_workspace_refused(self, settings, team):
         workspace = production_ops._workspace(team, "erp")
-        os.makedirs(workspace)
+        os.makedirs(os.path.join(workspace, "repo"))
         sentinel = os.path.join(workspace, "filestore-sentinel")
         with open(sentinel, "w") as fh:
             fh.write("precious")
+        client = _mock_client()
+        with _PatchAll(_patch_create_stack(client)) as mocks:
+            with pytest.raises(ConflictError) as excinfo:
+                self._create(settings, team)
+            mocks["_clone_repo"].assert_not_called()
+        message = str(excinfo.value)
+        assert "nothing marks these leftovers as deleted" in message
+        assert f"workspace '{workspace}'" in message
+        # The database is gone: no DROP DATABASE advice.
+        assert "DROP DATABASE" not in message
+        assert os.path.exists(sentinel)
+        assert "erp" not in production_registry.list_productions(team)
 
+    def test_tombstoned_db_refused_with_purge_advice(self, settings, team):
+        production_ops._write_tombstone(team, "erp", "oduflow_1_prod-erp")
+        client = _mock_client()
+        with _PatchAll(_patch_create_stack(client, db_exists=True)):
+            with pytest.raises(ConflictError) as excinfo:
+                self._create(settings, team)
+        message = str(excinfo.value)
+        assert "database 'oduflow_1_prod-erp' and workspace" in message
+        assert "--purge-deleted-productions" in message
+        assert "--team 1" in message
+        assert "delete_production" not in message
+        # The refusal leaves the soft-deleted leftovers as they were.
+        assert os.path.isfile(production_ops._tombstone_path(team, "erp"))
+
+    def test_kept_workspace_refused_after_its_db_was_dropped(self, settings, team):
+        """Re-creating a soft-deleted name over its kept workspace would hit
+        the old repo at git clone and mix the old filestore and deploy
+        history into the new production: refused up front, untouched."""
+        production_ops._write_tombstone(team, "erp", "oduflow_1_prod-erp")
+        tombstone = production_ops._tombstone_path(team, "erp")
+        with open(tombstone) as f:
+            marker = f.read()
+        workspace = production_ops._workspace(team, "erp")
+        os.makedirs(os.path.join(workspace, "repo"))
+        sentinel = os.path.join(workspace, "filestore-sentinel")
+        with open(sentinel, "w") as fh:
+            fh.write("precious")
+        client = _mock_client()
+        with _PatchAll(_patch_create_stack(client)) as mocks:
+            with pytest.raises(ConflictError) as excinfo:
+                self._create(settings, team)
+            mocks["_clone_repo"].assert_not_called()
+        message = str(excinfo.value)
+        assert f"are still kept: workspace '{workspace}'" in message
+        assert "--purge-deleted-productions" in message
+        # The purge clock keeps running from the original deletion.
+        with open(tombstone) as f:
+            assert f.read() == marker
+        assert os.path.exists(sentinel)
+        assert "erp" not in production_registry.list_productions(team)
+
+    def test_registered_name_refused_before_db_check(self, settings, team):
+        production_registry.create_production(team, "erp", {"domain": "e.x.com"})
+        client = _mock_client()
+        with _PatchAll(_patch_create_stack(client, db_exists=True)) as mocks:
+            with pytest.raises(ConflictError, match="Production 'erp' already exists"):
+                self._create(settings, team)
+            mocks["_db_exists"].assert_not_called()
+            mocks["ensure_prod_infra"].assert_not_called()
+        # The live production's record is untouched.
+        assert production_registry.get_production(team, "erp")["domain"] == "e.x.com"
+
+    def test_name_registered_meanwhile_is_not_called_a_leftover(self, settings, team):
+        """A concurrent create that registers the name after the early check
+        owns its database: never advise dropping it."""
+
+        def concurrent_create(*args, **kwargs):
+            production_registry.create_production(team, "erp", {})
+            return True
+
+        client = _mock_client()
+        patches = _patch_create_stack(client)
+        patches["_db_exists"] = patch.object(
+            production_ops, "_db_exists", side_effect=concurrent_create
+        )
+        with _PatchAll(patches):
+            with pytest.raises(ConflictError) as excinfo:
+                self._create(settings, team)
+        assert "Production 'erp' already exists" in str(excinfo.value)
+        assert "DROP DATABASE" not in str(excinfo.value)
+
+    @staticmethod
+    def _failing_drop(client, settings, sql, **kw):
+        if sql.startswith("DROP DATABASE"):
+            raise RuntimeError("pg down")
+        return ""
+
+    def test_undroppable_db_tombstoned_for_purge(self, settings, team):
+        client = _mock_client()
+        client.containers.run.side_effect = RuntimeError("boom")
+        patches = _patch_create_stack(client)
+        patches["_exec_sql"] = patch.object(
+            production_ops, "_exec_sql", side_effect=self._failing_drop
+        )
+        with _PatchAll(patches):
+            with pytest.raises(RuntimeError, match="boom"):
+                self._create(settings, team)
+
+        assert "erp" not in production_registry.list_productions(team)
+        with open(production_ops._tombstone_path(team, "erp")) as f:
+            assert json.load(f)["db_name"] == "oduflow_1_prod-erp"
+
+        # The purge sweep now reclaims what the rollback could not.
+        issued = []
+        with (
+            patch.object(production_ops, "get_client", return_value=_mock_client()),
+            patch.object(
+                production_ops,
+                "_exec_sql",
+                side_effect=lambda c, s, sql, **kw: issued.append(sql) or "",
+            ),
+            patch.object(production_ops, "_drop_pg_role"),
+        ):
+            result = production_ops.purge_deleted_productions(settings, team)
+        assert result["purged"] == ["erp"]
+        assert any('DROP DATABASE IF EXISTS "oduflow_1_prod-erp"' in s for s in issued)
+        assert not os.path.isdir(production_ops._workspace(team, "erp"))
+
+    def test_rollback_tombstones_only_once_the_record_is_gone(self, settings, team):
+        """The purge sweep clears a tombstone it finds on a registered
+        production as stale, so one written before the registry delete could
+        be lost to a sweep in between."""
+        registered_at_write = []
+        real_write = production_ops._write_tombstone
+
+        def spy_write(team_, name, env_db):
+            registered_at_write.append(
+                name in production_registry.list_productions(team_)
+            )
+            real_write(team_, name, env_db)
+
+        client = _mock_client()
+        client.containers.run.side_effect = RuntimeError("boom")
+        patches = _patch_create_stack(client)
+        patches["_exec_sql"] = patch.object(
+            production_ops, "_exec_sql", side_effect=self._failing_drop
+        )
+        patches["_write_tombstone"] = patch.object(
+            production_ops, "_write_tombstone", side_effect=spy_write
+        )
+        with _PatchAll(patches):
+            with pytest.raises(RuntimeError, match="boom"):
+                self._create(settings, team)
+        assert registered_at_write == [False]
+
+    def test_failure_before_create_database_never_touches_the_cluster(
+        self, settings, team
+    ):
+        """With PG unreachable, a create that failed before CREATE DATABASE
+        has nothing to drop: the workspace goes, nothing is tombstoned."""
+        issued = []
+
+        def pg_down(client, settings, sql, **kw):
+            issued.append(sql)
+            raise RuntimeError("pg down")
+
+        client = _mock_client()
         patches = _patch_create_stack(client)
         patches["_clone_repo"] = patch(
             "oduflow.docker_ops.env_ops._clone_repo",
             side_effect=RuntimeError("clone failed"),
         )
+        patches["_exec_sql"] = patch.object(
+            production_ops, "_exec_sql", side_effect=pg_down
+        )
+        # Reachable for the leftover check, gone by the rollback.
+        patches["_db_exists"] = patch.object(
+            production_ops,
+            "_db_exists",
+            side_effect=[False, RuntimeError("pg down")],
+        )
         with _PatchAll(patches):
             with pytest.raises(RuntimeError, match="clone failed"):
-                production_ops.create_production(
-                    settings,
-                    team,
-                    "erp",
-                    "https://github.com/o/r.git",
-                    "main",
-                    "erp.example.com",
-                    "odoo:18.0",
-                )
+                self._create(settings, team)
 
-        # The kept workspace survived the rollback...
-        assert os.path.exists(sentinel)
-        # ...while the failed attempt still released its registry reservation.
+        assert issued == []
+        assert not os.path.isdir(production_ops._workspace(team, "erp"))
         assert "erp" not in production_registry.list_productions(team)
 
     def test_failed_create_removes_fresh_workspace(self, settings, team):
-        """The rollback still removes a workspace this attempt itself created."""
-        import os
-
+        """The rollback removes the workspace this attempt created."""
         client = _mock_client()
         workspace = production_ops._workspace(team, "erp")
         assert not os.path.isdir(workspace)
@@ -294,15 +493,34 @@ class TestCreateProduction:
         )
         with _PatchAll(patches):
             with pytest.raises(RuntimeError, match="clone failed"):
-                production_ops.create_production(
-                    settings,
-                    team,
-                    "erp",
-                    "https://github.com/o/r.git",
-                    "main",
-                    "erp.example.com",
-                    "odoo:18.0",
-                )
+                self._create(settings, team)
+
+        assert not os.path.isdir(workspace)
+        assert "erp" not in production_registry.list_productions(team)
+
+    def test_failed_create_unregisters_extra_worktrees(self, settings, team):
+        workspace = production_ops._workspace(team, "erp")
+        wt_path = os.path.join(workspace, "extra", "acme")
+
+        def fake_worktree(team_, repo_name, branch, target_path):
+            os.makedirs(target_path)
+            return target_path
+
+        client = _mock_client()
+        client.containers.run.side_effect = RuntimeError("boom")
+        patches = _patch_create_stack(client)
+        patches["create_worktree"] = patch(
+            "oduflow.extra_addons.create_worktree", side_effect=fake_worktree
+        )
+        patches["resolve_extra_addons_path"] = patch(
+            "oduflow.extra_addons.resolve_extra_addons_path",
+            side_effect=lambda path, repo_name: path,
+        )
+        patches["remove_worktree"] = patch("oduflow.extra_addons.remove_worktree")
+        with _PatchAll(patches) as mocks:
+            with pytest.raises(RuntimeError, match="boom"):
+                self._create(settings, team, extra_addons={"acme": "main"})
+            mocks["remove_worktree"].assert_called_once_with(team, "acme", wt_path)
 
         assert not os.path.isdir(workspace)
         assert "erp" not in production_registry.list_productions(team)
@@ -861,6 +1079,134 @@ class TestSetProductionOdooConf:
         assert result["odoo_conf"] == {"workers": "3"}
         record = production_registry.get_production(team, "erp")
         assert record["odoo_conf"] == {"workers": "3"}
+
+
+class TestDatabaseManagerOverrides:
+    """list_db unlocks /web/database/*; the master password is the only lock."""
+
+    STRONG = "correct-horse-battery"
+
+    def _conf(self, settings, team, **kwargs):
+        client = _mock_client()
+        with patch.object(production_ops, "get_client", return_value=client):
+            return production_ops.set_production_odoo_conf(
+                settings, team, "erp", **kwargs
+            )
+
+    def test_enabling_without_a_password_is_refused(self, settings, team):
+        production_registry.create_production(team, "erp", {})
+        with pytest.raises(ValueError, match="admin_passwd"):
+            self._conf(settings, team, set_options={"list_db": "True"})
+        # Nothing stored: the refusal happens before the registry write.
+        assert production_registry.get_production(team, "erp")["odoo_conf"] == {}
+
+    @pytest.mark.parametrize("weak", ["admin", "Admin", "short", " padded-password "])
+    def test_weak_password_is_refused(self, settings, team, weak):
+        production_registry.create_production(team, "erp", {})
+        with pytest.raises(ValueError, match="admin_passwd"):
+            self._conf(
+                settings, team, set_options={"list_db": "True", "admin_passwd": weak}
+            )
+
+    def test_enabling_with_a_password_is_accepted(self, settings, team):
+        production_registry.create_production(team, "erp", {})
+        result = self._conf(
+            settings,
+            team,
+            set_options={"list_db": "True", "admin_passwd": self.STRONG},
+        )
+        assert result["odoo_conf"] == {
+            "list_db": "True",
+            "admin_passwd": self.STRONG,
+        }
+
+    @pytest.mark.parametrize("value", ["0", "no", "off", "FALSE", "none"])
+    def test_non_boolean_list_db_is_refused(self, settings, team, value):
+        # Odoo converts only True/true/False/false; everything else stays a
+        # truthy string, so `list_db = 0` would *enable* the manager.
+        production_registry.create_production(team, "erp", {})
+        with pytest.raises(ValueError, match="exactly True or False"):
+            self._conf(settings, team, set_options={"list_db": value})
+
+    def test_disabling_needs_no_password(self, settings, team):
+        production_registry.create_production(team, "erp", {})
+        result = self._conf(settings, team, set_options={"list_db": "False"})
+        assert result["odoo_conf"] == {"list_db": "False"}
+
+    def test_dropping_the_password_while_enabled_is_refused(self, settings, team):
+        production_registry.create_production(
+            team,
+            "erp",
+            {"odoo_conf": {"list_db": "True", "admin_passwd": self.STRONG}},
+        )
+        with pytest.raises(ValueError, match="admin_passwd"):
+            self._conf(settings, team, unset_options=["admin_passwd"])
+        # Turning both off in one call is fine.
+        result = self._conf(settings, team, unset_options=["admin_passwd", "list_db"])
+        assert result["odoo_conf"] == {}
+
+    def test_password_from_the_team_conf_satisfies_the_rule(
+        self, settings, team, tmp_path
+    ):
+        production_registry.create_production(team, "erp", {})
+        (tmp_path / "team_1" / "odoo.prod.conf").write_text(
+            f"[options]\nadmin_passwd = {self.STRONG}\n"
+        )
+        result = self._conf(settings, team, set_options={"list_db": "True"})
+        assert result["odoo_conf"] == {"list_db": "True"}
+
+    def test_hand_edited_record_cannot_open_the_manager(self, settings, team, tmp_path):
+        # productions.json is operator-writable; a conf rebuild must fail
+        # closed rather than serve the manager behind Odoo's default password.
+        production_registry.create_production(
+            team, "erp", {"odoo_conf": {"list_db": "True"}}
+        )
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        out = tmp_path / "generated.conf"
+        with patch(
+            "oduflow.pg_tune.detect_resources",
+            return_value={"total_ram_mb": 8192, "cpu_count": 4},
+        ):
+            production_ops._build_prod_odoo_conf(
+                settings, team, "erp", str(repo), [], output_path=str(out)
+            )
+        cp = configparser.RawConfigParser()
+        cp.read(out)
+        assert cp.get("options", "list_db") == "False"
+
+    def test_generated_conf_is_owner_only(self, settings, team, tmp_path):
+        production_registry.create_production(
+            team, "erp", {"odoo_conf": {"admin_passwd": self.STRONG}}
+        )
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        out = tmp_path / "generated.conf"
+        with patch(
+            "oduflow.pg_tune.detect_resources",
+            return_value={"total_ram_mb": 8192, "cpu_count": 4},
+        ):
+            production_ops._build_prod_odoo_conf(
+                settings, team, "erp", str(repo), [], output_path=str(out)
+            )
+        assert out.stat().st_mode & 0o777 == 0o600
+        assert self.STRONG in out.read_text()
+
+    def test_masking_hides_credentials_only(self):
+        masked = production_ops.mask_odoo_conf(
+            {
+                "admin_passwd": self.STRONG,
+                "smtp_password": "mail-secret",
+                "smtp_user": "mailer",
+                "workers": "4",
+            }
+        )
+        assert masked == {
+            "admin_passwd": production_ops.MASKED_VALUE,
+            "smtp_password": production_ops.MASKED_VALUE,
+            "smtp_user": "mailer",
+            "workers": "4",
+        }
 
 
 def _seed_prod_record(team, **overrides):
@@ -2007,3 +2353,56 @@ def test_production_info_returns_persisted_env_references(settings, team, env_va
         info = production_ops.get_production_info(settings, team, "erp")
     assert info["env_vars"] == (env_vars or {})
     resolve.assert_not_called()
+
+
+class TestRefreshOdumcpForImage:
+    """reconfigure_production moves the managed addon with the Odoo series."""
+
+    def _checkout(self, team):
+        from oduflow.production_mcp import addon_checkout
+
+        addon_checkout(team, "erp").mkdir(parents=True)
+
+    def test_production_without_managed_checkout_is_left_alone(self, settings, team):
+        with patch("oduflow.production_mcp.prepare_addon") as prepare:
+            production_ops._refresh_odumcp_for_image(
+                settings, team, "erp", [], "odoo:19.0"
+            )
+        prepare.assert_not_called()
+
+    def test_changed_image_refreshes_the_checkout(self, settings, team):
+        self._checkout(team)
+        with patch("oduflow.production_mcp.prepare_addon") as prepare:
+            production_ops._refresh_odumcp_for_image(
+                settings, team, "erp", [("/x", "/mnt/x")], "odoo:20.0"
+            )
+        prepare.assert_called_once_with(
+            settings, team, "erp", [("/x", "/mnt/x")], "odoo:20.0"
+        )
+
+    @pytest.mark.parametrize(
+        ("error", "status"),
+        [
+            ("unsupported", "unsupported"),
+            ("download", "sync_failed"),
+        ],
+    )
+    def test_failure_is_recorded_not_raised(self, settings, team, error, status):
+        from oduflow.production_mcp import UnsupportedOdooVersion
+
+        production_registry.create_production(
+            team, "erp", {"domain": "erp.example.com"}
+        )
+        self._checkout(team)
+        exc = (
+            UnsupportedOdooVersion("Odoo 15")
+            if error == "unsupported"
+            else RuntimeError("clone failed")
+        )
+        with patch("oduflow.production_mcp.prepare_addon", side_effect=exc):
+            production_ops._refresh_odumcp_for_image(
+                settings, team, "erp", [], "odoo:15.0"
+            )
+        assert (
+            production_registry.get_production(team, "erp")["mcp"]["status"] == status
+        )

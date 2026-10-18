@@ -25,6 +25,7 @@ Key differences from dev environments:
 
 from __future__ import annotations
 
+import configparser
 import datetime
 import fcntl
 import json
@@ -178,6 +179,26 @@ RESERVED_ODOO_CONF_KEYS = frozenset(
 # workers on 8069 and the gevent process on 8072, which carries the bus in
 # "workers" mode and every page in "gevent" mode.
 _HEALTH_PORTS = (_HTTP_PORT, _GEVENT_PORT)
+# Odoo's config loader (odoo/tools/config.py load()) turns *only* these exact
+# strings into booleans; every other value stays a non-empty string, which is
+# truthy. So `list_db = 0`, `list_db = no` and even `list_db = FALSE` all
+# ENABLE database management. Refused rather than stored as a footgun.
+_ODOO_CONF_TRUE = ("True", "true")
+_ODOO_CONF_FALSE = ("False", "false")
+# odoo.conf overrides whose value is a credential. Masked on the MCP read
+# surfaces (get_production_info, set_production_odoo_conf) so an agent that
+# can read a production never receives its master password. The dashboard is
+# the operator's own console and keeps showing the values.
+SENSITIVE_ODOO_CONF_KEYS = frozenset({"admin_passwd", "smtp_password"})
+MASKED_VALUE = "********"
+# Odoo's compiled-in default master password is the literal "admin", and the
+# generated conf does not set one — database management is closed by
+# list_db = False instead. Unlocking it therefore means choosing a real
+# password first, and "admin" is not one.
+_MIN_ADMIN_PASSWD_LEN = 12
+# The conf inside the container: Odoo reads it as a non-root user, so it
+# cannot inherit the owner-only mode the host copy carries.
+_CONTAINER_CONF_MODE = 0o644
 
 
 def validate_server_mode(value: str) -> str:
@@ -231,6 +252,101 @@ def validate_workers_override(value: object) -> None:
             f"got '{value}': both server modes run Odoo's multi-process server, "
             "which serves the gevent port Traefik routes to."
         )
+
+
+def parse_list_db_override(value: object) -> bool:
+    """Whether a ``list_db`` value leaves Odoo's database manager reachable.
+
+    Mirrors Odoo's own conf parsing: only the exact strings True/true/False/
+    false become booleans, so anything else is a truthy string that *enables*
+    database management. Raises ValueError for such a value instead of
+    storing an override that reads the opposite of what it looks like.
+    """
+    text = str(value).strip()
+    if text in _ODOO_CONF_TRUE:
+        return True
+    if text in _ODOO_CONF_FALSE:
+        return False
+    raise ValueError(
+        f"odoo.conf 'list_db' must be exactly True or False, got '{value}': "
+        "Odoo converts only those spellings to a boolean and reads every "
+        "other value as a non-empty (truthy) string, which would enable "
+        "database management."
+    )
+
+
+def validate_admin_passwd_override(value: object) -> None:
+    """A master password that actually locks Odoo's database manager."""
+    text = str(value)
+    if text != text.strip() or "\n" in text or "\r" in text:
+        raise ValueError(
+            "odoo.conf 'admin_passwd' must be a single line without leading "
+            "or trailing whitespace (Odoo strips it when reading the conf)."
+        )
+    if text.lower() == "admin" or len(text) < _MIN_ADMIN_PASSWD_LEN:
+        raise ValueError(
+            f"odoo.conf 'admin_passwd' must be at least "
+            f"{_MIN_ADMIN_PASSWD_LEN} characters and not 'admin': it is the "
+            "master password for creating, dropping, backing up and restoring "
+            "databases."
+        )
+
+
+def effective_admin_passwd(team: TeamSettings, name: str, conf: dict[str, str]) -> str:
+    """The master password the next generated conf would carry.
+
+    The per-production override when set, otherwise whatever the base conf
+    chain (team odoo.prod.conf > bundled) defines. The bundled conf sets
+    none, so this is empty unless an operator put one somewhere.
+    """
+    if "admin_passwd" in conf:
+        return str(conf["admin_passwd"])
+    base = configparser.RawConfigParser()
+    base.read(
+        _prod_base_conf_path(
+            team, get_repo_path(prod_env_name(name), team.workspaces_dir)
+        )
+    )
+    return base.get("options", "admin_passwd", fallback="")
+
+
+def validate_db_manager_overrides(
+    team: TeamSettings, name: str, conf: dict[str, str]
+) -> None:
+    """Refuse an override set that opens Odoo's database manager unlocked.
+
+    ``list_db = True`` makes /web/database/* reachable (Odoo gates every
+    database management function on it), and the only thing between that page
+    and the databases is the master password — which Oduflow never generates,
+    so unset means Odoo's default "admin". The two settings are therefore
+    validated as a pair, in whichever order they are sent.
+    """
+    if "list_db" in conf:
+        parse_list_db_override(conf["list_db"])
+    if "admin_passwd" in conf:
+        validate_admin_passwd_override(conf["admin_passwd"])
+    if not parse_list_db_override(conf.get("list_db", "False")):
+        return
+    passwd = effective_admin_passwd(team, name, conf)
+    if not passwd:
+        raise ValueError(
+            "odoo.conf 'list_db = True' exposes Odoo's database manager, so "
+            "it also needs an 'admin_passwd' override (or one in the team "
+            "odoo.prod.conf): without it Odoo falls back to its default "
+            "master password 'admin', which would let anyone who reaches the "
+            "domain create, drop, back up and restore databases."
+        )
+    if "admin_passwd" not in conf:
+        # It came from the base conf chain, so it has not been checked above.
+        validate_admin_passwd_override(passwd)
+
+
+def mask_odoo_conf(conf: dict[str, str] | None) -> dict[str, str]:
+    """A copy of the overrides with credential values replaced by a mask."""
+    return {
+        key: (MASKED_VALUE if key in SENSITIVE_ODOO_CONF_KEYS and value else value)
+        for key, value in (conf or {}).items()
+    }
 
 
 def prod_url(settings: Settings, team: TeamSettings, record: dict[str, Any]) -> str:
@@ -331,6 +447,7 @@ def _build_prod_odoo_conf(
     *,
     plan: ResourcePlan | None = None,
     output_path: str | None = None,
+    odoo_image: str = "",
 ) -> str:
     """Generate the merged production odoo.conf; return the host path."""
     from oduflow.extra_addons import generate_odoo_conf, resolve_main_addons_path
@@ -368,8 +485,10 @@ def _build_prod_odoo_conf(
             name,
             ", ".join(reserved),
         )
-    for key, value in (record.get("odoo_conf") or {}).items():
-        key = str(key).lower()
+    stored = {
+        str(k).lower(): str(v) for k, v in (record.get("odoo_conf") or {}).items()
+    }
+    for key, value in stored.items():
         if key in RESERVED_ODOO_CONF_KEYS:
             continue
         if key == "workers":
@@ -379,10 +498,20 @@ def _build_prod_odoo_conf(
                 logger.warning("Ignoring odoo.conf override for '%s': %s", name, exc)
                 continue
         overrides[key] = str(value)
-    from oduflow.production_mcp import MOUNT, addon_checkout
+    # Fail closed on the database manager: set_production_odoo_conf refuses
+    # these combinations, but a hand-edited productions.json must not end up
+    # serving /web/database/* behind Odoo's default master password. Dropping
+    # the override restores the managed list_db = False.
+    if "list_db" in overrides:
+        try:
+            validate_db_manager_overrides(team, name, stored)
+        except ValueError as exc:
+            logger.warning("Database management stays disabled for '%s': %s", name, exc)
+            overrides["list_db"] = "False"
+    from oduflow.production_mcp import MOUNT, managed_module
 
     extra_container_paths = list(extra_container_paths)
-    if (addon_checkout(team, name) / "addons/odumcp/__manifest__.py").is_file():
+    if (managed_module(team, name) / "__manifest__.py").is_file():
         extra_container_paths.append(MOUNT)
     generated = output_path or os.path.join(_workspace(team, name), "odoo.conf")
     generate_odoo_conf(
@@ -393,6 +522,12 @@ def _build_prod_odoo_conf(
         overrides=overrides,
         pinned=_PINNED_LISTEN_CONF,
         remove_keys=_DROPPED_LISTEN_CONF_KEYS,
+        odoo_image=odoo_image,
+        # A production conf may carry admin_passwd (the only secret that can
+        # reach it — db_* credentials travel as container env vars), so the
+        # host copy is owner-only. The copy inside the container is widened
+        # to _CONTAINER_CONF_MODE: Odoo reads it as a non-root user.
+        mode=0o600,
     )
     return generated
 
@@ -408,7 +543,9 @@ def stage_prod_odoo_conf(
     container = _get_container(client, settings, team, name)
     if container is None:
         return None
-    _copy_file_to_container(container, generated_path, "/etc/odoo")
+    _copy_file_to_container(
+        container, generated_path, "/etc/odoo", mode=_CONTAINER_CONF_MODE
+    )
     return str(container.name)
 
 
@@ -436,8 +573,17 @@ def reapply_prod_odoo_conf(
             ]
         except (json.JSONDecodeError, TypeError):
             extra_paths = []
-    generated = _build_prod_odoo_conf(settings, team, name, repo_path, extra_paths)
-    _copy_file_to_container(container, generated, "/etc/odoo")
+    generated = _build_prod_odoo_conf(
+        settings,
+        team,
+        name,
+        repo_path,
+        extra_paths,
+        odoo_image=(container.labels or {}).get(settings.image_label, ""),
+    )
+    _copy_file_to_container(
+        container, generated, "/etc/odoo", mode=_CONTAINER_CONF_MODE
+    )
     return True
 
 
@@ -886,56 +1032,110 @@ def _cleanup_partial_production(
     team: TeamSettings,
     name: str,
     *,
-    remove_workspace: bool = True,
+    db_created: bool,
 ) -> None:
-    """Best-effort teardown of a half-created production (rollback path).
+    """Teardown of a half-created production (rollback path), its registry
+    record included. create_production refused any leftovers of the name, so
+    everything here belongs to this attempt.
 
-    ``remove_workspace=False`` preserves a workspace that existed BEFORE this
-    create attempt — e.g. one kept by ``delete_production(drop_database=False)``
-    ("productions are precious"): its filestore and deploy history must survive
-    a failed re-create, which only borrowed the directory via
-    ``makedirs(exist_ok=True)``.
+    The database is dropped only if this attempt issued CREATE DATABASE. If
+    that drop fails, the database would be orphaned once the record goes:
+    nothing could ever reclaim it. The workspace, which holds the PG
+    credentials, is then kept and tombstoned instead, so the purge sweep
+    drops the database, role and workspace later.
     """
-    env_name = prod_env_name(name)
+    from oduflow import production_registry
+
     try:
         container = _get_container(client, settings, team, name)
         if container is not None:
             container.remove(force=True)
     except Exception:
         pass
-    env_db = prod_db_name(team, name)
-    try:
-        if _db_exists(
-            client, settings, env_db, container_name=settings.prod_db_container
-        ):
-            _exec_sql(
-                client,
-                settings,
-                f'DROP DATABASE IF EXISTS "{env_db}" WITH (FORCE);',
-                container_name=settings.prod_db_container,
+    db_left = False
+    if db_created:
+        db_dropped, warnings = _destroy_leftovers(
+            client, settings, team, name, require_db_drop=True
+        )
+        db_left = not db_dropped
+        for warning in warnings:
+            logger.warning("Rollback of production '%s': %s", name, warning)
+    else:
+        # No database means no PG role either: it is created after it.
+        _remove_workspace(team, name)
+    production_registry.delete_production(team, name)
+    if db_left:
+        # Only once the record is gone: the purge sweep clears a tombstone it
+        # finds on a registered production as stale.
+        try:
+            _write_tombstone(team, name, prod_db_name(team, name))
+            logger.warning(
+                "Tombstoned failed create of production '%s'; "
+                "`oduflow cleanup --purge-deleted-productions` reclaims it",
+                name,
             )
-    except Exception:
-        pass
-    try:
-        creds = load_credentials(
-            env_name, team.workspaces_dir, settings.db_user, settings.db_password
-        )
-        _drop_pg_role(
-            client,
-            settings,
-            creds["pg_user"],
-            container_name=settings.prod_db_container,
-        )
-    except Exception:
-        pass
+        except Exception as exc:
+            logger.warning(
+                "Could not tombstone failed create of production '%s': %s",
+                name,
+                exc,
+            )
+
+
+def _refuse_leftovers(
+    client: DockerClient, settings: Settings, team: TeamSettings, name: str
+) -> None:
+    """Refuse a name whose database or workspace is still around with no
+    registered production, naming the remedy that applies: delete_production
+    cannot help, since it needs a registry record.
+
+    A kept workspace is refused too. Creating over it would collide with its
+    repo and worktrees, and would mix the old filestore and deploy history
+    into the new production; so a deleted production's leftovers are purged
+    before its name is reused.
+    """
+    from oduflow import production_registry
+
+    env_db = prod_db_name(team, name)
     workspace = _workspace(team, name)
-    if not remove_workspace:
-        logger.warning(
-            "Leaving pre-existing production workspace intact after failed create: %s",
-            workspace,
+    db_exists = _db_exists(
+        client, settings, env_db, container_name=settings.prod_db_container
+    )
+    workspace_exists = os.path.isdir(workspace)
+    if not db_exists and not workspace_exists:
+        return
+    # A concurrent create may have registered the name since the early
+    # check: its resources are not leftovers.
+    production_registry.ensure_name_free(team, name)
+    kept = []
+    if db_exists:
+        kept.append(f"database '{env_db}'")
+    if workspace_exists:
+        kept.append(f"workspace '{workspace}'")
+    leftovers = " and ".join(kept)
+    if os.path.isfile(_tombstone_path(team, name)):
+        raise ConflictError(
+            f"Leftovers of production '{name}' are still kept: {leftovers}. "
+            "It was deleted without drop_database, or its failed create could "
+            "not drop the database. Copy anything you still need out of the "
+            f"workspace, run `oduflow cleanup --team {team.team_id} "
+            "--purge-deleted-productions` to review the leftovers, then add "
+            "--force to purge them permanently (it also removes the orphaned "
+            "dev resources it lists), and retry."
         )
-    elif os.path.isdir(workspace):
-        shutil.rmtree(workspace, ignore_errors=True)
+    message = (
+        f"No production '{name}' is registered, and nothing marks these "
+        f"leftovers as deleted: {leftovers}. A production deleted before "
+        "deletions were tombstoned, or a failed create, can leave them behind. "
+        "Check that they hold nothing you need, remove them, and retry."
+    )
+    if db_exists:
+        message += (
+            f" Drop the database with: docker exec {settings.prod_db_container} "
+            f"psql -U {settings.db_user} -d postgres -c "
+            f"'DROP DATABASE \"{env_db}\" WITH (FORCE);'"
+        )
+    raise ConflictError(message)
 
 
 def _container_spec(
@@ -966,9 +1166,9 @@ def _container_spec(
     odoo_volumes: dict[str, dict[str, str]] = {
         repo_path: {"bind": "/mnt/extra-addons", "mode": "rw"}
     }
-    from oduflow.production_mcp import MOUNT, addon_checkout
+    from oduflow.production_mcp import MOUNT, managed_module
 
-    connector = addon_checkout(team, name) / "addons/odumcp"
+    connector = managed_module(team, name)
     if (connector / "__manifest__.py").is_file():
         odoo_volumes[str(connector)] = {"bind": MOUNT + "/odumcp", "mode": "ro"}
     for host_path, container_path in extra_mount_paths:
@@ -1042,7 +1242,9 @@ def _run_odoo_container(
         # auto-reloads assets; any change requires at least a restart.
         command=f"odoo -d {prod_db_name(team, name)}",
     )
-    _copy_file_to_container(container, generated_conf, "/etc/odoo")
+    _copy_file_to_container(
+        container, generated_conf, "/etc/odoo", mode=_CONTAINER_CONF_MODE
+    )
     dep_paths = [(repo_path, "/mnt/extra-addons")] + list(extra_mount_paths or [])
     _, _, setup_logs = _install_repo_dependencies(container, dep_paths)
     # One restart picks up both the copied odoo.conf and pip packages.
@@ -1109,6 +1311,10 @@ def create_production(
             'Production hosting requires routing_mode = "traefik" (custom '
             "domains are routed via Traefik Host rules)."
         )
+    # A registered production owns its database and workspace: report the
+    # name as taken before the leftover check below can mistake them for
+    # debris.
+    production_registry.ensure_name_free(team, name)
     if not domain:
         # In a base-domain team the first production defaults to the zone
         # apex, later ones to <name>.<base_domain>.
@@ -1166,15 +1372,10 @@ def create_production(
         client, settings, odoo_image, container_name=settings.prod_db_container
     )
 
-    # Refuse to clobber leftovers: a previous production's database kept by
-    # delete_production(drop_database=False) must be dealt with explicitly.
-    if _db_exists(client, settings, env_db, container_name=settings.prod_db_container):
-        raise ConflictError(
-            f"Database '{env_db}' already exists in the production cluster "
-            f"(left by a previous production '{name}'). Delete it first "
-            "(delete_production with drop_database=true recreates cleanly) "
-            "or drop it manually."
-        )
+    # Refuse to clobber leftovers: a database or workspace with no registered
+    # production (kept by delete_production(drop_database=False), or left by
+    # a failed create) must be dealt with explicitly.
+    _refuse_leftovers(client, settings, team, name)
     try:
         client.containers.get(container_name)
         raise ConflictError(f"Production '{name}' container already exists.")
@@ -1202,18 +1403,11 @@ def create_production(
         },
     )
 
-    # A workspace kept by delete_production(drop_database=False) holds the old
-    # production's filestore and deploy history; the rollback below must not
-    # destroy what this attempt did not create.
-    workspace_preexisted = os.path.isdir(workspace)
-
+    db_created = False
     promo_notes: list[str] = []
     try:
         ensure_team_network(client, settings, team)
         os.makedirs(workspace, exist_ok=True)
-        # Re-creating a soft-deleted name revives it: drop the tombstone so
-        # the purge sweep never eats the new production's bytes.
-        clear_tombstone(team, name)
 
         # Full clone — commit history is the point for production.
         repo_path = get_repo_path(env_name, team.workspaces_dir)
@@ -1250,11 +1444,35 @@ def create_production(
                 extra_mount_paths.append((wt_path, f"/mnt/extra-addons-{repo_name}"))
                 extra_conf_paths.append(resolve_extra_addons_path(wt_path, repo_name))
 
+        # Pulled before the OduMCP addon is chosen: an unversioned custom tag
+        # is asked for its Odoo version, and a stale local copy of a moving tag
+        # would pick the wrong addon series.
+        image_cleanup.note_image_requested(odoo_image)
+        try:
+            logger.info("Pulling image %s", odoo_image)
+            client.images.pull(odoo_image)
+        except Exception as exc:
+            logger.warning(
+                "Could not pull image %s, using local copy: %s", odoo_image, exc
+            )
+
         from oduflow import production_mcp
 
         mcp_warning = ""
+        mcp_status = "sync_failed"
         try:
-            production_mcp.prepare_addon(settings, team, name, extra_mount_paths)
+            production_mcp.prepare_addon(
+                settings, team, name, extra_mount_paths, odoo_image
+            )
+        except PrerequisiteNotMetError as exc:
+            # Our own explanation (unsupported or undetectable Odoo version,
+            # repository without odumcp) says more than the generic warning.
+            if isinstance(exc, production_mcp.UnsupportedOdooVersion):
+                mcp_status = "unsupported"
+            mcp_warning = (
+                f"Production created, but Odoo MCP tools are unavailable: {exc} "
+                "Production infrastructure tools work."
+            )
         except Exception:
             mcp_warning = (
                 "Production created, but OduMCP addon source preparation failed. "
@@ -1262,6 +1480,9 @@ def create_production(
                 "and retry sync_production_mcp."
             )
 
+        # Set before the statement: a database PG created despite an error
+        # (a lost connection, a timeout) is still this attempt's to drop.
+        db_created = True
         _exec_sql(
             client,
             settings,
@@ -1338,16 +1559,8 @@ def create_production(
             name,
             repo_path,
             extra_conf_paths,
+            odoo_image=odoo_image,
         )
-
-        image_cleanup.note_image_requested(odoo_image)
-        try:
-            logger.info("Pulling image %s", odoo_image)
-            client.images.pull(odoo_image)
-        except Exception as exc:
-            logger.warning(
-                "Could not pull image %s, using local copy: %s", odoo_image, exc
-            )
 
         setup_logs: list[str] = []
         if template_name is None and source_env is None:
@@ -1389,7 +1602,7 @@ def create_production(
                 )
         if mcp_warning:
             production_registry.update_production(
-                team, name, {"mcp": {"status": "sync_failed"}}
+                team, name, {"mcp": {"status": mcp_status}}
             )
             logger.warning("%s: %s", name, mcp_warning)
             promo_notes.append(mcp_warning)
@@ -1422,14 +1635,7 @@ def create_production(
         logger.error(
             "create_production('%s') failed; rolling back partial resources", name
         )
-        _cleanup_partial_production(
-            client,
-            settings,
-            team,
-            name,
-            remove_workspace=not workspace_preexisted,
-        )
-        production_registry.delete_production(team, name)
+        _cleanup_partial_production(client, settings, team, name, db_created=db_created)
         raise
 
     logger.info(
@@ -1488,6 +1694,10 @@ def set_production_odoo_conf(
     case-variant must not bypass the reserved-key refusal. A call that leaves
     the overrides unchanged returns early without touching (or restarting)
     the container. The caller must hold the production's lock.
+
+    ``list_db`` and ``admin_passwd`` are validated as a pair: enabling
+    Odoo's database manager without a real master password is refused (see
+    validate_db_manager_overrides).
     """
     from oduflow.wal_monitor import assert_writable
 
@@ -1532,6 +1742,10 @@ def set_production_odoo_conf(
         conf.update(cleaned)
         for key in unset_list:
             conf.pop(key, None)
+    # Validated on the resulting set, not on this call's keys: list_db and
+    # admin_passwd guard each other, and either can arrive (or be dropped) in
+    # a separate call.
+    validate_db_manager_overrides(team, name, conf)
     notes = (
         [
             f"Removed odoo.conf overrides Oduflow manages and ignores: "
@@ -1570,6 +1784,40 @@ def set_production_odoo_conf(
         "restarted": restarted,
         "notes": notes,
     }
+
+
+def _refresh_odumcp_for_image(
+    settings: Settings,
+    team: TeamSettings,
+    name: str,
+    extra_mount_paths: list[tuple[str, str]],
+    odoo_image: str,
+) -> None:
+    """Point the managed OduMCP checkout at a changed image's Odoo series.
+
+    Only an existing managed checkout is refreshed; adopting a production that
+    never had one stays with sync_production_mcp. Optional like the rest of
+    OduMCP: a failure is recorded on the production (and logged), never fails
+    the reconfiguration.
+    """
+    from oduflow import production_mcp, production_registry
+
+    if not production_mcp.addon_checkout(team, name).exists():
+        return
+    try:
+        production_mcp.prepare_addon(
+            settings, team, name, extra_mount_paths, odoo_image
+        )
+    except Exception as exc:
+        status = (
+            "unsupported"
+            if isinstance(exc, production_mcp.UnsupportedOdooVersion)
+            else "sync_failed"
+        )
+        production_registry.update_production(team, name, {"mcp": {"status": status}})
+        logger.warning(
+            "%s: OduMCP addon not updated for image %s: %s", name, odoo_image, exc
+        )
 
 
 def reconfigure_production(
@@ -1797,15 +2045,6 @@ def reconfigure_production(
         extra_conf_paths.append(resolve_extra_addons_path(wt_path, repo_name))
 
     # --- Prepare everything, then swap the container (minimal downtime). ---
-    env_creds = load_credentials(
-        env_name, team.workspaces_dir, settings.db_user, settings.db_password
-    )
-    generated_conf = _build_prod_odoo_conf(
-        settings, team, name, repo_path, extra_conf_paths
-    )
-    odoo_env, odoo_volumes, labels = _container_spec(
-        settings, team, name, record, env_creds, extra_mount_paths
-    )
     odoo_image_new = record["odoo_image"]
     image_cleanup.note_image_requested(odoo_image_new)
     # Pull only when the image actually changed (or is absent locally) — an
@@ -1839,6 +2078,25 @@ def reconfigure_production(
             chown_recursive(
                 sessions_path, int(uid_str), int(gid_str), client, odoo_image_new
             )
+        _refresh_odumcp_for_image(
+            settings, team, name, extra_mount_paths, odoo_image_new
+        )
+
+    # Built after the addon refresh above: both mount the managed checkout.
+    env_creds = load_credentials(
+        env_name, team.workspaces_dir, settings.db_user, settings.db_password
+    )
+    generated_conf = _build_prod_odoo_conf(
+        settings,
+        team,
+        name,
+        repo_path,
+        extra_conf_paths,
+        odoo_image=odoo_image_new,
+    )
+    odoo_env, odoo_volumes, labels = _container_spec(
+        settings, team, name, record, env_creds, extra_mount_paths
+    )
 
     container = _get_container(client, settings, team, name)
     if container is not None:
@@ -2040,7 +2298,6 @@ def _destroy_leftovers(
     sweep retries instead of orphaning the database silently."""
     env_name = prod_env_name(name)
     env_db = prod_db_name(team, name)
-    workspace = _workspace(team, name)
     warnings: list[str] = []
 
     db_dropped = True
@@ -2068,17 +2325,25 @@ def _destroy_leftovers(
         )
     except Exception as exc:
         warnings.append(f"Failed to drop PG role: {exc}")
-    if os.path.isdir(workspace):
-        extra_dir = os.path.join(workspace, "extra")
-        if os.path.isdir(extra_dir):
-            from oduflow.extra_addons import remove_worktree
-
-            for repo_name in os.listdir(extra_dir):
-                wt_path = os.path.join(extra_dir, repo_name)
-                if os.path.isdir(wt_path):
-                    remove_worktree(team, repo_name, wt_path)
-        shutil.rmtree(workspace, ignore_errors=True)
+    _remove_workspace(team, name)
     return db_dropped, warnings
+
+
+def _remove_workspace(team: TeamSettings, name: str) -> None:
+    """Delete a production workspace, unregistering its extra-addons
+    worktrees from their shared bare clones first."""
+    workspace = _workspace(team, name)
+    if not os.path.isdir(workspace):
+        return
+    extra_dir = os.path.join(workspace, "extra")
+    if os.path.isdir(extra_dir):
+        from oduflow.extra_addons import remove_worktree
+
+        for repo_name in os.listdir(extra_dir):
+            wt_path = os.path.join(extra_dir, repo_name)
+            if os.path.isdir(wt_path):
+                remove_worktree(team, repo_name, wt_path)
+    shutil.rmtree(workspace, ignore_errors=True)
 
 
 def purge_deleted_productions(
@@ -2095,8 +2360,8 @@ def purge_deleted_productions(
 
     ``older_than_hours`` keeps leftovers younger than the cutoff (the reaper
     passes ``[lifecycle] prod_purge_hours``); ``0`` purges immediately (the
-    ``cleanup --purge-deleted-productions`` CLI). A tombstone on a production
-    that is back in the registry is stale (the name was re-created): it is
+    ``cleanup --purge-deleted-productions`` CLI). A tombstone on a registered
+    production is stale (create_production refuses a tombstoned name): it is
     removed and the leftovers are NOT touched. Pass the server's LockManager
     as ``locks`` to skip productions busy with another operation.
 
@@ -2861,6 +3126,9 @@ def list_productions(settings: Settings, team: TeamSettings) -> list[dict[str, A
                 "allow_copy_to_dev_mcp": bool(
                     record.get("allow_copy_to_dev_mcp", True)
                 ),
+                # "ready" / "sync_failed"; empty for records from before
+                # OduMCP provisioning. The dashboard flags "sync_failed".
+                "mcp_status": (record.get("mcp") or {}).get("status", ""),
                 "commit": head,
                 "commit_short": head[:10],
                 "created_at": record.get("created_at", ""),
