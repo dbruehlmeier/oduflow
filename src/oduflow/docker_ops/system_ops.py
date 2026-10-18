@@ -948,10 +948,13 @@ def check_db_quota(
 # target filesystem would be left without breathing room. Deliberately
 # constants, not TOML options — the reserve exists so PostgreSQL never hits
 # 0 bytes free (at which point even deleting environments fails).
-_DISK_MIN_FREE_GB = 5.0  # comfort target that should remain free
+_DISK_MIN_FREE_GB = 5.0  # production floor; comfort target on dev-only hosts
 _DISK_MIN_FREE_PERCENT = 5.0  # relative floor for small disks
 _DISK_RESERVE_CAP_GB = 10.0  # cap on the percent leg (large/dev-machine disks)
-_DISK_RECOVERY_FLOOR_BYTES = 1024**3  # always keep this much when the disk has it
+_DISK_RECOVERY_FLOOR_BYTES = 1024**3  # minimum reserve on dev-only devices
+_DISK_DEV_RESERVE_PERCENT = 1.0  # dev-only devices: relative reserve leg
+_DISK_DEV_RESERVE_CAP_GB = 2.0  # cap on the dev reserve (large dev disks)
+_PGDATA_WAL_BUDGET_BYTES = 1024**3  # WAL + catalogs written during a clone
 _DISK_ESTIMATE_MARGIN = 1.2  # safety multiplier on the write estimate
 _CLONE_BUDGET_BYTES = 512 * 1024**2  # remote git checkout allowance
 _OVERLAY_HEADROOM_BYTES = 512 * 1024**2  # upper/work layer of an overlay
@@ -1037,17 +1040,41 @@ def _reserve_bytes(total: int) -> int:
     return int(max(_DISK_MIN_FREE_GB * 1024**3, percent_leg))
 
 
-def _headroom_bytes(free: int, reserve: int) -> int:
+def _headroom_bytes(total: int, reserve: int, *, prod_shared: bool) -> int:
     """Bytes that must remain free after the estimated write.
 
-    ``reserve`` is the comfort target. A volume that already holds one
-    template often has only a few GiB free; demanding the full target then
-    rejects the first environment even though the copy fits and more than
-    1 GiB would remain. Cap the demand at max(1 GiB, 10% of current free).
+    Devices holding production data keep the full reserve. Dev-only devices
+    relax it to max(1 GiB, min(1% of total, 2 GiB)) — derived from the disk
+    size, never from current free space, so repeated creations face the same
+    threshold instead of ratcheting the remaining space toward zero.
     """
-    if free <= 0:
+    if prod_shared:
         return reserve
-    return min(reserve, max(_DISK_RECOVERY_FLOOR_BYTES, free // 10))
+    percent_leg = min(
+        total * _DISK_DEV_RESERVE_PERCENT / 100, _DISK_DEV_RESERVE_CAP_GB * 1024**3
+    )
+    return min(reserve, int(max(_DISK_RECOVERY_FLOOR_BYTES, percent_leg)))
+
+
+def _prod_shared_devices(client: DockerClient, settings: Settings) -> set[int] | None:
+    """``st_dev`` values of devices holding production data.
+
+    Empty set when production is disabled. ``None`` when production is enabled
+    but the device cannot be determined (volume missing or mountpoint not
+    visible, e.g. Docker Desktop): callers must then assume every checked
+    filesystem may be shared with production.
+    """
+    if not settings.prod_enabled:
+        return set()
+    try:
+        volume = client.volumes.get(settings.prod_db_volume)
+        attrs = volume.attrs if isinstance(volume.attrs, dict) else {}
+        mountpoint = attrs.get("Mountpoint", "")
+        if isinstance(mountpoint, str) and mountpoint and os.path.isdir(mountpoint):
+            return {os.stat(mountpoint).st_dev}
+    except Exception:
+        logger.warning("Could not locate production DB volume device", exc_info=True)
+    return None
 
 
 def _pgdata_usage_via_df(
@@ -1088,13 +1115,16 @@ def check_disk_space(
     """Refuse environment creation when a target filesystem lacks room.
 
     Estimates the bytes each target directory will receive (database
-    tablespace, workspace filestore + checkout), groups targets that share a
-    device via ``st_dev``, and requires ``free - estimate*margin`` to stay
-    above ``min(comfort, max(1 GiB, 10% of current free))``, where comfort is
-    ``max(5 GiB, min(5%, 10 GiB))``. The PGDATA volume (WAL + catalogs live
-    there, not in the tablespace) is held to the same floor.
-    Like ``check_db_quota``, only new creation is gated — delete/cleanup paths
-    stay available so a full disk can always be recovered.
+    tablespace, workspace filestore + checkout, a WAL/catalog budget for the
+    PGDATA volume), groups targets that share a device via ``st_dev``, and
+    requires ``free - estimate*margin`` to stay at or above
+    ``max(5 GiB, min(5% of total, 10 GiB))`` on devices that hold production
+    data (the production DB volume's device; every device when it cannot be
+    determined). Dev-only devices relax this to
+    ``max(1 GiB, min(1% of total, 2 GiB))`` — a function of the disk size, not
+    of current free space. Like ``check_db_quota``, only new creation is
+    gated — delete/cleanup paths stay available so a full disk can always be
+    recovered.
     """
     fs_bytes = (
         _estimate_template_filestore_bytes(settings, team, template_name)
@@ -1125,9 +1155,11 @@ def check_disk_space(
     except Exception:
         logger.warning("Could not inspect shared DB volume", exc_info=True)
     if mountpoint and os.path.isdir(mountpoint):
-        targets.append(("PostgreSQL data (WAL)", mountpoint, 0))
+        targets.append(("PostgreSQL data (WAL)", mountpoint, _PGDATA_WAL_BUDGET_BYTES))
     else:
         pgdata_df = _pgdata_usage_via_df(client, settings)
+
+    prod_devices = _prod_shared_devices(client, settings)
 
     groups: dict[int, dict[str, Any]] = {}
     for label, path, nbytes in targets:
@@ -1146,7 +1178,7 @@ def check_disk_space(
 
     problems: list[str] = []
     checked: list[dict[str, Any]] = []
-    for group in groups.values():
+    for dev, group in groups.items():
         try:
             usage = shutil.disk_usage(group["anchor"])
         except OSError:
@@ -1154,14 +1186,19 @@ def check_disk_space(
             continue
         required = int(group["bytes"] * _DISK_ESTIMATE_MARGIN)
         reserve = _reserve_bytes(usage.total)
-        headroom = _headroom_bytes(usage.free, reserve)
+        headroom = _headroom_bytes(
+            usage.total,
+            reserve,
+            prod_shared=prod_devices is None or dev in prod_devices,
+        )
         checked.append(
             {
                 "anchor": group["anchor"],
                 "components": group["labels"],
                 "free_gb": round(usage.free / 1024**3, 1),
                 "required_gb": round(required / 1024**3, 1),
-                "reserve_gb": round(headroom / 1024**3, 1),
+                "reserve_gb": round(reserve / 1024**3, 1),
+                "headroom_gb": round(headroom / 1024**3, 1),
             }
         )
         if usage.free - required < headroom:
@@ -1173,22 +1210,27 @@ def check_disk_space(
             )
     if pgdata_df is not None:
         total, free = pgdata_df
+        required = int(_PGDATA_WAL_BUDGET_BYTES * _DISK_ESTIMATE_MARGIN)
         reserve = _reserve_bytes(total)
-        headroom = _headroom_bytes(free, reserve)
+        # The in-container device cannot be compared against the production
+        # volume's st_dev, so fall back to the host-wide production flag.
+        headroom = _headroom_bytes(total, reserve, prod_shared=settings.prod_enabled)
         checked.append(
             {
                 "anchor": "PGDATA (in-container)",
                 "components": ["PostgreSQL data (WAL)"],
                 "free_gb": round(free / 1024**3, 1),
-                "required_gb": 0.0,
-                "reserve_gb": round(headroom / 1024**3, 1),
+                "required_gb": round(required / 1024**3, 1),
+                "reserve_gb": round(reserve / 1024**3, 1),
+                "headroom_gb": round(headroom / 1024**3, 1),
             }
         )
-        if free < headroom:
+        if free - required < headroom:
             problems.append(
                 f"PostgreSQL data volume '{settings.shared_db_volume}': "
-                f"{free / 1024**3:.1f} GiB free, {headroom / 1024**3:.1f} GiB "
-                "must stay free"
+                f"{free / 1024**3:.1f} GiB free, creation needs "
+                f"~{required / 1024**3:.1f} GiB of WAL and "
+                f"{headroom / 1024**3:.1f} GiB must stay free"
             )
 
     logger.info(
