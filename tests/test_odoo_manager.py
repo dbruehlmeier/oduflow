@@ -394,6 +394,9 @@ class TestCreateEnvironment:
         mock_odoo.exec_run.return_value = (0, b"OK")
         mock_odoo.wait.return_value = {"StatusCode": 0}
         mock_docker_client.containers.run.return_value = mock_odoo
+        mock_docker_client.containers.create.return_value.wait.return_value = {
+            "StatusCode": 0
+        }
         mock_docker_client.containers.get.side_effect = docker.errors.NotFound("nf")
 
         result = env_ops.create_environment(
@@ -410,10 +413,15 @@ class TestCreateEnvironment:
         assert mock_sql.call_count == 2
         mock_creds.assert_called_once()
         mock_role.assert_called_once()
-        # Greenfield: isolated init container + serving container = 2 run calls.
-        assert mock_docker_client.containers.run.call_count == 2
-        for run_call in mock_docker_client.containers.run.call_args_list:
-            assert run_call.kwargs["extra_hosts"] == {
+        # Greenfield: an isolated init container (created, so it can receive
+        # the generated conf before starting) + the serving container.
+        mock_docker_client.containers.create.assert_called_once()
+        assert mock_docker_client.containers.run.call_count == 1
+        for call in (
+            mock_docker_client.containers.create.call_args,
+            mock_docker_client.containers.run.call_args,
+        ):
+            assert call.kwargs["extra_hosts"] == {
                 "host.docker.internal": "host-gateway"
             }
         mock_alloc.assert_called_once()
@@ -753,6 +761,11 @@ class TestCreateEnvironment:
         mock_odoo.exec_run.return_value = (0, b"OK")
         mock_odoo.wait.return_value = {"StatusCode": 0}
         mock_docker_client.containers.run.return_value = mock_odoo
+        init_container = mock_docker_client.containers.create.return_value
+        init_container.wait.return_value = {"StatusCode": 0}
+        events = MagicMock()
+        events.attach_mock(mock_copy_conf, "copy")
+        events.attach_mock(init_container.start, "start")
         mock_docker_client.containers.get.side_effect = docker.errors.NotFound("nf")
 
         result = env_ops.create_environment(
@@ -771,16 +784,89 @@ class TestCreateEnvironment:
         assert "TEMPLATE" not in create_db_call[0][2]
         # Should NOT mount filestore
         mock_mount.assert_not_called()
-        # Greenfield init runs `-i base` in a SEPARATE isolated container
-        # (the FIRST containers.run), before the serving container — so the
-        # serving PID1 never races it. containers.run is called twice.
-        assert mock_docker_client.containers.run.call_count == 2
-        init_run = mock_docker_client.containers.run.call_args_list[0]
+        # Greenfield init runs `-i base` in a SEPARATE isolated container,
+        # before the serving container — so the serving PID1 never races it.
+        init_run = mock_docker_client.containers.create.call_args
         assert "-i base" in init_run.kwargs["command"]
         assert "--stop-after-init" in init_run.kwargs["command"]
         assert init_run.kwargs["extra_hosts"] == {
             "host.docker.internal": "host-gateway"
         }
+        # The init reads the generated conf (repo .oduflow/odoo.conf, demo
+        # data settings included), copied in before the container starts.
+        conf = "/tmp/flow-test/workspaces/feature-no-tpl/odoo.conf"
+        assert events.mock_calls[:2] == [
+            mock_call.copy(
+                init_container, conf, "/etc/odoo", archive_name="odoo.conf", mode=0o644
+            ),
+            mock_call.start(),
+        ]
+        assert mock_docker_client.containers.run.call_count == 1
+
+    @patch("oduflow.docker_ops.env_ops._rollback_partial_environment")
+    @patch(
+        "oduflow.extra_addons.generate_odoo_conf",
+        return_value="/tmp/flow-test/workspaces/feature-no-tpl/odoo.conf",
+    )
+    @patch("oduflow.docker_ops.env_ops._copy_file_to_container")
+    @patch("oduflow.docker_ops.env_ops._create_pg_role")
+    @patch(
+        "oduflow.docker_ops.env_ops.create_credentials",
+        return_value={"pg_user": "u_1_feature-no-tpl", "pg_password": "test-pw"},
+    )
+    @patch("oduflow.docker_ops.env_ops._ensure_system_ready")
+    @patch("oduflow.docker_ops.env_ops.get_odoo_uid_gid", return_value="100:101")
+    @patch("oduflow.docker_ops.env_ops._exec_sql")
+    @patch("oduflow.docker_ops.env_ops._db_exists", return_value=False)
+    @patch("oduflow.docker_ops.env_ops._mount_filestore")
+    @patch("oduflow.docker_ops.env_ops._get_used_ports", return_value=set())
+    @patch("oduflow.docker_ops.env_ops.allocate_port", return_value=50001)
+    @patch("oduflow.docker_ops.env_ops.subprocess.run")
+    @patch("oduflow.docker_ops.env_ops.os.chmod")
+    @patch("oduflow.docker_ops.env_ops.os.makedirs")
+    @patch("oduflow.docker_ops.env_ops.os.path.exists", return_value=False)
+    def test_create_no_template_failed_init_rolls_back(
+        self,
+        mock_exists,
+        mock_makedirs,
+        mock_chmod,
+        mock_run,
+        mock_alloc,
+        mock_used,
+        mock_mount,
+        mock_db_exists,
+        mock_sql,
+        mock_uid_gid,
+        mock_ready,
+        mock_creds,
+        mock_role,
+        mock_copy_conf,
+        mock_gen_conf,
+        mock_rollback,
+        mock_docker_client,
+    ):
+        # A non-zero `-i base` exit (e.g. a bad repo .oduflow/odoo.conf) leaves
+        # an empty/partial database: creation must fail and roll back, not
+        # start the serving container and report the environment created.
+        init_container = mock_docker_client.containers.create.return_value
+        init_container.wait.return_value = {"StatusCode": 2}
+        init_container.logs.return_value = b"odoo: unrecognized option"
+        mock_docker_client.containers.get.side_effect = docker.errors.NotFound("nf")
+
+        with pytest.raises(ExternalCommandError, match="-i base"):
+            env_ops.create_environment(
+                TEST_SETTINGS,
+                TEST_TEAM,
+                "feature/no-tpl",
+                "https://github.com/org/repo.git",
+                "odoo:15.0",
+                template_name=None,
+            )
+
+        # The DB, role, port and workspace already exist at this point.
+        mock_rollback.assert_called_once()
+        # The serving container must never start on the broken database.
+        mock_docker_client.containers.run.assert_not_called()
 
     @patch(
         "oduflow.extra_addons.generate_odoo_conf",
@@ -827,6 +913,8 @@ class TestCreateEnvironment:
         mock_odoo.exec_run.return_value = (0, b"OK")
         mock_odoo.wait.return_value = {"StatusCode": 0}
         mock_docker_client.containers.run.return_value = mock_odoo
+        init_container = mock_docker_client.containers.create.return_value
+        init_container.wait.return_value = {"StatusCode": 0}
         mock_docker_client.containers.get.side_effect = docker.errors.NotFound("nf")
 
         local_dir = str(tmp_path)
@@ -1694,6 +1782,8 @@ class TestCreateEnvironmentEnvVars:
         mock_odoo = MagicMock()
         mock_odoo.exec_run.return_value = (0, b"OK")
         mock_docker_client.containers.run.return_value = mock_odoo
+        init_container = mock_docker_client.containers.create.return_value
+        init_container.wait.return_value = {"StatusCode": 0}
         mock_docker_client.containers.get.side_effect = docker.errors.NotFound("nf")
 
         env_ops.create_environment(
@@ -1928,13 +2018,15 @@ class TestUpdateEnvironment:
                 TEST_SETTINGS, TEST_TEAM, "main", pull_image=False, **kwargs
             )
 
+    # A bare team domain has no prefix to replace: qa nests under it.
+    @pytest.mark.parametrize("team_hostname", ["dev.example.com", "example.com"])
     @pytest.mark.parametrize("old_hostname", ["", "dev1", "previous"])
     def test_update_hostname_routes_and_registry(
-        self, mock_docker_client, tmp_path, old_hostname
+        self, mock_docker_client, tmp_path, old_hostname, team_hostname
     ):
         from oduflow.hostname_registry import allocate_hostname, get_hostname
 
-        team = dataclasses.replace(TEST_TEAM, hostname="dev.example.com")
+        team = dataclasses.replace(TEST_TEAM, hostname=team_hostname)
         settings = dataclasses.replace(
             TEST_SETTINGS, routing_mode="traefik", teams={"1": team}
         )
