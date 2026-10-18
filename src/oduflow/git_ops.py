@@ -875,23 +875,30 @@ def current_branch(repo_path: str) -> str:
     plain directory nested inside some other repository) reports ``""``
     instead of the enclosing repository's branch.
     """
-    toplevel = subprocess.run(
-        ["git", "-C", repo_path, "rev-parse", "--show-toplevel"],
-        capture_output=True,
-        text=True,
-        env=_GIT_BASE_ENV,
-    )
-    if toplevel.returncode != 0 or os.path.realpath(
-        toplevel.stdout.strip()
-    ) != os.path.realpath(repo_path):
-        return ""
+    # rev-parse prints the toplevel and the abbreviated HEAD in argument
+    # order, so one call answers both questions.
     result = subprocess.run(
-        ["git", "-C", repo_path, "rev-parse", "--abbrev-ref", "HEAD"],
+        [
+            "git",
+            "-C",
+            repo_path,
+            "rev-parse",
+            "--show-toplevel",
+            "--abbrev-ref",
+            "HEAD",
+        ],
         capture_output=True,
         text=True,
         env=_GIT_BASE_ENV,
     )
-    return result.stdout.strip() if result.returncode == 0 else ""
+    lines = result.stdout.splitlines()
+    if (
+        result.returncode != 0
+        or len(lines) != 2
+        or os.path.realpath(lines[0]) != os.path.realpath(repo_path)
+    ):
+        return ""
+    return lines[1]
 
 
 def is_git_repository(repo_path: str) -> bool:

@@ -2072,7 +2072,13 @@ def reconfigure_production(
         remove_worktree,
         resolve_extra_addons_path,
     )
-    from oduflow.git_ops import checkout_branch, current_branch, fetch_branch, rev_parse
+    from oduflow.git_ops import (
+        checkout_branch,
+        current_branch,
+        fetch_branch,
+        is_git_repository,
+        rev_parse,
+    )
 
     record = production_registry.get_production(team, name)
     start_time = time.time()
@@ -2147,9 +2153,9 @@ def reconfigure_production(
         }
 
     # No-op only when the request changes nothing AND actual state matches
-    # the record; a missing container or checkout (a previous run failed
-    # mid-way) or stale routing labels are drift that the run below repairs
-    # from the record.
+    # the record; a missing container, a missing or corrupt checkout (a
+    # previous run failed mid-way) or stale routing labels are drift that
+    # the run below repairs from the record.
     container = _get_container(client, settings, team, name)
     # A rotated team secret keeps its reference, so only the values the
     # container runs with reveal it; recreating applies the new value.
@@ -2176,13 +2182,14 @@ def reconfigure_production(
     # deploying the old branch forever if this call early-returned as a no-op.
     # "branch" not in updates covers both an explicit no-change value and a
     # retry whose intent the registry already holds.
-    target_branch = updates.get("branch", record.get("branch", ""))
+    target_branch = record.get("branch", "")
     label_branch = (
         (container.labels or {}).get("oduflow.git_branch", "")
         if container is not None
         else ""
     )
-    checked_out = current_branch(repo_path) if os.path.isdir(repo_path) else ""
+    repo_ok = is_git_repository(repo_path)
+    checked_out = current_branch(repo_path) if repo_ok else ""
     branch_drift = (
         "branch" not in updates
         and bool(target_branch)
@@ -2194,7 +2201,7 @@ def reconfigure_production(
     drift = (
         force_recreate
         or container is None
-        or not os.path.isdir(repo_path)
+        or not repo_ok
         or routing_drift(settings, team, name, record, container.labels or {})
         or bool(secret_drift)
         or branch_drift
@@ -2233,8 +2240,10 @@ def reconfigure_production(
 
     # --- Converge the workspace (repo checkout + extra addon worktrees). ---
     staged_clone_path: str | None = None
-    if "repo_url" in updates or "git_user" in updates or not os.path.isdir(repo_path):
-        # A changed remote (or credential identity) invalidates the clone.
+    if "repo_url" in updates or "git_user" in updates or not repo_ok:
+        # A changed remote (or credential identity) invalidates the clone, and
+        # a missing or corrupt checkout (not a Git working tree) cannot be
+        # fetched into — re-clone instead of handing git a broken tree.
         # Clone beside the live checkout — the running container bind-mounts
         # repo_path, so the old tree must keep serving until the container
         # swap below; the directories are switched inside that window.
@@ -2250,7 +2259,11 @@ def reconfigure_production(
             depth=0,
             timeout=300,
         )
-    elif "branch" in updates or branch_drift:
+    elif "branch" in updates or (branch_drift and checked_out != target_branch):
+        # Label-only drift (the checkout already sits on the record's branch)
+        # is repaired by the container recreate below; fetch+checkout here
+        # would silently move the production to the origin tip — a deploy
+        # nobody asked for.
         fetch_branch(repo_path, record["branch"], team.git_credentials_file())
         checkout_branch(repo_path, record["branch"])
 
@@ -2371,7 +2384,13 @@ def reconfigure_production(
         new_head = rev_parse(repo_path)
     except Exception:
         pass
-    code_changed = bool({"branch", "repo_url", "extra_addons"} & set(updates))
+    # A drift repair that moved the checkout changed the running code just as
+    # an explicit branch change does: it must land in the deploy ledger (the
+    # rollback target) and trigger the module-upgrade note below. An unknown
+    # head ("") proves nothing moved, so it never counts on its own.
+    code_changed = bool({"branch", "repo_url", "extra_addons"} & set(updates)) or (
+        bool(old_head) and bool(new_head) and old_head != new_head
+    )
     if code_changed:
         append_deploy(
             team,
