@@ -1278,6 +1278,13 @@ def _patch_reconfigure_stack(client):
             "oduflow.git_ops.checkout_branch", return_value=("a", "b", [])
         ),
         "rev_parse": patch("oduflow.git_ops.rev_parse", return_value="cafebabe" * 5),
+        # The empty directory _seed_prod_record creates stands in for a
+        # healthy checkout.
+        "is_git_repository": patch(
+            "oduflow.git_ops.is_git_repository", return_value=True
+        ),
+        # "" = unknown (what a real empty test checkout reports): never drift.
+        "current_branch": patch("oduflow.git_ops.current_branch", return_value=""),
         "_clone_repo": patch(
             "oduflow.docker_ops.env_ops._clone_repo", side_effect=fake_clone
         ),
@@ -1442,6 +1449,131 @@ class TestReconfigureProduction:
             result = production_ops.reconfigure_production(settings, team, "erp")
         assert "No settings changed" in result["message"]
         client.containers.run.assert_not_called()
+
+    def test_stale_branch_label_is_drift_and_repaired(self, settings, team):
+        # An earlier reconfigure(branch=...) updated the registry, then died
+        # before converging: the container still runs (and deploys would still
+        # pull) the old branch. A retry that changes nothing must re-checkout
+        # the record's branch and recreate the container, not early-return.
+        _seed_prod_record(team, branch="hotfix")
+        client = self._client_with_container(settings, team)
+        client.containers.get.return_value.labels["oduflow.git_branch"] = "production"
+        with _PatchAll(_patch_reconfigure_stack(client)) as mocks:
+            result = production_ops.reconfigure_production(settings, team, "erp")
+        assert result["changed"] == []
+        assert any("drifted" in note for note in result["notes"])
+        client.containers.run.assert_called_once()
+        assert (
+            client.containers.run.call_args.kwargs["labels"]["oduflow.git_branch"]
+            == "hotfix"
+        )
+        mocks["fetch_branch"].assert_called_once()
+        assert mocks["fetch_branch"].call_args.args[1] == "hotfix"
+        mocks["checkout_branch"].assert_called_once()
+        assert mocks["checkout_branch"].call_args.args[1] == "hotfix"
+
+    def test_matching_branch_label_stays_a_noop(self, settings, team):
+        _seed_prod_record(team)
+        client = self._client_with_container(settings, team)
+        client.containers.get.return_value.labels["oduflow.git_branch"] = "production"
+        with _PatchAll(_patch_reconfigure_stack(client)) as mocks:
+            result = production_ops.reconfigure_production(settings, team, "erp")
+        assert "No settings changed" in result["message"]
+        client.containers.run.assert_not_called()
+        mocks["fetch_branch"].assert_not_called()
+
+    def test_checkout_on_wrong_branch_is_drift_and_repaired(self, settings, team):
+        # The label can be right while the checkout is not (the container was
+        # already recreated, the checkout switch was not reached): the checkout
+        # itself is the second drift signal.
+        _seed_prod_record(team, branch="hotfix")
+        client = self._client_with_container(settings, team)
+        client.containers.get.return_value.labels["oduflow.git_branch"] = "hotfix"
+        patches = _patch_reconfigure_stack(client)
+        patches["current_branch"] = patch(
+            "oduflow.git_ops.current_branch", return_value="production"
+        )
+        with _PatchAll(patches) as mocks:
+            result = production_ops.reconfigure_production(settings, team, "erp")
+        assert any("drifted" in note for note in result["notes"])
+        client.containers.run.assert_called_once()
+        mocks["checkout_branch"].assert_called_once()
+        assert mocks["checkout_branch"].call_args.args[1] == "hotfix"
+
+    def test_branch_drift_repair_lands_in_the_deploy_ledger(self, settings, team):
+        # The repair moves the checkout (and thus the running code) exactly
+        # like an explicit branch change: without a ledger entry there is no
+        # rollback target and no module-upgrade warning.
+        _seed_prod_record(team, branch="hotfix")
+        client = self._client_with_container(settings, team)
+        client.containers.get.return_value.labels["oduflow.git_branch"] = "production"
+        patches = _patch_reconfigure_stack(client)
+        heads = iter(["a1" * 20, "b2" * 20])
+        patches["rev_parse"] = patch(
+            "oduflow.git_ops.rev_parse", side_effect=lambda *a, **kw: next(heads)
+        )
+        with _PatchAll(patches):
+            result = production_ops.reconfigure_production(settings, team, "erp")
+        assert result["changed"] == []
+        deploys = production_ops.read_deploys(team, "erp")
+        assert len(deploys) == 1
+        assert deploys[0]["trigger"] == "reconfigure"
+        assert deploys[0]["from_commit"] == "a1" * 20
+        assert deploys[0]["to_commit"] == "b2" * 20
+        assert any("update_production" in note for note in result["notes"])
+
+    def test_label_only_drift_does_not_move_the_checkout(self, settings, team):
+        # The checkout already sits on the record's branch; only the container
+        # label is stale. The repair must recreate the container without
+        # fetching — a fetch+checkout would silently deploy the origin tip.
+        _seed_prod_record(team, branch="hotfix")
+        client = self._client_with_container(settings, team)
+        client.containers.get.return_value.labels["oduflow.git_branch"] = "production"
+        patches = _patch_reconfigure_stack(client)
+        patches["current_branch"] = patch(
+            "oduflow.git_ops.current_branch", return_value="hotfix"
+        )
+        with _PatchAll(patches) as mocks:
+            result = production_ops.reconfigure_production(settings, team, "erp")
+        assert any("drifted" in note for note in result["notes"])
+        client.containers.run.assert_called_once()
+        mocks["fetch_branch"].assert_not_called()
+        mocks["checkout_branch"].assert_not_called()
+        assert production_ops.read_deploys(team, "erp") == []
+
+    def test_corrupt_checkout_is_drift_and_recloned(self, settings, team):
+        # The directory exists but is not a Git working tree (a lost .git):
+        # fetching into it would crash with a raw git error, so the repair
+        # must take the staged re-clone path instead.
+        _seed_prod_record(team)
+        client = self._client_with_container(settings, team)
+        client.containers.get.return_value.labels["oduflow.git_branch"] = "production"
+        patches = _patch_reconfigure_stack(client)
+        patches["is_git_repository"] = patch(
+            "oduflow.git_ops.is_git_repository", return_value=False
+        )
+        with _PatchAll(patches) as mocks:
+            result = production_ops.reconfigure_production(settings, team, "erp")
+        assert any("drifted" in note for note in result["notes"])
+        client.containers.run.assert_called_once()
+        mocks["_clone_repo"].assert_called_once()
+        assert mocks["_clone_repo"].call_args[0][2].endswith("repo.new")
+        mocks["fetch_branch"].assert_not_called()
+
+    def test_explicit_branch_change_needs_no_drift_signal(self, settings, team):
+        # The explicit path must not double-trigger via branch_drift (the
+        # label still shows the old branch): "branch" in updates wins.
+        _seed_prod_record(team)
+        client = self._client_with_container(settings, team)
+        client.containers.get.return_value.labels["oduflow.git_branch"] = "production"
+        with _PatchAll(_patch_reconfigure_stack(client)) as mocks:
+            result = production_ops.reconfigure_production(
+                settings, team, "erp", branch="hotfix"
+            )
+        assert result["changed"] == ["branch"]
+        mocks["checkout_branch"].assert_called_once()
+        assert mocks["checkout_branch"].call_args.args[1] == "hotfix"
+        assert not any("drifted" in note for note in result["notes"])
 
     def test_requested_recreate_is_reported(self, settings, team):
         _seed_prod_record(team)
