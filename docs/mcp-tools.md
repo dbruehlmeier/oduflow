@@ -39,6 +39,7 @@ end to end.
 
     [`create_environment`](#create_environment)&nbsp;·
     [`delete_environment`](#delete_environment)&nbsp;·
+    [`recreate_environment`](#recreate_environment)&nbsp;·
     [`list_environments`](#list_environments)&nbsp;·
     [`get_environment_info`](#get_environment_info)&nbsp;·
     [`start_environment`](#start_environment)&nbsp;·
@@ -285,7 +286,7 @@ are in use. Move it with [`switch_branch`](#switch_branch), pass a different
 :   *str · default empty* — Comma- or newline-separated `KEY=VALUE` pairs injected into the container. Commas inside values are preserved unless what follows looks like another `KEY=`; put one pair per line when in doubt. Merged per key over the template's own values, with these winning. A value `secret:<name>` references a [team secret](#list_secrets).
 
 `hostname`
-:   *str · default empty* — Short Traefik hostname (e.g. `"qa"` → `qa.example.com`). Replaces the team prefix in either hostname mode.
+:   *str · default empty* — Short Traefik hostname (e.g. `"qa"` → `qa.example.com`). Replaces the team prefix in either hostname mode; a bare team domain (`example.com`) has no prefix, so the name goes under it — again `qa.example.com`.
 
 `from_production`
 :   *str · default empty* — Build this environment from a production's real data (database + filestore + repo/image/extra addons). Mutually exclusive with `template_name` and `local_path`. The copy goes through one managed `prod-<name>` template, published on first use and reused afterwards.
@@ -326,6 +327,31 @@ Lock: environment.
 
 - A branch is merged and its environment is no longer needed.
 - You need to free an environment slot and no existing environment is worth keeping (otherwise prefer [`switch_branch`](#switch_branch)).
+- The environment itself is being replaced, not retired — then use [`recreate_environment`](#recreate_environment) instead, so its share link and MCP token survive.
+
+### `recreate_environment`
+
+Tear an environment down and provision it again from its recorded
+configuration (git branch, repo URL, image, template, extra addons, env vars,
+hostname) — a clean slate without re-entering anything.
+
+Unlike `delete_environment` + `create_environment`, the environment's identity
+survives: the dashboard **share link** already handed out stays valid, and the
+scoped `/mcp/<env>` endpoint keeps the **same Bearer token**, so connected MCP
+clients need no reconfiguration.
+
+Lock: environment.
+{ .odu-tool-meta }
+
+**Parameters**
+
+`env_name`
+:   *str · required* — The environment to tear down and provision again.
+
+**Use it when**
+
+- A database or filestore is beyond repair and you want a fresh start from the same template/branch.
+- The environment is shared with a client or wired into MCP clients — never delete + create it by hand in that case.
 
 ### `list_environments`
 
@@ -2517,7 +2543,7 @@ Lock: production.
 :   *str · default empty* — Dev environment to **promote**: its database and filestore are copied (Odoo briefly stopped for a consistent copy, then restarted — the environment is not reset), and empty `repo_url` / `branch` / `odoo_image` / `git_user` / `extra_addons` default to the environment's own. **No sanitization** — the data goes *into* production.
 
 `env_vars`
-:   *dict · default none* — User environment variables; values may be `secret:<name>` references. Omit to inherit the source environment's variables; pass `{}` to inherit none. Managed `HOST`/`PORT`/`USER`/`PASSWORD` cannot be overridden. References survive reconfiguration.
+:   *dict · default none* — User environment variables; values may be `secret:<name>` references. Omit to inherit the source environment's variables; pass `{}` to inherit none. Managed `HOST`/`PORT`/`USER`/`PASSWORD` cannot be overridden. `HOME`, `PYTHONHOME`, `PYTHONUSERBASE`, `PYTHONNOUSERSITE` and a `PYTHONPATH` that lists a `site-packages` directory are refused: they hide the installed pip packages or move data out of the mounts. References survive reconfiguration.
 
 `server_mode`
 :   *str · default `workers`* — How Odoo serves HTTP. `workers` (sync): worker processes on port 8069 serve the pages and Traefik sends only the live bus (`/websocket`, `/longpolling`) to the gevent port 8072. `gevent` (async): Traefik sends **all** traffic to the single gevent process on 8072 — suits many long-lived or I/O-bound requests, but one CPU-heavy request slows everyone. Crons run in both modes. See [Server mode](production.md#server-mode).
@@ -2583,7 +2609,9 @@ Read a production's Odoo container logs.
 
 ### `start_production`
 
-Start a stopped production.
+Start a stopped production. On a production flagged `unhealthy`, it waits for
+the health check (`[production] health_timeout`) and clears the flag once
+Odoo answers.
 
 Lock: production.
 { .odu-tool-meta }
@@ -2618,7 +2646,9 @@ Lock: production. **Takes the production offline.**
 ### `restart_production`
 
 Restart a production's Odoo container — brief downtime. A container whose
-Traefik routing is outdated is recreated instead (same downtime).
+Traefik routing is outdated is recreated instead (same downtime). On a
+production flagged `unhealthy`, it waits for the health check and clears the
+flag once Odoo answers; the reply warns when it still does not.
 
 Lock: production.
 { .odu-tool-meta }
@@ -2678,7 +2708,7 @@ Lock: production.
 :   *dict · default none* — New **full set** of extra addon repos `{repo_name: branch}`. Pass `{}` to remove all; omit to leave unchanged.
 
 `env_vars`
-:   *dict · default none* — **Full replacement** user environment variables, including `secret:<name>` references. Omit to preserve; `{}` clears them.
+:   *dict · default none* — **Full replacement** user environment variables, including `secret:<name>` references. Omit to preserve; `{}` clears them. A changed set may not contain `HOME`, `PYTHONHOME`, `PYTHONUSERBASE`, `PYTHONNOUSERSITE` or a `PYTHONPATH` that lists a `site-packages` directory.
 
 `server_mode`
 :   *str · default empty* — `workers` (sync: pages on 8069, bus on 8072) or `gevent` (async: everything on 8072). Re-tunes the `odoo.conf` workers and re-points Traefik. Omit to leave unchanged.
@@ -2785,6 +2815,11 @@ are classified automatically). Note that in production a "refresh"-class change
 (XML/JS) still restarts the container, because there is no `--dev=xml` in
 production.
 
+A large upgrade can outlast the client's request timeout; the deploy still
+finishes on the server. A failed deploy records the failed step, the Odoo
+error with its traceback, and the output tail in
+[`production_deploys`](#production_deploys).
+
 Lock: production.
 { .odu-tool-meta }
 
@@ -2864,6 +2899,12 @@ Lock: production.
 Deploy history, newest last: commits, actions, modules, status
 (`success` / `rolled_back` / `rollback_failed` / `skipped`) and errors.
 
+A failed deploy also records `failed_step` (`dependencies` / `install` /
+`upgrade` / `health` / `exception`) and `failure_excerpt`: the Odoo error
+record with its traceback. Exit code 255 from `install`/`upgrade` means Odoo
+could not load or upgrade the registry; the excerpt says why. See
+[Diagnosing a failed deploy](production.md#diagnosing-a-failed-deploy).
+
 **Parameters**
 
 `name`
@@ -2872,9 +2913,14 @@ Deploy history, newest last: commits, actions, modules, status
 `limit`
 :   *int · default `20`* — Maximum number of records.
 
+`include_output`
+:   *bool · default `False`* — Also return `output_tail`: the last 200 lines of the failed step's output, or of the server log for a failed health check.
+
 **Use it when**
 
 - Correlating "it broke on Tuesday" with what was deployed.
+- Finding out why an `update_production` failed after the client timed out
+  before the response arrived.
 - Finding the commit to pass to [`rollback_production`](#rollback_production).
 - Auditing whether an auto-update deploy silently rolled back.
 

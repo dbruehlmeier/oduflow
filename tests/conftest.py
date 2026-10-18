@@ -36,6 +36,16 @@ def _server_lock_per_test(monkeypatch):
         os.close(instance_lock._fd)
 
 
+@pytest.fixture(autouse=True)
+def _no_label_scan(monkeypatch):
+    """resolve_token's legacy-label fallback scans Docker on a registry miss;
+    unit tests must stay Docker-free (and deterministic on a machine running a
+    live server). Tests of the fallback itself re-patch _scan_labels."""
+    from oduflow import env_tokens
+
+    monkeypatch.setattr(env_tokens, "_scan_labels", lambda settings: {})
+
+
 def _test_settings(tmp_dir: str) -> tuple[Settings, TeamSettings]:
     """Settings whose Docker resources cannot reach a developer's own server.
 
@@ -67,6 +77,9 @@ def _test_settings(tmp_dir: str) -> tuple[Settings, TeamSettings]:
         prod_db_container=f"{_TEST_PROD_DB_CONTAINER}-{suffix}",
         prod_db_volume=f"{_TEST_PROD_DB_VOLUME}-{suffix}",
         managed_label=f"{_TEST_PREFIX}{suffix}.managed",
+        # Generated sync cron jobs `docker exec` into this container: never the
+        # developer's own Oduflow.
+        template_cron_container=f"{_TEST_PREFIX}{suffix}-cron",
         base_data_dir=tmp_dir,
         teams={"1": team},
     )

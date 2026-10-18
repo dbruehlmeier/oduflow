@@ -387,6 +387,13 @@ class Settings:
     # Storage
     base_data_dir: str = ""
     overlay_threshold_mb: int = 50
+    # System cron owns synchronization processes. In Docker mount this host
+    # directory and set cron_container to the existing Oduflow container name.
+    template_cron_dir: str = "/etc/cron.d"
+    # Empty: the user running Oduflow natively (the only one allowed), or root
+    # as the host user that runs `docker exec` (template_sync._cron_user).
+    template_cron_user: str = ""
+    template_cron_container: str = ""
 
     # Coding agent — deployment-wide bits only; enabling the agent and its
     # credentials are per team (TeamSettings.agent_*). When enabled for a team,
@@ -435,6 +442,10 @@ class Settings:
     prod_db_volume: str = "oduflow-prod-db-data"
     prod_walg_version: str = ""  # empty = version pinned in walg.py
     prod_workers_cap: int = 8  # upper bound for auto-tuned Odoo workers
+    # Seconds a production gets to become healthy after a deploy, rollback,
+    # reconfigure, restore, Stack apply or recovery start/restart. Workers-mode productions with many modules
+    # can take several minutes to start serving.
+    prod_health_timeout: int = 180
     # [production.wal]: cluster-wide disk protection, independent of backups.
     wal_upload_timeout: int = 120
     wal_warn_after: int = 120
@@ -858,6 +869,8 @@ class Settings:
 
         if self.prod_workers_cap < 1:
             raise ValueError("[production] workers_cap must be >= 1")
+        if self.prod_health_timeout < 1:
+            raise ValueError("[production] health_timeout must be >= 1")
 
         if self.backup is not None:
             b = self.backup
@@ -903,6 +916,7 @@ class Settings:
             "agent",
             "production",
             "backup",
+            "template_sync",
             "team",
             "route",
         ):
@@ -1143,6 +1157,13 @@ class Settings:
             postgres_image_explicit="image" in database,
             base_data_dir=base_data_dir,
             overlay_threshold_mb=int(storage.get("overlay_threshold_mb", 50)),
+            template_cron_dir=str(
+                raw.get("template_sync", {}).get("cron_dir", "/etc/cron.d")
+            ),
+            template_cron_user=str(raw.get("template_sync", {}).get("cron_user", "")),
+            template_cron_container=str(
+                raw.get("template_sync", {}).get("cron_container", "")
+            ),
             agent_image=_normalize_agent_image(agent.get("image")),
             agent_claude_model=str(agent.get("claude_model", "")).strip(),
             agent_codex_model=str(agent.get("codex_model", "")).strip(),
@@ -1160,6 +1181,7 @@ class Settings:
             ),
             prod_walg_version=str(production.get("walg_version", "")).strip(),
             prod_workers_cap=int(production.get("workers_cap", 8)),
+            prod_health_timeout=int(production.get("health_timeout", 180)),
             wal_upload_timeout=int(wal_values["wal_upload_timeout"]),
             wal_warn_after=int(wal_values["wal_warn_after"]),
             wal_stall_after=int(wal_values["wal_stall_after"]),

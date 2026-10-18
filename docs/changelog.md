@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Features
+
+- **Template Refresh in the dashboard** — reload a template from its own
+  dump files and report overlay remount errors.
+- **Cron-owned SSH template sync** — manage source/schedule/logs from
+  Templates; manual requests are queued for host cron. Optional environment
+  data refresh prepares and sanitizes new data before switching, retains old
+  filestore generations for environments that stay behind, and rolls back
+  caught switch failures. CLI/UI/MCP mutations share process-safe file locks.
+
 ### Security
 
 - **Environments are isolated inside the team's coding-agent container** —
@@ -20,6 +30,20 @@
   See decision record
   [0079](https://github.com/oduflow/oduflow/blob/main/specs/0079-per-environment-agent-identities.md).
 
+### Features
+
+- **Extra repo branches are filled in from the Odoo image** — the **Create
+  Environment** dialog and a template's **Settings** fill each extra repo's
+  branch from the Odoo image (`odoo:19.0` → `19.0`) wherever the repo carries
+  that branch, so per-version repos such as the OCA sets or enterprise no
+  longer have to be typed out. An online-release image (`odoo:saas~19.1`) only
+  gets its own `saas-19.1`. Branches from a template, a production or your own
+  typing are never replaced, a field you cleared stays empty, and each selected
+  repo with a filled-in branch is marked **guessed** and counted under the list.
+  The image field now also follows a template switch when a template filled it,
+  so the new template's database no longer runs on the previous template's
+  Odoo. (#337)
+
 ### Fixes
 
 - **Environment creation on development-only hosts with limited disk space** —
@@ -32,6 +56,54 @@
   production on a separate disk keeps the relaxed policy on its dev disk. The
   shared PostgreSQL data volume additionally budgets 1 GiB of WAL/catalog
   writes per creation; write estimates still include the 20% safety margin.
+- **Failed production deploys explain themselves** — a failed
+  `update_production` used to record only `Deploy failed (exit_code=255)`.
+  The Odoo output that held the cause reached only the response, which a
+  client that timed out on a long upgrade never received. The deploy record
+  in `production_deploys` now names the step that failed (`dependencies`,
+  `install`, `upgrade`, `health` or `exception`), keeps the reinstall's own
+  exit code, and stores the Odoo error record with its traceback
+  (`failure_excerpt`) and the last 200 lines of the step's output
+  (`output_tail`, returned with `include_output=true`). For a failed health
+  check, that is the server log. The deploy's error line ends with the cause,
+  for example `Cause: psycopg2.errors.SerializationFailure: …`, and the
+  server log gets the excerpt. The production docs now describe the
+  environment the upgrade runs in and what the exit codes mean.
+- **Oversized command output keeps its end** — an output over the 10 MB
+  output cache limit kept only its start, which can drop the traceback that
+  Odoo prints last. The cache now keeps the first 1 MB and the end.
+- **Production health waits stop on a crash loop** — a container that Docker
+  restarts twice while Oduflow waits for health now fails the wait at once.
+  Before, `reconfigure_production` and deploy verification kept the
+  production's lock for the full 180 s, so a broken setting could not be
+  reverted during that time.
+- **Auto deploys skip uninstalled modules** — an extra-addons repo bundles
+  many modules of which only a few are installed, and a fast-forward that
+  touched the others failed the whole `update_production` (or
+  `pull_environment`) with "not installed and cannot be upgraded". Auto mode
+  now drops the changes of uninstalled modules with a warning and classifies
+  the rest again, so a JS or view change in an installed module still reloads
+  and a changed `.py`, including one outside any module, still restarts. A
+  module the database already has is upgraded even when it looks new (moved
+  between directories or repos), and a production never auto-installs new
+  modules. Explicit `install=`/`upgrade=` requests keep the strict error.
+- **Configurable production health wait** — the new `[production]
+  health_timeout` (default 180 s) sets how long every production health wait
+  lasts: deploy verification, the rollback restart (was 120 s), reconfigure,
+  restore and Stack apply. Workers-mode productions with many modules can take
+  minutes to start serving.
+- **Starting a production clears a stale unhealthy flag** —
+  `start_production` and `restart_production` on a production flagged
+  unhealthy now wait for its health check and clear the flag once Odoo
+  answers. When it still does not, the MCP reply and the dashboard say so
+  instead of reporting a plain success.
+- **Production environment variables that break the container are refused**
+  — `create_production` and a changed `reconfigure_production(env_vars=…)`
+  refuse `HOME`, `PYTHONHOME`, `PYTHONUSERBASE`, `PYTHONNOUSERSITE` and a
+  `PYTHONPATH` that lists a `site-packages` directory. These variables hid the
+  pip packages installed for the repositories (`ModuleNotFoundError`) or let a
+  `dataclasses` backport shadow the standard library, which took the server
+  down. Existing productions that store such a variable still recreate.
 - **Share links open from email** — a share link opened from another site, such
   as a button in a webmail message, landed on "This link is missing its key":
   the browser kept the other site as initiator across the redirect and withheld

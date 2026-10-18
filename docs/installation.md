@@ -317,6 +317,7 @@ prod_purge_hours = 0        # purge DB/files kept by a production deletion after
 # enabled = true            # opt in; requires routing.mode = "traefik"
 # walg_version = ""         # empty = Oduflow's pinned WAL-G version
 # workers_cap = 8           # upper bound for auto-tuned Odoo workers
+# health_timeout = 180      # seconds a production may take to become healthy
 
 # [backup]                  # optional; requires all three credentials below
 # bucket = ""
@@ -443,6 +444,7 @@ hosting at call time.
 | `[production].walg_version` | *(empty)* | WAL-G release override. Empty uses the version pinned by Oduflow |
 | `[production].odumcp_repo_url` | `https://github.com/oduflow/oduflow-client-addons.git` | Fallback source for automatic OduMCP installation when production repositories do not provide the addon. Needs one branch per Odoo version (`16.0` … `20.0`); each production uses the branch of its own Odoo version |
 | `[production].workers_cap` | `8` | Upper bound for automatically calculated Odoo workers; must be at least `1` |
+| `[production].health_timeout` | `180` | Seconds a production may take to become healthy after a deploy, rollback, reconfigure, restore, Stack apply or recovery start/restart; raise it for workers-mode productions with many modules |
 | `[production].wal` | *(defaults below)* | Nested `[production.wal]` table for cluster-wide WAL timeouts and disk protection; active whenever production hosting is enabled |
 | `[production.wal].upload_timeout` | `120` | Seconds per WAL upload before termination; forced kill follows after 5 seconds |
 | `[production.wal].warn_after` | `120` | Seconds without archive progress while a queue exists before warning |

@@ -154,6 +154,7 @@ restart Oduflow; productions themselves are then created at runtime:
 [production]
 enabled = true          # required; restart Oduflow after changing
 workers_cap = 8         # upper bound for auto-tuned Odoo workers
+health_timeout = 180    # seconds a production may take to become healthy
 
 [backup]                # configures backups; production must also be enabled
 bucket = "acme-backups"
@@ -304,6 +305,19 @@ or `{}` to inherit none. `reconfigure_production(env_vars={...})` replaces the
 stored set; omitting it preserves the existing variables. The managed database
 variables `HOST`, `PORT`, `USER`, and `PASSWORD` cannot be overridden.
 
+Every process in the container inherits these variables: the server, the
+deploy's `odoo -u` and the pip installs. For that reason, a new set may not
+contain `HOME`, `PYTHONHOME`, `PYTHONUSERBASE` or `PYTHONNOUSERSITE`. Odoo
+keeps its filestore and sessions under `HOME`, and the repositories'
+requirements are installed into the `odoo` user's pip `--user` site.
+Overriding these variables hides the installed packages or moves data out of
+the mounted volumes. `PYTHONPATH` may not list a `site-packages` or
+`dist-packages` directory either. Python searches `PYTHONPATH` before the
+standard library, so a backport installed there (such as `dataclasses`)
+shadows the stdlib module and Odoo fails to start. A production that already
+stores such a variable keeps it and still recreates; only setting a new
+variable set is refused.
+
 No sanitization happens — the data goes *into* production. One caveat: if
 the source environment was itself created from a production
 (`from_production`), its data was sanitized on that copy, and the new
@@ -342,6 +356,13 @@ also recreated, without a separate maintenance window, by the next deploy
 that changes code (`update_production` or an auto-deploy) and by
 `restart_production`; a plain `reconfigure_production(name="erp")` does it
 immediately.
+
+After recreating the container, reconfigure waits up to
+`[production] health_timeout` seconds (default 180) for Odoo to become healthy. A container that crash-loops, for example on an environment
+variable that breaks Python, fails the wait early: Docker restarts it twice
+during the wait, and the production lock is released for the next call. The
+same rule applies to every production health wait, including deploy
+verification and the rollback restart.
 
 **Applying a rotated secret.** Secret values reach the container only when it
 is created, so `restart_production` keeps running with the old value. After
@@ -442,7 +463,16 @@ preflight SQL failure, triggers code rollback just like a failed module command.
 `update_production(name)` pulls the branch (and extra-addon worktrees),
 classifies the changes (or takes explicit `install=` / `upgrade=` /
 `restart=true`), applies them, and **verifies** the deploy — module exit
-codes plus an in-container health check. A changed `.oduflow/requirements.txt`
+codes plus an in-container health check. In auto mode (no explicit
+`install`/`upgrade`/`restart`), only modules **installed in the database** are
+upgraded: an extra-addon repo typically bundles many modules of which a few
+are installed, and a routine fast-forward touching uninstalled ones must not
+fail the deploy — their changes are dropped with a warning and the rest is
+classified again, so a JS or view change in an installed module still
+reloads and a changed `.py` still restarts. A module already in the database
+is upgraded even when it looks new (moved between directories or repos), and
+new modules are never auto-installed on a production. Explicit
+`install=`/`upgrade=` requests keep the strict behaviour. A changed `.oduflow/requirements.txt`
 or `.oduflow/apt_packages.txt` — in the main repo or an extra-addon repo —
 reinstalls the pip/apt dependencies into the container before the restart
 (they are also installed from scratch whenever the container is recreated:
@@ -478,7 +508,70 @@ Every deploy lands in the production's history (`production_deploys`):
 commits, action, modules, status (`success` / `rolled_back` /
 `rollback_failed` / `skipped`), trigger (mcp / ui / webhook / schedule).
 
+The health checks after a deploy, rollback, reconfigure, restore or Stack
+apply wait up to `[production] health_timeout` seconds (default 180). Raise it
+for workers-mode productions with many modules — they can take minutes to
+start serving. A production stuck with an `unhealthy` flag after a timed-out
+rollback recovers with `restart_production` or `start_production`: on a
+flagged production either one re-judges health and clears the flag once the
+service answers again (and says so when it still does not).
+
 Manual code rollback to any commit: `rollback_production(name, to_commit)`.
+
+### Diagnosing a failed deploy
+
+A large `-u` can outlast the MCP client's request timeout. The deploy still
+finishes on the server, but the client never receives the response or its
+Odoo output. So a failed deploy keeps its evidence in the deploy record
+itself:
+
+| Field | Content |
+|---|---|
+| `failed_step` | `dependencies` (apt/pip reinstall), `install` (`odoo -i`), `upgrade` (`odoo -u`), `health` (every command succeeded, but Odoo did not answer `/web/health`), or `exception` (Oduflow raised an exception, for example a module preflight query) |
+| `exit_code` | The exit code of that step |
+| `dependencies_exit_code` | The apt/pip reinstall's own exit code, when one ran: a failed upgrade next to a failed reinstall usually means a missing Python package |
+| `failure_excerpt` | The Odoo log record that explains the failure, with its traceback: the last `CRITICAL` record, else the last `ERROR` one, else the last bare Python traceback |
+| `output_tail` | The last 200 lines (16 KB at most) of the failed step's output. For a failed health check, this is the server log instead |
+| `error` | One line: the step, the exit code, the rollback, and the cause (the exception that closes the traceback) |
+
+`production_deploys` returns `failure_excerpt` by default. Pass
+`include_output=true` for `output_tail` too. The dashboard shows `error`
+under the deploy's status. The server log gets the same excerpt on the
+`deploy failed at step …` line.
+
+What the exit codes mean:
+
+| Exit code | Meaning |
+|---|---|
+| `255` from `install`/`upgrade` | Odoo could not load or upgrade the registry: `preload_registries()` caught an exception, logged `CRITICAL Failed to initialize database` with the traceback, and returned `-1`. The excerpt says why |
+| `1` from `dependencies` | An apt or pip install failed. Oduflow reports 1 for any failed dependency step |
+| `1` from `exception` | Oduflow raised an exception after the code moved. The exception's text is in `error` |
+| `137` | The command was killed by `SIGKILL`, typically by the container's memory limit |
+| `0` with `failed_step: health` | The commands succeeded, but the restarted server did not answer within `[production] health_timeout` seconds |
+
+**Where the upgrade runs.** `odoo -i` / `odoo -u` is a `docker exec` into the
+production's running container: `/entrypoint.sh odoo -d <db>
+--stop-after-init --no-http -u <modules>`. It uses the same image, the same
+`/etc/odoo/odoo.conf`, the same environment variables (including
+`env_vars`) and the same `odoo` user with `HOME=/var/lib/odoo`, so it sees
+the same pip `--user` packages under `/var/lib/odoo/.local` as the server.
+Two things differ from the server process:
+
+- **The upgrade runs next to the live server.** The production's HTTP
+  workers and its cron worker keep using the same database during the
+  upgrade. A cron job or request can hold locks on rows or tables the upgrade
+  rewrites. PostgreSQL then aborts the upgrade's transaction with
+  `could not serialize access due to concurrent update` or
+  `deadlock detected`, and Odoo exits with 255. A dev environment never has
+  this concurrency, because it runs with `workers = 0` and
+  `max_cron_threads = 0`, so the same `-u` can pass there. The production
+  PostgreSQL cluster logs lock waits (`log_lock_waits = on`).
+- With `workers > 0`, the upgrade is Odoo's prefork master process, which
+  does not apply `limit_memory_hard` to itself. It shares the container's
+  memory limit with the workers.
+
+If the team's `odoo.prod.conf` sets `logfile`, Odoo writes its log there
+instead of to the command's output, and the excerpt stays empty.
 
 ## GitHub webhooks (auto-deploy)
 
