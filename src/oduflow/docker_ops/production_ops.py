@@ -2050,9 +2050,11 @@ def reconfigure_production(
     The registry record (intent) is updated first, then the workspace and
     container are converged to it — on a mid-way failure re-running the
     same call resumes the convergence: a request that changes nothing
-    still repairs a missing container or repo checkout, or a container
+    still repairs a missing container or repo checkout, a container
     whose Traefik routing no longer matches the record (e.g. one created
-    before the bus route existed), instead of reporting a no-op. Changing
+    before the bus route existed), or a checkout/container still on a
+    branch the record has moved away from, instead of reporting a no-op.
+    Changing
     ``server_mode`` re-tunes odoo.conf and re-points Traefik at the other
     Odoo port. Changing ``odoo_image`` does NOT migrate the
     database: a major Odoo version bump additionally needs an explicit
@@ -2070,7 +2072,7 @@ def reconfigure_production(
         remove_worktree,
         resolve_extra_addons_path,
     )
-    from oduflow.git_ops import checkout_branch, fetch_branch, rev_parse
+    from oduflow.git_ops import checkout_branch, current_branch, fetch_branch, rev_parse
 
     record = production_registry.get_production(team, name)
     start_time = time.time()
@@ -2167,12 +2169,35 @@ def reconfigure_production(
         rotated_secrets = [
             key for key in secret_drift if created_refs.get(key) == effective_env[key]
         ]
+    # The branch the production actually runs: deploys resolve it from the
+    # container's oduflow.git_branch label and pull into the checkout, so a
+    # record whose branch neither of them matches (an earlier reconfigure
+    # updated the registry, then failed before converging) would keep
+    # deploying the old branch forever if this call early-returned as a no-op.
+    # "branch" not in updates covers both an explicit no-change value and a
+    # retry whose intent the registry already holds.
+    target_branch = updates.get("branch", record.get("branch", ""))
+    label_branch = (
+        (container.labels or {}).get("oduflow.git_branch", "")
+        if container is not None
+        else ""
+    )
+    checked_out = current_branch(repo_path) if os.path.isdir(repo_path) else ""
+    branch_drift = (
+        "branch" not in updates
+        and bool(target_branch)
+        and (
+            (bool(label_branch) and label_branch != target_branch)
+            or (bool(checked_out) and checked_out != target_branch)
+        )
+    )
     drift = (
         force_recreate
         or container is None
         or not os.path.isdir(repo_path)
         or routing_drift(settings, team, name, record, container.labels or {})
         or bool(secret_drift)
+        or branch_drift
     )
     if settings.backup is not None and (updates or drift):
         ensure_prod_infra(client, settings, force=True)
@@ -2225,7 +2250,7 @@ def reconfigure_production(
             depth=0,
             timeout=300,
         )
-    elif "branch" in updates:
+    elif "branch" in updates or branch_drift:
         fetch_branch(repo_path, record["branch"], team.git_credentials_file())
         checkout_branch(repo_path, record["branch"])
 
@@ -2375,8 +2400,8 @@ def reconfigure_production(
     elif not updates and not rotated_secrets:
         notes.append(
             "No settings changed, but drifted state was repaired (the "
-            "container, its Traefik routing and/or the repo checkout did not "
-            "match the record and have been recreated from it)."
+            "container, its Traefik routing, the repo checkout and/or its "
+            "branch did not match the record and have been recreated from it)."
         )
     if purged_conf:
         notes.append(
