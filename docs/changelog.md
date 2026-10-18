@@ -46,6 +46,16 @@
 
 ### Fixes
 
+- **Environment creation on development-only hosts with limited disk space** —
+  the disk check now reserves max(1 GiB, min(1% of the disk, 2 GiB)) on devices
+  that hold no production data, derived from the disk size rather than from
+  current free space so repeated creations face a stable threshold. A copy
+  estimated to write 5.2 GiB can therefore proceed with 8.6 GiB free. Devices
+  shared with the production database volume retain the full 5–10 GiB reserve
+  (all devices, when that volume's device cannot be determined); a host with
+  production on a separate disk keeps the relaxed policy on its dev disk. The
+  shared PostgreSQL data volume additionally budgets 1 GiB of WAL/catalog
+  writes per creation; write estimates still include the 20% safety margin.
 - **Failed production deploys explain themselves** — a failed
   `update_production` used to record only `Deploy failed (exit_code=255)`.
   The Odoo output that held the cause reached only the response, which a
