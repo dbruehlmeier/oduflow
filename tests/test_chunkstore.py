@@ -681,6 +681,61 @@ class TestPruneKeepRevisions:
             dst = tmp_path / f"erp-dst{rev}"
             chunkstore.restore(storage, "erp", rev, str(dst))
 
+    def test_vanished_file_is_skipped_not_fatal(self, small_config_storage, tmp_path, monkeypatch):
+        """P-M15: a file deleted between the scan's lstat and the read used to
+        abort the whole snapshot of a live filestore."""
+        import builtins
+
+        storage = small_config_storage
+        src = tmp_path / "src"
+        _make_tree(
+            str(src), {"a.bin": b"keep me" * 100, "gone.bin": b"racy" * 100}
+        )
+
+        real_open = builtins.open
+
+        def fake_open(path, *args, **kwargs):
+            if str(path).endswith("gone.bin"):
+                raise FileNotFoundError(path)
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "open", fake_open)
+        result = chunkstore.backup(str(src), storage, "erp")
+        monkeypatch.undo()
+
+        dst = tmp_path / "dst"
+        chunkstore.restore(storage, "erp", result.revision, str(dst))
+        assert _read_tree(str(dst)) == {"a.bin": b"keep me" * 100}
+
+    def test_file_grown_mid_backup_still_restores(self, small_config_storage, tmp_path, monkeypatch):
+        """P-M15: entry["size"] came from the scan's lstat, so a file that grew
+        between scan and read produced a revision whose restore always failed
+        the size check. The actually-chunked byte count must be recorded."""
+        import builtins
+
+        storage = small_config_storage
+        src = tmp_path / "src"
+        base = b"x" * 5000
+        _make_tree(str(src), {"grow.bin": base})
+
+        real_open = builtins.open
+        grown = []
+
+        def fake_open(path, *args, **kwargs):
+            if str(path).endswith("grow.bin") and "b" in str(args[:1]) and not grown:
+                grown.append(True)
+                with real_open(path, "ab") as f:
+                    f.write(b"EXTRA")
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "open", fake_open)
+        result = chunkstore.backup(str(src), storage, "erp")
+        monkeypatch.undo()
+
+        dst = tmp_path / "dst"
+        chunkstore.restore(storage, "erp", result.revision, str(dst))
+        assert _read_tree(str(dst)) == {"grow.bin": base + b"EXTRA"}
+
     def test_corrupt_revision_does_not_wedge_prune(self, small_config_storage, tmp_path):
         """A corrupt revision file must be kept and skipped — the old fallback
         re-read the same broken object inside its own `except`, so one bad
