@@ -160,7 +160,7 @@ class _PatchAll:
 
 class TestCreateProduction:
     @pytest.mark.parametrize("stage", ["prepare_odumcp", "provision_odumcp"])
-    def test_odumcp_failure_preserves_production(self, settings, team, stage):
+    def test_odumcp_failure_preserves_production(self, settings, team, stage, caplog):
         client = _mock_client()
         with _PatchAll(_patch_create_stack(client)) as mocks:
             mocks[stage].side_effect = RuntimeError("internal-secret-error")
@@ -181,9 +181,38 @@ class TestCreateProduction:
         assert result["odoo_container"]
         assert "sync_production_mcp" in result["notes"][0]
         assert "internal-secret-error" not in str(result)
+        # The user-facing text stays generic; the cause reaches the server log.
+        assert "internal-secret-error" in caplog.text
+        assert "Traceback" in caplog.text
         record = production_registry.get_production(team, "erp")
         assert record["mcp"]["status"] == "sync_failed"
         assert client.containers.run.called
+
+    def test_provisioning_prerequisite_is_reported_with_its_cause(
+        self, settings, team, caplog
+    ):
+        """A missing production_token must not hide behind the generic warning."""
+        client = _mock_client()
+        with _PatchAll(_patch_create_stack(client)) as mocks:
+            mocks["provision_odumcp"].side_effect = PrerequisiteNotMetError(
+                "Set this team's production_token before provisioning OduMCP."
+            )
+            result = production_ops.create_production(
+                settings,
+                team,
+                "erp",
+                "https://github.com/o/r.git",
+                "main",
+                "erp.example.com",
+                "odoo:19.0",
+            )
+        note = result["notes"][0]
+        assert "Set this team's production_token" in note
+        assert "sync_production_mcp" in note
+        assert "Set this team's production_token" in caplog.text
+        assert team.production_token not in str(result)
+        record = production_registry.get_production(team, "erp")
+        assert record["mcp"]["status"] == "sync_failed"
 
     def test_unsupported_odoo_version_explains_missing_odumcp(self, settings, team):
         from oduflow.production_mcp import UnsupportedOdooVersion
@@ -2810,6 +2839,30 @@ class TestRefreshOdumcpForImage:
             settings, team, "erp", [("/x", "/mnt/x")], "odoo:20.0"
         )
 
+    def test_checkout_taken_over_by_the_repository_is_removed(self, settings, team):
+        """The image changed and the client repository now ships odumcp: the
+        managed copy goes before the caller recreates the container."""
+        from oduflow.naming import get_repo_path, prod_env_name
+        from oduflow.production_mcp import addon_checkout, managed_module
+
+        module = managed_module(team, "erp")
+        module.mkdir(parents=True)
+        (module / "__manifest__.py").write_text("{}")
+        repo_module = os.path.join(
+            get_repo_path(prod_env_name("erp"), team.workspaces_dir),
+            "addons",
+            "odumcp",
+        )
+        os.makedirs(repo_module)
+        with open(os.path.join(repo_module, "__manifest__.py"), "w") as f:
+            f.write("{}")
+        with patch("oduflow.docker_ops.env_ops._clone_repo") as clone:
+            production_ops._refresh_odumcp_for_image(
+                settings, team, "erp", [], "odoo:20.0"
+            )
+        clone.assert_not_called()
+        assert not addon_checkout(team, "erp").exists()
+
     @pytest.mark.parametrize(
         ("error", "status"),
         [
@@ -2836,3 +2889,215 @@ class TestRefreshOdumcpForImage:
         assert (
             production_registry.get_production(team, "erp")["mcp"]["status"] == status
         )
+
+
+class TestDeployCompletesOdumcpTakeover:
+    """A deploy that brings odumcp into the repository retires the managed copy."""
+
+    OLD, NEW = "a" * 40, "b" * 40
+
+    def _managed_checkout(self, team):
+        from oduflow.production_mcp import managed_module
+
+        module = managed_module(team, "erp")
+        module.mkdir(parents=True, exist_ok=True)
+        with open(module / "__manifest__.py", "w") as f:
+            f.write("{}")
+
+    def _repository_module(self, team):
+        from oduflow.naming import get_repo_path, prod_env_name
+
+        module = os.path.join(
+            get_repo_path(prod_env_name("erp"), team.workspaces_dir), "addons", "odumcp"
+        )
+        os.makedirs(module, exist_ok=True)
+        with open(os.path.join(module, "__manifest__.py"), "w") as f:
+            f.write("{}")
+
+    def _container(self, mounted=True):
+        from oduflow.production_mcp import MOUNT
+
+        container = MagicMock(status="running")
+        container.labels = {"oduflow.team": "1", "oduflow.prod": "true"}
+        container.attrs = {
+            "Mounts": [{"Destination": MOUNT + "/odumcp"}] if mounted else []
+        }
+        return container
+
+    def _deploy(
+        self,
+        settings,
+        team,
+        container,
+        pull_result,
+        healthy=(True,),
+        recreate_healthy=True,
+    ):
+        reconfigure = MagicMock(return_value={"healthy": recreate_healthy})
+        routing = MagicMock(return_value="")
+        with (
+            patch.object(production_ops, "get_client", return_value=MagicMock()),
+            patch.object(production_ops, "_require_container", return_value=container),
+            patch(
+                "oduflow.docker_ops.env_ops.pull_environment", return_value=pull_result
+            ),
+            patch.object(
+                production_ops, "wait_production_healthy", side_effect=list(healthy)
+            ),
+            patch("oduflow.git_ops.rev_parse", side_effect=[self.OLD, self.NEW]),
+            patch.object(production_ops, "reconfigure_production", reconfigure),
+            patch.object(production_ops, "_repair_routing_after_deploy", routing),
+            patch.object(production_ops, "_reset_code"),
+            patch.object(production_ops, "reapply_prod_odoo_conf", return_value=True),
+            patch.object(production_ops, "_container_log_tail", return_value=""),
+        ):
+            result = production_ops.update_production(
+                settings, team, "erp", trigger="webhook"
+            )
+        return result, reconfigure, routing
+
+    @pytest.mark.parametrize("action", ["restart", "none"])
+    def test_takeover_deploy_recreates_and_retires_the_checkout(
+        self, settings, team, action
+    ):
+        """Keyed on the repository after the pull: a deploy whose changed
+        files classify as nothing to apply (action none) still counts."""
+        from oduflow.production_mcp import addon_checkout
+
+        _seed_prod_record(team)
+        self._managed_checkout(team)
+        self._repository_module(team)
+        container = self._container()
+
+        result, reconfigure, routing = self._deploy(
+            settings,
+            team,
+            container,
+            {"action": action, "exit_code": 0, "changed_files": ["x"]},
+        )
+
+        reconfigure.assert_called_once_with(settings, team, "erp", force_recreate=True)
+        assert not addon_checkout(team, "erp").exists()
+        assert not list(addon_checkout(team, "erp").parent.glob(".odumcp-retired-*"))
+        assert result["deploy"]["status"] == "success"
+        assert result["deploy"]["odumcp_takeover"] == "completed"
+        assert "odumcp now comes from the repository" in result["message"]
+        assert "managed copy was removed" in result["message"]
+        assert production_ops.read_deploys(team, "erp")[-1]["odumcp_takeover"] == (
+            "completed"
+        )
+        # The recreate converged routing from the record; no second recreate.
+        routing.assert_not_called()
+
+    def test_unhealthy_recreate_is_reported_not_hidden(self, settings, team):
+        """reconfigure_production records an unhealthy recreate instead of
+        raising: the takeover still completes (the repository copy was the one
+        Odoo loaded), but the note must not claim a clean recreate."""
+        from oduflow.production_mcp import addon_checkout
+
+        _seed_prod_record(team)
+        self._managed_checkout(team)
+        self._repository_module(team)
+
+        result, reconfigure, _ = self._deploy(
+            settings,
+            team,
+            self._container(),
+            {"action": "restart", "exit_code": 0, "changed_files": ["x"]},
+            recreate_healthy=False,
+        )
+
+        reconfigure.assert_called_once()
+        assert not addon_checkout(team, "erp").exists()
+        assert result["deploy"]["odumcp_takeover"] == "completed"
+        assert "did not become healthy" in result["message"]
+        assert "production_logs" in result["message"]
+
+    def test_failed_deploy_leaves_the_managed_copy_alone(self, settings, team):
+        from oduflow.production_mcp import addon_checkout
+
+        _seed_prod_record(team)
+        self._managed_checkout(team)
+        self._repository_module(team)
+
+        result, reconfigure, _ = self._deploy(
+            settings,
+            team,
+            self._container(),
+            {"action": "upgrade", "exit_code": 1, "output": "boom"},
+            healthy=(True,),
+        )
+
+        assert result["action"] == "rolled_back"
+        reconfigure.assert_not_called()
+        assert addon_checkout(team, "erp").exists()
+        assert "odumcp_takeover" not in result["deploy"]
+
+    def test_deploy_without_a_managed_mount_does_nothing(self, settings, team):
+        from oduflow.production_mcp import addon_checkout
+
+        _seed_prod_record(team)
+        self._managed_checkout(team)
+        self._repository_module(team)
+
+        result, reconfigure, routing = self._deploy(
+            settings,
+            team,
+            self._container(mounted=False),
+            {"action": "restart", "exit_code": 0, "changed_files": ["x"]},
+        )
+
+        reconfigure.assert_not_called()
+        assert addon_checkout(team, "erp").exists()
+        assert "odumcp_takeover" not in result["deploy"]
+        routing.assert_called_once()
+
+    def test_deploy_without_a_repository_module_does_nothing(self, settings, team):
+        from oduflow.production_mcp import addon_checkout
+
+        _seed_prod_record(team)
+        self._managed_checkout(team)
+
+        result, reconfigure, _ = self._deploy(
+            settings,
+            team,
+            self._container(),
+            {"action": "restart", "exit_code": 0, "changed_files": ["x"]},
+        )
+
+        reconfigure.assert_not_called()
+        assert addon_checkout(team, "erp").exists()
+        assert "odumcp_takeover" not in result["deploy"]
+
+    def test_checkout_survives_a_failed_recreate(self, settings, team, caplog):
+        """The container may still mount the copy: retiring it would hollow
+        out the module Odoo runs. The deploy itself stays successful."""
+        from oduflow.production_mcp import addon_checkout
+
+        _seed_prod_record(team)
+        self._managed_checkout(team)
+        self._repository_module(team)
+        reconfigure = MagicMock(side_effect=RuntimeError("docker is away"))
+        with (
+            patch.object(production_ops, "get_client", return_value=MagicMock()),
+            patch.object(
+                production_ops, "_require_container", return_value=self._container()
+            ),
+            patch(
+                "oduflow.docker_ops.env_ops.pull_environment",
+                return_value={"action": "restart", "exit_code": 0},
+            ),
+            patch.object(production_ops, "wait_production_healthy", return_value=True),
+            patch("oduflow.git_ops.rev_parse", side_effect=[self.OLD, self.NEW]),
+            patch.object(production_ops, "reconfigure_production", reconfigure),
+            patch.object(
+                production_ops, "_repair_routing_after_deploy", return_value=""
+            ),
+        ):
+            result = production_ops.update_production(settings, team, "erp")
+
+        assert addon_checkout(team, "erp").exists()
+        assert result["deploy"]["status"] == "success"
+        assert result["deploy"]["odumcp_takeover"] == "failed"
+        assert "sync_production_mcp" in result["message"]
+        assert "docker is away" in caplog.text

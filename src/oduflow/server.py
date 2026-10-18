@@ -5632,18 +5632,36 @@ def create_production(
 @mcp.tool()
 @handle_errors
 @production_enabled
-def sync_production_mcp(name: str = "", ctx: Context | None = None) -> str:
+def sync_production_mcp(
+    name: str = "", refresh: bool = False, ctx: Context | None = None
+) -> str:
     """Install/configure odumcp and synchronize the configured production key.
 
     Empty name processes every production of this team, reporting failures
     separately. Use after changing production_token in TOML and restarting
     Oduflow, or after moving a production to another Odoo version. No secret
-    is accepted or returned. Stopped productions must be started first. Adding
-    the managed addon mount, or replacing a checkout made for another Odoo
-    version, recreates the container.
+    is accepted or returned. Stopped productions must be started first.
+
+    Oduflow ships odumcp as a managed checkout unless the production's own
+    repositories contain the module; once they do, the managed copy is removed
+    (by this tool, or automatically by the deploy that brought the module in)
+    and never touched again. refresh=True re-clones the managed checkout from
+    the connector repository (same Odoo version) and upgrades the module —
+    the only way the managed module is updated; it requires an explicit name
+    (one production per call) and is a no-op for a module shipped in the
+    client repository. Adding or removing the managed mount, replacing or
+    refreshing the checkout, recreates the container. Each result reports the
+    addon source, the connector branch and commit, and whether the container
+    was recreated.
     """
     from oduflow import production_mcp
 
+    if refresh and not name:
+        raise ValueError(
+            "refresh=True re-clones the connector and recreates the production "
+            "container: name one production; refreshing every production of the "
+            "team in one call is not allowed."
+        )
     settings, team = _get_settings(), _resolve_team(ctx)
     names = [name] if name else sorted(production_registry.list_productions(team))
     results = []
@@ -5653,7 +5671,9 @@ def sync_production_mcp(name: str = "", ctx: Context | None = None) -> str:
         try:
             _locks.acquire_env(key, operation="sync_production_mcp")
             acquired = True
-            results.append(production_mcp.synchronize(settings, team, target))
+            results.append(
+                production_mcp.synchronize(settings, team, target, refresh=refresh)
+            )
         except FlowError as exc:
             results.append({"name": target, "status": "failed", "error": str(exc)})
         except Exception as exc:

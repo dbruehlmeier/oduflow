@@ -62,17 +62,50 @@ attempts to install `odumcp` if it is absent. Automatic provisioning supports
 **Odoo 16 and later**. Older productions can still be managed with infrastructure
 tools.
 
-Oduflow uses addon code in the main or extra repositories when available. Otherwise
-it clones the connector repository at the branch of the production's own Odoo
-version (`18.0` for `odoo:18.0`) and mounts **only** its `odumcp` addon read-only.
-The version comes from the image tag; for a custom image without a version in its
-tag, Oduflow asks the image's `odoo --version`. This managed checkout survives
-container recreation and is not silently updated by unrelated deployments. When
-`reconfigure_production` moves a production to another Odoo version, the checkout
-is replaced with the new version's branch before the container is recreated; run
-`sync_production_mcp` afterwards to upgrade the installed module. A synchronization
-also replaces a checkout made for another version, and recreates the container
-whenever the container does not see the current checkout, which repairs an
+**Oduflow ships `odumcp` as a managed component by default.** When neither the
+main nor the extra repositories contain the module, Oduflow clones the connector
+repository at the branch of the production's own Odoo version (`18.0` for
+`odoo:18.0`) into a managed checkout and mounts **only** its `odumcp` addon
+read-only. The version comes from the image tag; for a custom image without a
+version in its tag, Oduflow asks the image's `odoo --version`. This managed
+checkout survives container recreation and is never silently updated: neither
+production creation nor deployments pull newer connector code. It changes in
+exactly two cases:
+
+- **Odoo version change.** When `reconfigure_production` moves a production to
+  another Odoo version, the checkout is replaced with the new version's branch
+  before the container is recreated; run `sync_production_mcp` afterwards to
+  upgrade the installed module. A synchronization also replaces a checkout made
+  for another version.
+- **Explicit refresh.** `sync_production_mcp(name, refresh=true)` re-clones the
+  same version's branch from `odumcp_repo_url`, recreates the container and
+  upgrades the module (even at an unchanged manifest version, so data and view
+  changes land). This is the only way the managed module is updated, and it is
+  an operator action — nothing refreshes it automatically. A refresh requires
+  an explicit `name`: one production per call, never the whole team.
+
+**A client takes the module over by committing `odumcp` into their own
+repository** (main or extra, where Odoo scans it) **and deploying.** The deploy
+that brings the module in completes the takeover by itself: once the new code is
+verified healthy, Oduflow recreates the container without the managed mount and
+removes its managed checkout, records `odumcp_takeover: completed` in the deploy
+history entry and says so in the deploy result (`odumcp now comes from the
+repository; the managed copy was removed`). This holds for manual,
+webhook and auto-update deploys alike, and also when the deploy classified the
+change as nothing to apply (the detection keys on the repository state after the
+pull, not on the changed files). `sync_production_mcp` does the same for a
+production whose takeover is still pending (for example because that recreate
+failed). From then on the module is client code: Oduflow never touches it again —
+`refresh=true` is a documented no-op for a client-shipped module, and
+installs/upgrades follow the repository's deployments like any other addon.
+Removing the module from the repository again puts Oduflow back in charge on the
+next synchronization.
+
+Whether the managed copy is mounted at all is decided by the repository state
+whenever a container is built: any recreate (reconfiguration, image change,
+synchronization) leaves the mount out as soon as the client repositories ship
+`odumcp`. A synchronization recreates the container whenever the container does
+not see the current checkout (or still mounts a removed one), which repairs an
 earlier synchronization whose recreation failed. Provisioning refuses to install
 an addon built for a different Odoo version than the one running:
 
@@ -126,8 +159,18 @@ After changing `production_token` in TOML and restarting Oduflow, connect with t
 new token and call `sync_production_mcp(name)`; omit `name` to process all team
 productions. The call installs/configures the addon and replaces only its managed
 key. It reports each production independently; start stopped productions and retry
-failures. Adding a missing managed addon mount recreates the container briefly.
-Reapplying the same key is a no-op for the key itself.
+failures. Adding a missing managed addon mount — or dropping it once the client
+repository provides `odumcp` — recreates the container briefly. Reapplying the
+same key is a no-op for the key itself.
+
+Each result states where the addon comes from (`addon_source`: `managed` or
+`repository`), what happened to the managed checkout (`checkout`: `kept`,
+`cloned`, `replaced`, `refreshed`, `removed` or `repository`), whether the
+container was recreated and, for a managed checkout, the connector branch and
+commit it is at. Pass `refresh=true` (with an explicit `name`) to re-clone the
+managed checkout from `odumcp_repo_url` for the same Odoo version and upgrade the
+module; the result reports `refreshed` and, for a client-shipped module, a note
+that nothing was refreshed.
 
 The new token immediately controls the Oduflow endpoint after restart. Each Odoo
 accepts the new key only after its synchronization succeeds; until then its old
