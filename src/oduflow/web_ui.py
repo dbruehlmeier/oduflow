@@ -113,6 +113,7 @@ from oduflow.naming import (
     validate_template_name,
 )
 from oduflow.settings import OpenCodeProviderSettings, Settings, TeamSettings
+from oduflow.tunnels import manager as tunnel_manager
 
 logger = logging.getLogger("oduflow")
 
@@ -5247,6 +5248,66 @@ def _build_routes(
                 {"ok": False, "error": "Internal server error."}, status_code=500
             )
 
+    async def api_public_odoo(request: Request) -> JSONResponse:
+        """Operator-only publication of the Odoo HTTP service."""
+        if getattr(request.state, "scoped_env", None):
+            return JSONResponse(
+                {"ok": False, "error": "Not available for a shared link."},
+                status_code=403,
+            )
+        branch = request.path_params["branch"]
+        acquired = False
+        try:
+            settings = get_settings()
+            team = _get_ui_team(request)
+            if request.method == "GET":
+                result = await _offload(tunnel_manager.status, settings, team, branch)
+            else:
+                hostname = ""
+                if request.method == "POST":
+                    body = await request.json()
+                    if (
+                        not isinstance(body, dict)
+                        or set(body) - {"hostname"}
+                        or not isinstance(body.get("hostname", ""), str)
+                    ):
+                        return JSONResponse(
+                            {
+                                "ok": False,
+                                "error": "Expected an optional hostname string.",
+                            },
+                            status_code=400,
+                        )
+                    hostname = body.get("hostname", "")
+                locks.acquire_env(branch, team.team_id, operation="public_odoo")
+                acquired = True
+                if request.method == "POST":
+                    result = await _offload(
+                        tunnel_manager.publish, settings, team, branch, hostname
+                    )
+                else:
+                    result = await _offload(
+                        tunnel_manager.unpublish, settings, team, branch
+                    )
+            return JSONResponse(
+                {"ok": True, "result": result}, headers={"Cache-Control": "no-store"}
+            )
+        except ValueError:
+            return JSONResponse(
+                {"ok": False, "error": "Invalid JSON request."}, status_code=400
+            )
+        except FlowError as exc:
+            return _error_response(exc)
+        except Exception:
+            logger.warning("Public Odoo link request failed")
+            return JSONResponse(
+                {"ok": False, "error": "Cannot manage the public Odoo link."},
+                status_code=500,
+            )
+        finally:
+            if acquired:
+                locks.release_env(branch)
+
     def api_share_get(request: Request) -> JSONResponse:
         return _share_endpoint(
             request, lambda team, branch: env_share.get(team, branch)
@@ -7265,6 +7326,11 @@ def _build_routes(
             "/api/environments/{branch:path}/unprotect", api_unprotect, methods=["POST"]
         ),
         Route("/api/environments/{branch:path}/note", api_set_note, methods=["POST"]),
+        Route(
+            "/api/environments/{branch:path}/public-odoo",
+            api_public_odoo,
+            methods=["GET", "POST", "DELETE"],
+        ),
         Route(
             "/api/environments/{branch:path}/mcp-access",
             api_mcp_access,

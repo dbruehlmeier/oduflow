@@ -210,8 +210,17 @@ def test_startup_stack_is_applied_before_server(tmp_path):
         patch.object(
             sys,
             "argv",
-            ["oduflow", "--stack", "/stack/oduflow.yaml", "--transport", "http"],
+            [
+                "oduflow",
+                "--no-telemetry",
+                "--stack",
+                "/stack/oduflow.yaml",
+                "--transport",
+                "http",
+            ],
         ),
+        patch("oduflow.postgres_migration.validate_configuration"),
+        patch("oduflow.postgres_migration.upgrade"),
         patch.object(server, "find_toml"),
         patch.object(server, "_get_settings", return_value=settings),
         patch.object(server.migrations, "run_pending"),

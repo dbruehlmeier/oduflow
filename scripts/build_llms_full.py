@@ -21,6 +21,7 @@ SOURCES = (
     "use-cases.md",
     "templates.md",
     "environments.md",
+    "tunnels.md",
     "production.md",
     "agent.md",
     "services.md",

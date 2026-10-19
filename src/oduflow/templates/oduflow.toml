@@ -14,6 +14,18 @@ allow_local_path = true        # trusted single-user local development; disable 
 [admin]
 password = ""
 
+# ── Public Odoo links ─────────────────────────────────
+# Configure one provider, then use "Publish Odoo" on an environment card.
+# Connectors run in Docker and publish Odoo with its normal login permissions.
+[tunnel]
+provider = "none"               # none | cloudflare_quick | cloudflare | ngrok
+# ngrok_authtoken = ""          # ngrok agent Authtoken
+# ngrok_domain = ""             # optional default hostname; one environment at a time
+# cloudflare_api_token = ""     # Account: Tunnel Edit; Zone: DNS Edit
+# cloudflare_account_id = ""
+# cloudflare_zone_id = ""
+# cloudflare_domain = "example.com"
+
 # ── Routing ───────────────────────────────────────────
 [routing]
 mode = "port"                   # "port" | "traefik"

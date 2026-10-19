@@ -48,6 +48,9 @@ than a JSON API. Production routes are registered only when
 | Method | Endpoint | Description |
 |---|---|---|
 | `GET` | `/api/environments` | List environments |
+| `GET` | `/api/environments/{branch}/public-odoo` | Public Odoo URL, provider, enabled flag, status and error; operator session only |
+| `POST` | `/api/environments/{branch}/public-odoo` | [Publish Odoo](tunnels.md) through the configured tunnel; body `{}` or optional `hostname` |
+| `DELETE` | `/api/environments/{branch}/public-odoo` | Revoke the public Odoo link and remove its owned provider resources |
 | `POST` | `/api/environments/create` | Create an environment. Body: `env_name`, optional `hostname`, `repo_url`, `odoo_image`, `template_name`, `extra_addons`, `auto_install_modules`, `env_vars` (merged per key over the template's), `git_user`, `from_production` (build from a dev copy of that production, through its managed `prod-<name>` template — published on first use; mutually exclusive with `template_name`), `base_branch` (when the branch does not exist on origin, create it from this branch and push it; the result's `branch_created_from` names the base when that happened) |
 | `POST` | `/api/environments/{branch}/start` | Start an environment |
 | `POST` | `/api/environments/{branch}/stop` | Stop an environment |

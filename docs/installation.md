@@ -1,5 +1,9 @@
 # Installation
 
+After installing locally, you can give a client an HTTPS link to an Odoo
+environment using [Public Odoo links](tunnels.md). Cloudflare and ngrok
+connectors run automatically in Docker; no router port forwarding is needed.
+
 ## System Requirements
 
 - **Docker** (Docker Engine or Docker Desktop)

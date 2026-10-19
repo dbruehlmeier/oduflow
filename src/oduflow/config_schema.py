@@ -35,6 +35,8 @@ from typing import Any
 
 from oduflow.settings import (
     DEFAULT_AGENT_IMAGE,
+    DEFAULT_CLOUDFLARED_IMAGE,
+    DEFAULT_NGROK_IMAGE,
     DEFAULT_OPENCODE_API_KEY_ENV,
     DEFAULT_OPENCODE_BASE_URL_ENV,
     DEFAULT_POSTGRES_IMAGE,
@@ -175,6 +177,86 @@ _PUBLIC_SCHEME_HELP = (
 )
 
 GROUPS: tuple[Group, ...] = (
+    Group(
+        id="tunnel",
+        title="Public Odoo links",
+        table=("tunnel",),
+        description="Choose one Docker-managed tunnel provider. Publish individual Odoo environments from their cards. Changing provider reconnects existing publications and can change their URLs.",
+        fields=(
+            Field(
+                "provider",
+                "enum",
+                "Provider",
+                default="none",
+                choices=("none", "cloudflare_quick", "cloudflare", "ngrok"),
+                apply=LIVE,
+            ),
+            Field(
+                "ngrok_authtoken",
+                "secret",
+                "ngrok Authtoken",
+                "Agent authtoken from your ngrok account.",
+                default="",
+                apply=LIVE,
+            ),
+            Field(
+                "ngrok_domain",
+                "str",
+                "Default ngrok hostname",
+                "Optional account-assigned or reserved hostname, without https://. A fixed hostname can publish one environment at a time. Override it on each publication when your plan supports multiple domains.",
+                default="",
+                apply=LIVE,
+            ),
+            Field(
+                "cloudflare_api_token",
+                "secret",
+                "Cloudflare API token",
+                "Needs Cloudflare Tunnel Edit for the account and DNS Edit for the zone. Oduflow creates and removes its own tunnels and DNS records.",
+                default="",
+                apply=LIVE,
+            ),
+            Field(
+                "cloudflare_account_id",
+                "str",
+                "Cloudflare account ID",
+                default="",
+                apply=LIVE,
+            ),
+            Field(
+                "cloudflare_zone_id",
+                "str",
+                "Cloudflare zone ID",
+                default="",
+                apply=LIVE,
+            ),
+            Field(
+                "cloudflare_domain",
+                "str",
+                "Cloudflare domain",
+                "Domain for environment hostnames. Use the zone apex (example.com) for standard Cloudflare certificate coverage.",
+                default="",
+                placeholder="example.com",
+                apply=LIVE,
+            ),
+            Field(
+                "cloudflared_image",
+                "str",
+                "cloudflared image",
+                default=DEFAULT_CLOUDFLARED_IMAGE,
+                apply=LIVE,
+                advanced=True,
+            ),
+            Field(
+                "ngrok_image",
+                "str",
+                "ngrok image",
+                "Official Alpine variant with BusyBox is required for the private agent API.",
+                default=DEFAULT_NGROK_IMAGE,
+                apply=LIVE,
+                advanced=True,
+            ),
+        ),
+    ),
     Group(
         id="server",
         title="Server",

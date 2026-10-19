@@ -2812,11 +2812,14 @@ def _create_environment_impl(
     from oduflow.extra_addons import generate_odoo_conf, resolve_main_addons_path
 
     odoo_conf_to_copy = os.path.join(workspace_path, "odoo.conf")
+    from oduflow.tunnels.manager import proxy_overrides
+
     generate_odoo_conf(
         _dev_base_conf_path(team, repo_path),
         odoo_conf_to_copy,
         extra_conf_paths,
         resolve_main_addons_path(repo_path),
+        pinned=proxy_overrides(settings, team, env_name),
         odoo_image=odoo_image,
     )
 
@@ -4057,6 +4060,10 @@ def delete_environment(
 
     logger.info("Deleting environment", extra={"env_name": env_name})
 
+    from oduflow.tunnels.manager import pause_environment
+
+    pause_environment(settings, team, env_name, delete=not preserve_access)
+
     _agent_remove_env(client, settings, team, env_name)
 
     # Forget any stored ACP chat sessions for this env (host-side state, so
@@ -4234,6 +4241,10 @@ def recreate_environment(
         # must not be reachable with them (delete_environment's invariant).
         env_share.remove(team, env_name)
         env_tokens.remove(team, env_name)
+        from oduflow.tunnels.manager import pause_environment
+
+        with contextlib.suppress(Exception):
+            pause_environment(settings, team, env_name, delete=True)
         invalidate_cache()
         raise
 
@@ -4466,6 +4477,9 @@ def stop_environment(
             f"Environment '{env_name}' does not exist. Use create_environment first."
         )
     _assert_team_owns(odoo_container, settings, team, env_name)
+    from oduflow.tunnels.manager import pause_environment
+
+    pause_environment(settings, team, env_name)
     odoo_container.stop()
 
     activity.mark_stopped(team, env_name, by="manual")
@@ -4937,11 +4951,14 @@ def _reapply_odoo_conf(
         ]
     generated_conf = os.path.join(workspace_path, "odoo.conf")
     main_addons_path = resolve_main_addons_path(repo_path)
+    from oduflow.tunnels.manager import proxy_overrides
+
     generate_odoo_conf(
         _dev_base_conf_path(team, repo_path),
         generated_conf,
         extra_container_paths,
         main_addons_path,
+        pinned=proxy_overrides(settings, team, env_name),
         odoo_image=labels.get(settings.image_label, ""),
     )
     _copy_file_to_container(container, generated_conf, "/etc/odoo")
@@ -6501,6 +6518,11 @@ def update_environment(
     # ------------------------------------------------------------------
     # 2. Stop and remove ONLY the container
     # ------------------------------------------------------------------
+    from oduflow.tunnels.manager import pause_environment
+
+    # A rename retires the old publication; the new name can be published
+    # explicitly. A same-name update retains its desired publication.
+    pause_environment(settings, team, env_name, delete=bool(rename_to))
     try:
         container.stop()
     except Exception:

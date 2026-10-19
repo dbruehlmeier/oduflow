@@ -471,6 +471,7 @@ var RAW = { text: '', revision: '', loaded: false, dirty: false };
 const SECTIONS = [
   { id: 'server', title: 'Server', groups: ['server'] },
   { id: 'routing', title: 'Routing', groups: ['routing'] },
+  { id: 'tunnel', title: 'Tunnels', groups: ['tunnel'] },
   { id: 'routes', title: 'Extra routes', collection: 'routes' },
   { id: 'teams', title: 'Teams', collection: 'team' },
   { id: 'lifecycle', title: 'Lifecycle', groups: ['lifecycle'] },
@@ -794,6 +795,7 @@ function renderField(f, path, opts) {
     if (!hasEmpty) opts2 += '<option value=""' + (cur === '' ? ' selected' : '') + '>Default (' + esc(f.default) + ')</option>';
     choices.forEach(function (c) {
       var label = c === '' ? (f.default === '' ? 'Not set (derived)' : 'Default') : (f.kind === 'tls' ? TLS_LABELS[c] : c);
+      if (path.join('.') === 'tunnel.provider') label = {none: 'Disabled', cloudflare_quick: 'Cloudflare Quick Tunnel', cloudflare: 'Cloudflare Tunnel', ngrok: 'ngrok'}[c] || label;
       opts2 += '<option value="' + esc(c) + '"' + (cur === c ? ' selected' : '') + '>' + esc(label) + '</option>';
     });
     control = '<select class="text-input mono" id="' + id + '" onchange="onEnum(this, ' + esc(JSON.stringify(path)) + ')">' + opts2 + '</select>';
@@ -835,7 +837,7 @@ function secretControl(f, path, val, locked) {
   if (isSet && revealed === undefined) html += '<button class="btn btn-sm" type="button" onclick="revealSecret(' + esc(JSON.stringify(path)) + ')">Reveal</button>';
   if (shown) html += '<button class="btn btn-sm" type="button" onclick="copyField(\'' + id + '\')">Copy</button>';
   if (!locked) {
-    html += '<button class="btn btn-sm" type="button" onclick="generateSecret(' + esc(JSON.stringify(path)) + ', ' + (f.key === 'production_token' ? 32 : 24) + ')">Generate</button>';
+    if (path[0] !== 'tunnel') html += '<button class="btn btn-sm" type="button" onclick="generateSecret(' + esc(JSON.stringify(path)) + ', ' + (f.key === 'production_token' ? 32 : 24) + ')">Generate</button>';
     if (isSet && !f.required && !(drafted && drafted.unset)) html += '<button class="btn btn-sm danger" type="button" onclick="removeKey(' + esc(JSON.stringify(path)) + ')">Remove</button>';
     if (drafted) html += '<button class="btn btn-sm" type="button" onclick="undoKey(' + esc(JSON.stringify(path)) + ')">Undo</button>';
   }
@@ -885,6 +887,7 @@ function onEnum(el, path) {
   if (el.value === '') draftPut(path, null, true);
   else draftPut(path, f && f.kind === 'tls' ? tlsValue(el.value) : el.value, false);
   markEdited(el, path);
+  if (path.join('.') === 'tunnel.provider') renderSection();
 }
 function tlsValue(s) { return s === 'true' ? true : s === 'false' ? false : {}; }
 function onPorts(id, path) {
@@ -1032,8 +1035,19 @@ function groupPanel(g, prefix, opts) {
     }
     return '<section class="panel">' + head + body + '</section>';
   }
-  var basic = g.fields.filter(function (f) { return !f.advanced; });
-  var adv = g.fields.filter(function (f) { return f.advanced; });
+  var visibleFields = g.fields;
+  if (g.id === 'tunnel') {
+    var provider = currentValue(['tunnel', 'provider']) || 'none';
+    visibleFields = visibleFields.filter(function (f) {
+      if (f.key === 'provider') return true;
+      if (f.key === 'cloudflared_image') return provider === 'cloudflare' || provider === 'cloudflare_quick';
+      if (f.key.indexOf('ngrok_') === 0) return provider === 'ngrok';
+      return provider === 'cloudflare';
+    });
+    if (provider === 'cloudflare_quick') body += '<p class="panel-desc">No account is required. Each publication gets a temporary URL that changes when its tunnel is recreated. Quick Tunnels do not support SSE.</p>';
+  }
+  var basic = visibleFields.filter(function (f) { return !f.advanced; });
+  var adv = visibleFields.filter(function (f) { return f.advanced; });
   body += basic.map(function (f) { return renderField(f, tablePath.concat([f.key])); }).join('');
   if (adv.length) {
     body += '<details class="advanced"><summary>Advanced</summary>' +

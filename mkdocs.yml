@@ -97,6 +97,7 @@ nav:
       - Use Cases & Workflows: use-cases.md
       - Template Management: templates.md
       - Environment Management: environments.md
+      - Public Odoo Links: tunnels.md
       - Production Hosting: production.md
       - Coding Agent: agent.md
       - Auxiliary Services: services.md

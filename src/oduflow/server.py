@@ -2620,6 +2620,51 @@ def start_environment(
 @mcp.tool()
 @handle_errors
 @with_env_lock
+def publish_environment(
+    env_name: str, hostname: str = "", ctx: Context | None = None
+) -> str:
+    """Publish this Odoo environment over HTTPS using the configured tunnel provider.
+
+    This publishes Odoo, with its existing login and permissions. It does not
+    grant dashboard access. hostname is optional; Quick Tunnel assigns its own.
+    The first publication may restart Odoo to enable proxy mode. Use
+    get_environment_public_url to poll a starting publication. Automatic retry
+    and restoration run while the Oduflow server is running.
+    """
+    from oduflow.tunnels.manager import publish
+
+    _reject_prod_env(env_name)
+    return json.dumps(
+        publish(_get_settings(), _resolve_team(ctx), env_name, hostname), indent=2
+    )
+
+
+@mcp.tool()
+@handle_errors
+@with_env_lock
+def unpublish_environment(env_name: str, ctx: Context | None = None) -> str:
+    """Revoke this environment's public Odoo tunnel and remove its owned routes."""
+    from oduflow.tunnels.manager import unpublish
+
+    _reject_prod_env(env_name)
+    return json.dumps(
+        unpublish(_get_settings(), _resolve_team(ctx), env_name), indent=2
+    )
+
+
+@mcp.tool()
+@handle_errors
+def get_environment_public_url(env_name: str, ctx: Context | None = None) -> str:
+    """Return the public Odoo URL, provider, publication status and any error."""
+    from oduflow.tunnels.manager import status
+
+    _reject_prod_env(env_name)
+    return json.dumps(status(_get_settings(), _resolve_team(ctx), env_name), indent=2)
+
+
+@mcp.tool()
+@handle_errors
+@with_env_lock
 def pull_and_apply(
     env_name: str,
     install: str = "",
@@ -8860,10 +8905,16 @@ def _start_stdio() -> None:
     from oduflow.wal_monitor import start_monitor
 
     start_monitor(_get_settings)
+    from oduflow.tunnels.manager import Worker as TunnelWorker
+
+    tunnel_worker = TunnelWorker(_get_settings, _locks)
+    tunnel_worker.start()
     try:
         asyncio.run(mcp.run_stdio_async())
     except KeyboardInterrupt:
         logger.info("Shutting down.")
+    finally:
+        tunnel_worker.stop()
 
 
 def _traefik_forwarded_allow_ips(settings: Settings) -> list[str]:
@@ -9053,7 +9104,14 @@ def _start_http() -> None:
     server = uvicorn.Server(config)
     global _uvicorn_server
     _uvicorn_server = server
-    server.run()
+    from oduflow.tunnels.manager import Worker as TunnelWorker
+
+    tunnel_worker = TunnelWorker(_get_settings, _locks)
+    tunnel_worker.start()
+    try:
+        server.run()
+    finally:
+        tunnel_worker.stop()
     if _restart_requested.is_set():
         _reexec()
     if not server.started:

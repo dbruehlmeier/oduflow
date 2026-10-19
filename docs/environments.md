@@ -2,6 +2,10 @@
 
 ![Environments Dashboard](img/envs.png)
 
+To let a client open Odoo running on your laptop, use
+[Public Odoo links](tunnels.md): choose a tunnel provider in Server settings,
+then **More → Publish Odoo** on the environment card.
+
 ## Creating Environments
 
 ```bash

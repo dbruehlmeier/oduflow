@@ -21,6 +21,8 @@ TRACE: bool = False
 
 DEFAULT_AGENT_IMAGE = "oduist/oduflow-coder:0.4.0"
 DEFAULT_POSTGRES_IMAGE = "postgres:16"
+DEFAULT_CLOUDFLARED_IMAGE = "cloudflare/cloudflared:2026.10.1"
+DEFAULT_NGROK_IMAGE = "ngrok/ngrok:3.39.11-alpine-6a536c4"
 _LEGACY_AGENT_IMAGE = "oduist/oduflow-coder:latest"
 # Retired keys already reported: settings are re-parsed for every console
 # validation and live apply, and one warning per process is enough.
@@ -130,6 +132,71 @@ class OpenCodeProviderSettings:
     @property
     def display_name(self) -> str:
         return self.name or self.id
+
+
+@dataclass(frozen=True)
+class TunnelSettings:
+    """One installation-wide provider for opt-in public Odoo URLs."""
+
+    provider: str = "none"
+    ngrok_authtoken: str = field(default="", repr=False)
+    ngrok_domain: str = ""
+    cloudflare_api_token: str = field(default="", repr=False)
+    cloudflare_account_id: str = ""
+    cloudflare_zone_id: str = ""
+    cloudflare_domain: str = ""
+    cloudflared_image: str = DEFAULT_CLOUDFLARED_IMAGE
+    ngrok_image: str = DEFAULT_NGROK_IMAGE
+
+    def validate(self) -> None:
+        from oduflow.naming import validate_domain
+
+        if self.provider not in ("none", "cloudflare_quick", "cloudflare", "ngrok"):
+            raise ValueError(
+                "[tunnel].provider must be none, cloudflare_quick, cloudflare or ngrok"
+            )
+        for name in ("ngrok_domain", "cloudflare_domain"):
+            value = getattr(self, name)
+            if value:
+                validate_domain(value)
+        if self.provider == "ngrok" and not self.ngrok_authtoken:
+            raise ValueError("[tunnel].ngrok_authtoken is required for ngrok")
+        if self.provider == "cloudflare":
+            for name in (
+                "cloudflare_api_token",
+                "cloudflare_account_id",
+                "cloudflare_zone_id",
+                "cloudflare_domain",
+            ):
+                if not getattr(self, name):
+                    raise ValueError(
+                        f"[tunnel].{name} is required for Cloudflare Tunnel"
+                    )
+            for name in ("cloudflare_account_id", "cloudflare_zone_id"):
+                if not re.fullmatch(r"[a-fA-F0-9]{32}", getattr(self, name)):
+                    raise ValueError(
+                        f"[tunnel].{name} must be a 32-character Cloudflare ID"
+                    )
+        for name in ("cloudflared_image", "ngrok_image"):
+            if not getattr(self, name).strip():
+                raise ValueError(f"[tunnel].{name} must not be empty")
+
+
+def _parse_tunnel_section(raw: object) -> TunnelSettings:
+    if not isinstance(raw, dict):
+        raise ValueError("[tunnel] must be a table")
+    defaults = TunnelSettings()
+    values = {}
+    for name in defaults.__dataclass_fields__:
+        value = raw.get(name, getattr(defaults, name))
+        if not isinstance(value, str):
+            raise ValueError(f"[tunnel].{name} must be a string")
+        values[name] = value.strip()
+    for name in ("provider", "ngrok_domain", "cloudflare_domain"):
+        values[name] = values[name].lower()
+    result = TunnelSettings(**values)
+    result.validate()
+    return result
 
 
 @dataclass(frozen=True)
@@ -347,6 +414,7 @@ class Settings:
 
     # Routing
     routing_mode: str = "port"
+    tunnel: TunnelSettings = field(default_factory=TunnelSettings)
     acme_email: str = ""
     # Whether Traefik terminates TLS itself. True (default): Traefik listens on
     # :443 and redirects HTTP->HTTPS; routing_tls_auto selects certificate issuance. False:
@@ -642,6 +710,7 @@ class Settings:
             )
 
     def validate(self) -> None:
+        self.tunnel.validate()
         if not self.teams:
             raise ValueError(
                 "No [team.*] sections found in configuration. "
@@ -1146,6 +1215,7 @@ class Settings:
             allow_insecure_http=bool(server.get("allow_insecure_http", False)),
             admin_password=str(admin.get("password", "")).strip(),
             routing_mode=routing_mode,
+            tunnel=_parse_tunnel_section(raw.get("tunnel", {})),
             acme_email=str(routing.get("acme_email", "")).strip(),
             routing_tls=tls is not False,
             routing_tls_auto=tls is True,

@@ -2717,6 +2717,38 @@
     </div>
   </div>
 </div>
+<div class="modal-overlay" id="public-odoo-modal" onclick="closePublicOdoo(event)">
+  <div class="modal modal-sm">
+    <div class="modal-header">
+      <h2 id="public-odoo-title">Publish Odoo</h2>
+      <button class="modal-close" onclick="closePublicOdoo()" aria-label="Close">&times;</button>
+    </div>
+    <div class="modal-body">
+      <p class="modal-note">Send this HTTPS link to a client to review Odoo. Access follows the normal Odoo login and user permissions. The first publication may briefly restart Odoo to enable HTTPS proxy support.</p>
+      <p class="modal-note" id="public-odoo-status" role="status" aria-live="polite">Loading…</p>
+      <p class="modal-note" id="public-odoo-config" hidden>Select a provider in <a href="/admin" target="_blank" rel="noopener">Server settings → Tunnels</a>.</p>
+      <div class="form-group" id="public-odoo-host-group" hidden>
+        <label for="public-odoo-host">Hostname (optional)</label>
+        <input class="mono-input" id="public-odoo-host" type="text" placeholder="Use the provider default" spellcheck="false" oninput="_publicOdooHostDirty = true">
+      </div>
+      <div class="form-group" id="public-odoo-link-group" hidden>
+        <label for="public-odoo-url">Public Odoo URL</label>
+        <div class="copy-row">
+          <input class="mono-input" id="public-odoo-url" type="text" readonly>
+          <button class="btn" type="button" onclick="copyMcpField('public-odoo-url', 'Odoo URL copied')">Copy</button>
+        </div>
+      </div>
+      <p class="modal-note" id="public-odoo-quick" hidden>The address changes when the tunnel is recreated. Keep this computer and Odoo running while the client reviews it.</p>
+      <div class="form-error" id="public-odoo-error" role="alert" style="display:none;"></div>
+      <div class="form-actions">
+        <button class="btn btn-create" id="public-odoo-publish" type="button" onclick="publicOdooRequest('POST')" disabled>Publish</button>
+        <button class="btn btn-delete" id="public-odoo-disable" type="button" onclick="publicOdooRequest('DELETE')" hidden>Disable public link</button>
+        <button class="btn" type="button" onclick="publicOdooRequest('GET')">Refresh</button>
+        <button class="btn" type="button" onclick="closePublicOdoo()">Close</button>
+      </div>
+    </div>
+  </div>
+</div>
 <div class="modal-overlay" id="share-modal" onclick="closeShare(event)">
   <div class="modal modal-sm">
     <div class="modal-header">
@@ -3809,7 +3841,8 @@ function renderEnvironments(envs, force) {
               '<button role="menuitem" title="Scoped MCP endpoint and Secret Key for this environment only" onclick="openMcpAccess(\'' + escAttr(env.branch) + '\')">MCP Access</button>' +
               (SCOPED_ENV
                 ? ''
-                : '<button role="menuitem" title="Share a link to this environment only: its dashboard, consoles and Agent Chat, nothing else" onclick="openShare(\'' + escAttr(env.branch) + '\')">Share UI</button>') +
+                : '<button role="menuitem" title="Publish this Odoo over HTTPS for a client to review" onclick="openPublicOdoo(\'' + escAttr(env.branch) + '\')">Publish Odoo</button>' +
+                  '<button role="menuitem" title="Share a link to this environment only: its dashboard, consoles and Agent Chat, nothing else" onclick="openShare(\'' + escAttr(env.branch) + '\')">Share UI</button>') +
               (showAgent && !SCOPED_ENV
                 ? '<button role="menuitem" title="Terminal session with the coding agent for this environment" onclick="openAgentConsole(\'' + escAttr(env.branch) + '\')">Agent CLI</button>'
                 : '') +
@@ -4185,6 +4218,91 @@ async function openMcpAccess(branch) {
     }
   } catch (e) {
     showToast('Connection error: ' + e.message, true);
+  }
+}
+
+var _publicOdooBranch = '';
+var _publicOdooGeneration = 0;
+var _publicOdooTimer = null;
+var _publicOdooBusy = false;
+var _publicOdooHostDirty = false;
+
+function openPublicOdoo(branch) {
+  _publicOdooGeneration += 1;
+  clearTimeout(_publicOdooTimer);
+  _publicOdooBranch = branch;
+  _publicOdooBusy = false;
+  _publicOdooHostDirty = false;
+  document.getElementById('public-odoo-title').textContent = 'Publish Odoo — ' + branch;
+  document.getElementById('public-odoo-url').value = '';
+  document.getElementById('public-odoo-host').value = '';
+  document.getElementById('public-odoo-link-group').hidden = true;
+  document.getElementById('public-odoo-host-group').hidden = true;
+  document.getElementById('public-odoo-config').hidden = true;
+  document.getElementById('public-odoo-quick').hidden = true;
+  document.getElementById('public-odoo-publish').disabled = true;
+  document.getElementById('public-odoo-disable').hidden = true;
+  document.getElementById('public-odoo-status').textContent = 'Loading…';
+  showModal('public-odoo-modal');
+  publicOdooRequest('GET');
+}
+
+function closePublicOdoo(event) {
+  if (event && event.target !== event.currentTarget) return;
+  _publicOdooGeneration += 1;
+  _publicOdooBranch = '';
+  clearTimeout(_publicOdooTimer);
+  hideModal('public-odoo-modal');
+}
+
+async function publicOdooRequest(method) {
+  if (!_publicOdooBranch || _publicOdooBusy) return;
+  var generation = ++_publicOdooGeneration;
+  clearTimeout(_publicOdooTimer);
+  _publicOdooBusy = true;
+  var publish = document.getElementById('public-odoo-publish');
+  var disable = document.getElementById('public-odoo-disable');
+  var error = document.getElementById('public-odoo-error');
+  publish.disabled = true;
+  disable.disabled = true;
+  error.style.display = 'none';
+  if (method !== 'GET') document.getElementById('public-odoo-status').textContent = method === 'POST' ? 'Publishing…' : 'Disabling…';
+  try {
+    var options = {method: method};
+    if (method === 'POST') {
+      options.headers = {'Content-Type': 'application/json'};
+      options.body = JSON.stringify({hostname: document.getElementById('public-odoo-host').value.trim()});
+    }
+    var response = await fetch(API + '/' + encodeURIComponent(_publicOdooBranch) + '/public-odoo', options);
+    var data = await readResult(response);
+    if (generation !== _publicOdooGeneration) return;
+    if (!data.ok) throw new Error(data.error || 'Cannot manage the public Odoo link');
+    var result = data.result;
+    var names = {none: 'Disabled', cloudflare_quick: 'Cloudflare Quick Tunnel', cloudflare: 'Cloudflare Tunnel', ngrok: 'ngrok'};
+    var states = {disabled: 'Not published', starting: 'Connecting', published: 'Published', stopped: 'Odoo stopped', error: 'Error — retrying automatically'};
+    document.getElementById('public-odoo-status').textContent = (names[result.provider] || result.provider) + ' · ' + (states[result.status] || result.status);
+    document.getElementById('public-odoo-config').hidden = result.provider !== 'none';
+    document.getElementById('public-odoo-host-group').hidden = result.provider === 'none' || result.provider === 'cloudflare_quick';
+    document.getElementById('public-odoo-quick').hidden = result.provider !== 'cloudflare_quick';
+    if (method !== 'GET') _publicOdooHostDirty = false;
+    if (!_publicOdooHostDirty) document.getElementById('public-odoo-host').value = result.hostname || '';
+    document.getElementById('public-odoo-url').value = result.url || '';
+    document.getElementById('public-odoo-link-group').hidden = !result.url;
+    publish.textContent = result.enabled ? 'Apply / retry' : 'Publish';
+    publish.disabled = result.provider === 'none';
+    disable.hidden = !result.enabled && result.status !== 'error';
+    if (result.error) { error.textContent = result.error; error.style.display = 'block'; }
+  } catch (exc) {
+    if (generation !== _publicOdooGeneration) return;
+    error.textContent = exc.message;
+    error.style.display = 'block';
+    publish.disabled = false;
+  } finally {
+    if (generation === _publicOdooGeneration) {
+      _publicOdooBusy = false;
+      disable.disabled = false;
+      _publicOdooTimer = setTimeout(function () { publicOdooRequest('GET'); }, 5000);
+    }
   }
 }
 
@@ -10458,6 +10576,7 @@ var MODAL_CLOSERS = {
   'template-settings-modal': closeTemplateSettingsModal,
   'confirm-modal': cancelConfirm,
   'share-modal': closeShare,
+  'public-odoo-modal': closePublicOdoo,
   'note-modal': closeNoteModal,
   'install-modules-modal': closeInstallModules,
   'upgrade-modules-modal': closeUpgradeModules

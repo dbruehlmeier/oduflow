@@ -2,7 +2,7 @@
 
 ![Agent Instructions](img/agent_instructions.png)
 
-Oduflow exposes **108 tools**. They are reachable from any MCP client (Cursor,
+Oduflow exposes **111 tools**. They are reachable from any MCP client (Cursor,
 Cline, Amp, Claude Code, …), locally with `oduflow call`, against a remote
 Oduflow server with `oduflow client`, and — for a subset — over the
 [REST API](web-api.md).
@@ -30,6 +30,12 @@ end to end.
     adds descriptions — always in sync with the running version.
 
 ## Tool index
+
+For external client review of a local environment, see
+[`publish_environment`, `get_environment_public_url`, and `unpublish_environment`](tunnels.md#mcp-and-cli).
+These tools require full team access. Publishing and unpublishing take the
+environment lock; reading the saved URL does not. They publish Odoo with its
+existing accounts and permissions, independently of Share UI.
 
 <div class="grid cards odu-tool-index" markdown>
 

@@ -69,7 +69,9 @@ class TestCLIInitDestroy:
         from oduflow import server
 
         with (
-            patch.object(sys, "argv", ["oduflow", "-t", "http"]),
+            patch.object(sys, "argv", ["oduflow", "--no-telemetry", "-t", "http"]),
+            patch("oduflow.postgres_migration.validate_configuration"),
+            patch("oduflow.postgres_migration.upgrade"),
             patch("oduflow.docker_ops.client.wait_for_docker") as mock_wait_for_docker,
             patch.object(server.migrations, "run_pending"),
             patch.object(server, "_ensure_initialized"),

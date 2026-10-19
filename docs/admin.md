@@ -40,6 +40,7 @@ For authenticator-app 2FA, run `oduflow ui-2fa setup --admin` on the server
 |---|---|
 | Server | Listener, local-path mounts, insecure-HTTP switch, tracing, telemetry |
 | Routing | Port or Traefik mode, TLS, ACME e-mail, public URL scheme |
+| Tunnels | [Public Odoo links](tunnels.md): select Cloudflare Quick Tunnel, managed Cloudflare Tunnel, or ngrok; configure credentials and domains |
 | Extra routes | `[route.*]` Traefik routes to services Oduflow does not manage |
 | Teams | Add and remove teams; per team: hostname, base domain, credentials, port range, slots, quotas, coding agent and its environment, image registry |
 | Lifecycle | Auto-stop, auto-delete, deleted-production purge |
