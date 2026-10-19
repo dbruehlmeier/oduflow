@@ -81,6 +81,13 @@ than a JSON API. Production routes are registered only when
 Branch parameters use Starlette's `path` converter internally, so names that
 contain `/` are accepted and URL-decoded as one environment name.
 
+For operator sessions, each item in `GET /api/environments` also includes
+`ui_shared` (a boolean) and `public_odoo` (`enabled` and `status`) for the
+[card access indicators](tunnels.md#publish-from-the-dashboard). An unreadable
+tunnel registry yields `enabled: null, status: "unknown"`; it does not hide the
+environment list. These summaries contain no share keys, publication URLs or
+provider credentials, and are omitted from scoped Share UI responses.
+
 The four `share` routes are operator-only: a shared session cannot read, reissue
 or revoke the link it arrived on. See
 [Shared environment links](#shared-environment-links).

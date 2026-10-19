@@ -294,6 +294,7 @@ def test_share_modal_ignores_stale_loads_and_blocks_unsafe_actions():
     source = _DASHBOARD.read_text(encoding="utf-8")
     names = (
         "_setShareActions",
+        "updateEnvironmentAccess",
         "_renderSharePending",
         "_renderShareError",
         "openShare",
@@ -321,6 +322,8 @@ def test_share_modal_ignores_stale_loads_and_blocks_unsafe_actions():
         var _shareRequestGeneration = 0;
         var _shareBusy = false;
         var _shareResult = null;
+        var cachedEnvs = [{{branch: 'first'}}, {{branch: 'second'}}];
+        function renderEnvironments() {{}}
         var pending = [];
         function fetch(url) {{
           return new Promise(function (resolve) {{ pending.push({{url: url, resolve: resolve}}); }});
@@ -368,6 +371,8 @@ def test_share_modal_ignores_stale_loads_and_blocks_unsafe_actions():
             createDisabledAfterError: element('share-create').disabled,
             rotateDisplay: element('share-rotate').style.display,
             requestCountAfterInvalidRotate: pending.length,
+            cardShared: cachedEnvs[1].ui_shared,
+            staleCardUntouched: cachedEnvs[0].ui_shared === undefined,
             mutation: mutation
           }}));
         }})();
@@ -386,6 +391,8 @@ def test_share_modal_ignores_stale_loads_and_blocks_unsafe_actions():
     assert result["createDisabledAfterError"] is False
     assert result["rotateDisplay"] == "none"
     assert result["requestCountAfterInvalidRotate"] == 3
+    assert result["cardShared"] is False
+    assert result["staleCardUntouched"] is True
     assert result["mutation"] == {
         "disabled": True,
         "requestCount": 1,

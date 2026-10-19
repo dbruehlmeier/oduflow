@@ -23,6 +23,24 @@ Server settings, terminals, or the Oduflow MCP server.
    their Odoo login details through your usual channel.
 5. Use **Disable public link** to revoke access through the tunnel.
 
+The operator's environment card shows two independent, clickable indicators:
+
+| Indicator | Meaning | Click to |
+|---|---|---|
+| **Odoo published** | The tunnel reports a public Odoo link | Copy the URL or disable publication |
+| **UI shared** | A dashboard access link has been created | Copy, regenerate or revoke the dashboard link |
+
+Both indicators can appear together. Publication also shows **Odoo publishing**
+while connecting, **Odoo paused** while stopped or the provider is disabled,
+and **Tunnel error** when it needs attention. **Tunnel unknown** means the saved
+publication state cannot be read. Disabling publication removes its indicator;
+revoking a dashboard link removes **UI shared**. Indicators follow dashboard
+refreshes and update after actions in either dialog.
+
+**UI shared** does not establish an internet route to Oduflow. On a laptop its
+link may still use a local address; the dashboard needs to be reachable by the
+recipient separately. The Odoo tunnel does not publish the dashboard.
+
 Keep the computer awake, online, and running Docker, Odoo, and the Oduflow
 server during the review. Existing local Odoo addresses keep working.
 
@@ -32,6 +50,55 @@ its bus/WebSocket traffic requires a second upstream. Production hosting
 continues to use its own routing. On first publication Oduflow enables
 `proxy_mode` in Odoo and restarts that container if necessary so HTTPS
 redirects work. The proxy setting is retained on subsequent recreates.
+
+## How requests reach the environment
+
+```mermaid
+flowchart TB
+    browser["Client browser"] -->|"HTTPS · public hostname"| edge["Cloudflare / ngrok"]
+    edge -->|"Request over the tunnel"| connector
+    subgraph laptop["Laptop · team's Docker network"]
+        connector["cloudflared / ngrok container"] -->|"HTTP · container DNS name"| odoo["Selected Odoo container :8069"]
+    end
+```
+
+Arrows show the request path. The connector establishes the connection to the
+provider **outbound** from the laptop, so the router needs no incoming port
+forwarding. The provider accepts the public HTTPS request and carries it back
+over that connection.
+
+When you publish an environment, Oduflow resolves its team and environment name
+to its Odoo container and explicitly configures the destination, for example
+`http://oduflow-1-demo-odoo:8069`. The connector joins that team's Docker network;
+Docker DNS resolves the container name to its internal IP. Each environment has
+its own container, so all can listen on `8069` without a port conflict.
+
+- **Quick Tunnel:** a separate connector receives the selected Odoo address in
+  its `--url` argument and gets an assigned public hostname.
+- **Managed Cloudflare:** an ingress rule maps the public hostname to that
+  Odoo address; a DNS record connects the hostname to the named tunnel.
+- **ngrok:** each environment has an endpoint whose upstream is that Odoo
+  address. One agent container per team can serve these endpoints.
+
+This path goes directly to Odoo. It does **not** pass through Traefik or the
+Odoo port published on the laptop. It works with Oduflow's port routing mode
+as well as installations that also run Traefik. Odoo's `proxy_mode` lets it
+recognize the original HTTPS request when generating redirects and URLs.
+
+### Why port 8072 is not used
+
+| Odoo mode | HTTP requests | WebSocket / bus | Supported by these tunnels |
+|---|---|---|---|
+| Default development mode, `workers = 0` | `8069` | Same HTTP port, `8069` | Yes |
+| Multiple workers, `workers > 0` | `8069` | Separate gevent port, normally `8072` | No |
+
+In the default threaded mode, Odoo serves WebSocket connections on its HTTP
+listener. An additional `8072` route is unnecessary. With multiple workers,
+the proxy must send `/websocket` (or `/longpolling` on older Odoo versions) to
+the separate evented listener. The current tunnel implementation has one
+upstream and refuses that configuration. See
+[Odoo's deployment documentation](https://www.odoo.com/documentation/19.0/administration/on_premise/deploy.html)
+for its worker and proxy modes.
 
 ## Choose a provider
 

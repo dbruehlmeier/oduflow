@@ -142,6 +142,17 @@ def get(team: TeamSettings, env_name: str) -> dict[str, Any] | None:
     return record
 
 
+def shared_environments(team: TeamSettings) -> set[str]:
+    """Names with a share key, read once without returning any credentials."""
+    if not team.data_dir:
+        return set()
+    return {
+        name
+        for name, record in _load(shares_path(team)).items()
+        if isinstance(record.get("secret"), str)
+    }
+
+
 def create_or_get(team: TeamSettings, env_name: str) -> str:
     """Return the environment's share secret, minting one on first use."""
     existing = get(team, env_name)

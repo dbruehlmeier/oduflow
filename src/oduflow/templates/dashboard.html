@@ -262,9 +262,11 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 10px;
     margin-bottom: 12px;
   }
-  .env-header .left { display: flex; align-items: center; gap: 10px; }
+  .env-header .left { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
   .branch-name { font-weight: 600; font-size: var(--text-lg); }
   .git-branch { font-size: var(--text-xs); color: var(--text-dim); font-weight: 400; font-family: var(--font-mono); }
   /* An environment is reusable: the branch it serves is a property you can
@@ -291,6 +293,22 @@
   .badge-exited  { background: color-mix(in oklab, var(--red) 15%, transparent); color: var(--red); }
   .badge-protected { background: color-mix(in oklab, var(--yellow) 15%, transparent); color: var(--yellow); }
   .badge-cluster-prod { background: color-mix(in oklab, var(--cyan) 15%, transparent); color: var(--cyan); }
+  .badge-access {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--text);
+    font-family: inherit;
+    cursor: pointer;
+  }
+  .badge-access svg { width: 14px; height: 14px; flex-shrink: 0; }
+  .badge-access:hover { border-color: currentColor; }
+  .badge-access:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+  .badge-published { background: color-mix(in oklab, var(--cyan) 15%, transparent); color: var(--cyan); }
+  .badge-access-pending { background: color-mix(in oklab, var(--yellow) 15%, transparent); color: var(--yellow); }
+  .badge-access-error { background: color-mix(in oklab, var(--red) 15%, transparent); color: var(--red); }
   .bulk-bar {
     position: sticky;
     top: 8px;
@@ -3706,6 +3724,37 @@ function toggleExtras(btn) {
   applyExtrasState(box);
 }
 
+function environmentAccessBadges(env) {
+  if (SCOPED_ENV) return '';
+  var html = '';
+  var publication = env.public_odoo;
+  var globe = '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="10" cy="10" r="8"/><ellipse cx="10" cy="10" rx="3.5" ry="8"/><path d="M2 10h16"/></svg>';
+  var link = '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M8 12l4-4M6.5 8.5l-2 2a3.5 3.5 0 005 5l2-2M8.5 6.5l2-2a3.5 3.5 0 015 5l-2 2"/></svg>';
+  if (publication && (publication.enabled || ['published', 'starting', 'error', 'unknown'].includes(publication.status))) {
+    var states = {
+      published: ['Odoo published', 'badge-published', 'Public Odoo link enabled. Open to copy or disable it.'],
+      starting: ['Odoo publishing', 'badge-access-pending', 'The Odoo tunnel is connecting. Open for its current status.'],
+      stopped: ['Odoo paused', 'badge-access-pending', 'Publication is saved but its connector is stopped. Open for details.'],
+      disabled: ['Odoo paused', 'badge-access-pending', 'Publication is saved but the tunnel provider is disabled.'],
+      error: ['Tunnel error', 'badge-access-error', 'The Odoo tunnel needs attention. Open for details or retry.'],
+      unknown: ['Tunnel unknown', 'badge-access-pending', 'Cannot read the Odoo publication status. Open for details.']
+    };
+    var state = states[publication.status] || states.unknown;
+    html += '<button type="button" class="badge badge-access ' + state[1] + '" title="' + state[2] + '" onclick="openPublicOdoo(\'' + escAttr(env.branch) + '\')">' + globe + state[0] + '</button>';
+  }
+  if (env.ui_shared) {
+    html += '<button type="button" class="badge badge-access" title="A dashboard access link exists. Internet access to Oduflow must be available separately. Open to copy or revoke the link." onclick="openShare(\'' + escAttr(env.branch) + '\')">' + link + 'UI shared</button>';
+  }
+  return html;
+}
+
+function updateEnvironmentAccess(branch, field, value) {
+  var env = cachedEnvs.find(function (item) { return item.branch === branch; });
+  if (!env || JSON.stringify(env[field]) === JSON.stringify(value)) return;
+  env[field] = value;
+  renderEnvironments(cachedEnvs);
+}
+
 function renderEnvironments(envs, force) {
   const el = document.getElementById('env-list');
   if (!envs || envs.length === 0) {
@@ -3809,6 +3858,7 @@ function renderEnvironments(envs, force) {
             (env.status === 'partial' ? ' title="' + env.containers.filter(function(c) { return c.status === 'running'; }).length + ' of ' + env.containers.length + ' containers running"' : '') +
             '>' + esc(env.status) + '</span>' +
           (env.protected ? '<span class="badge badge-protected" title="Stop, Update, Recreate and Delete are disabled">protected</span>' : '') +
+          environmentAccessBadges(env) +
           (busy ? '<span class="badge badge-busy"><span class="spinner" aria-hidden="true"></span>' + esc(busy.op) + '&hellip; <span data-busy-for="' + esc(env.branch) + '">' + _fmtElapsed(Date.now() - busy.started) + '</span></span>' : '') +
         '</div>' +
         '<div class="env-actions">' +
@@ -4278,6 +4328,7 @@ async function publicOdooRequest(method) {
     if (generation !== _publicOdooGeneration) return;
     if (!data.ok) throw new Error(data.error || 'Cannot manage the public Odoo link');
     var result = data.result;
+    updateEnvironmentAccess(_publicOdooBranch, 'public_odoo', {enabled: result.enabled, status: result.status});
     var names = {none: 'Disabled', cloudflare_quick: 'Cloudflare Quick Tunnel', cloudflare: 'Cloudflare Tunnel', ngrok: 'ngrok'};
     var states = {disabled: 'Not published', starting: 'Connecting', published: 'Published', stopped: 'Odoo stopped', error: 'Error — retrying automatically'};
     document.getElementById('public-odoo-status').textContent = (names[result.provider] || result.provider) + ' · ' + (states[result.status] || result.status);
@@ -4377,6 +4428,7 @@ function renderShare(result) {
   document.getElementById('share-error').style.display = 'none';
   document.getElementById('share-retry').style.display = 'none';
   var shared = !!(result && result.shared);
+  updateEnvironmentAccess(_shareBranch, 'ui_shared', shared);
   document.getElementById('share-url').value = shared ? (result.url || '') : '';
   document.getElementById('share-link-group').style.display = shared ? '' : 'none';
   document.getElementById('share-none').style.display = shared ? 'none' : '';

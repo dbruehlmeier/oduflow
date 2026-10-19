@@ -6,16 +6,18 @@ import pytest
 from starlette.applications import Starlette
 from starlette.testclient import TestClient
 
-from oduflow import web_ui
+from oduflow import env_share, web_ui
 from oduflow.errors import FlowError
 from oduflow.locking import LockManager
-from oduflow.settings import Settings, TeamSettings
+from oduflow.settings import Settings, TeamSettings, TunnelSettings
+from oduflow.tunnels import manager, store
 
 
 @pytest.fixture
 def web(tmp_path, monkeypatch):
     settings = Settings(
         base_data_dir=str(tmp_path),
+        tunnel=TunnelSettings(provider="ngrok", ngrok_authtoken="agent-secret"),
         teams={
             "1": TeamSettings(
                 team_id="1", ui_password="password", data_dir=str(tmp_path / "1")
@@ -133,3 +135,101 @@ def test_busy_environment_returns_conflict(web, monkeypatch):
         publish.assert_not_called()
     finally:
         locks.release_env("feature/x")
+
+
+def _list_cards(web, monkeypatch):
+    _, _, _, client = web
+    monkeypatch.setattr(
+        web_ui.env_ops,
+        "list_environments",
+        lambda *args: [
+            {"env_name": name, "branch": name, "containers": []}
+            for name in ("feature/x", "other")
+        ],
+    )
+    return client
+
+
+def test_card_indicators_are_team_scoped_and_exclude_credentials(web, monkeypatch):
+    settings, _, _, _ = web
+    client = _list_cards(web, monkeypatch)
+    with store.Registry(settings) as registry:
+        for team_id, name in (("1", "feature/x"), ("2", "other")):
+            registry.publications[store.key(team_id, name)] = {
+                "team_id": team_id,
+                "env_name": name,
+                "config": manager._config(settings),
+                "desired": True,
+                "status": "published",
+                "url": "https://private-publication.example.com",
+                "remote": {"token": "connector-secret"},
+            }
+    share_key = env_share.create_or_get(settings.teams["1"], "feature/x")
+    other_team = TeamSettings(team_id="2", data_dir=settings.base_data_dir + "/2")
+    other_key = env_share.create_or_get(other_team, "other")
+    read = Mock(wraps=store.read)
+    monkeypatch.setattr(store, "read", read)
+
+    response = client.get("/api/environments")
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    cards = response.json()["environments"]
+    assert cards[0]["public_odoo"] == {"enabled": True, "status": "published"}
+    assert cards[0]["ui_shared"] is True
+    assert cards[1]["public_odoo"] == {"enabled": False, "status": "disabled"}
+    assert cards[1]["ui_shared"] is False
+    assert read.call_count == 1
+    for private in (
+        share_key,
+        other_key,
+        "agent-secret",
+        "connector-secret",
+        "https://",
+    ):
+        assert private not in response.text
+
+
+def test_card_share_indicator_follows_create_and_revoke(web, monkeypatch):
+    client = _list_cards(web, monkeypatch)
+
+    def shared():
+        return client.get("/api/environments").json()["environments"][0]["ui_shared"]
+
+    assert shared() is False
+    assert client.post("/api/environments/feature/x/share").status_code == 200
+    assert shared() is True
+    assert client.post("/api/environments/feature/x/share/revoke").status_code == 200
+    assert shared() is False
+
+
+def test_unreadable_tunnel_registry_keeps_cards_with_unknown_status(web, monkeypatch):
+    settings, _, _, _ = web
+    client = _list_cards(web, monkeypatch)
+    store.atomic_write(store.root(settings) / "registry.json", "broken json")
+
+    response = client.get("/api/environments")
+
+    assert response.status_code == 200
+    assert all(
+        env["public_odoo"] == {"enabled": None, "status": "unknown"}
+        for env in response.json()["environments"]
+    )
+
+
+def test_shared_cards_do_not_expose_operator_access_indicators(web, monkeypatch):
+    _, _, app, _ = web
+    client = _list_cards(web, monkeypatch)
+    share = client.post("/api/environments/feature/x/share").json()["result"]["url"]
+    visitor = TestClient(app)
+    assert visitor.get("/" + share.split("/", 3)[3]).status_code == 200
+    summaries = Mock(side_effect=AssertionError("Scoped visitors cannot read tunnels"))
+    monkeypatch.setattr(manager, "summaries", summaries)
+
+    response = visitor.get("/api/environments")
+
+    assert response.status_code == 200
+    assert response.json()["environments"] == [
+        {"env_name": "feature/x", "branch": "feature/x", "containers": []}
+    ]
+    summaries.assert_not_called()

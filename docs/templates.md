@@ -406,10 +406,21 @@ oduflow sync-template prod --team 1 --pending   # consume a queued UI request on
 
 ### Optional environment data refresh
 
-Use **Environment → More → Auto-refresh data: Off** to opt in. The confirmation
-covers subsequent resets: local database and filestore changes are discarded.
-Code, container settings, credentials, URL and ports stay in place. Protected
-environments are skipped and reported. Stopped environments stay stopped.
+**Auto-refresh data** is off by default. Use
+**Environment → More → Auto-refresh data: Off** to opt in. It follows the source
+template's SSH sync: after a successful import, an opted-in environment that
+does not already have that snapshot receives the updated data. The switch does
+not create a schedule or start a sync; configure the template's source and
+schedule above, or use **Sync now**. Enabling it alone does not reset data
+immediately.
+
+This is different from the dashboard's **Auto-refresh** polling control and
+the environment's **Sync** action for Git code. The confirmation covers
+subsequent data resets: local database and filestore changes are discarded.
+Code, container settings, environment access keys, local URL and ports stay in
+place. Odoo users and their passwords are database contents and follow the
+replacement snapshot and sanitization. Protected environments are skipped and
+reported. Stopped environments stay stopped.
 
 Before updating a shared lower filestore, cron pins existing overlay
 workspaces to a retained generation. This initial pin briefly stops/remounts

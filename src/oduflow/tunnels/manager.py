@@ -84,6 +84,23 @@ def status(settings: Settings, team: TeamSettings, env_name: str) -> dict[str, A
     return _payload(settings, record)
 
 
+def summaries(
+    settings: Settings, team: TeamSettings, env_names: list[str]
+) -> dict[str, dict[str, Any]]:
+    """Card indicators from one registry read, with no URLs or credentials."""
+    try:
+        records = store.read(settings)["publications"] if store.exists(settings) else {}
+    except FlowError:
+        # An unreadable publication registry must not hide the environment list
+        # or turn an unknown publication into an apparently disabled one.
+        return {name: {"enabled": None, "status": "unknown"} for name in env_names}
+    result = {}
+    for name in env_names:
+        payload = _payload(settings, records.get(store.key(team.team_id, name)))
+        result[name] = {"enabled": payload["enabled"], "status": payload["status"]}
+    return result
+
+
 def proxy_overrides(
     settings: Settings, team: TeamSettings, env_name: str
 ) -> dict[str, str]:

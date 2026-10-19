@@ -1452,7 +1452,23 @@ def _build_routes(
             scoped_env = getattr(request.state, "scoped_env", None)
             if scoped_env:
                 envs = [e for e in envs if e.get("env_name") == scoped_env]
-            return JSONResponse({"ok": True, "environments": envs})
+            else:
+                publications = tunnel_manager.summaries(
+                    settings, team, [e["env_name"] for e in envs]
+                )
+                shared = env_share.shared_environments(team)
+                envs = [
+                    {
+                        **env,
+                        "public_odoo": publications[env["env_name"]],
+                        "ui_shared": env["env_name"] in shared,
+                    }
+                    for env in envs
+                ]
+            return JSONResponse(
+                {"ok": True, "environments": envs},
+                headers={"Cache-Control": "no-store"},
+            )
         except FlowError as e:
             return _error_response(e)
         except Exception:
